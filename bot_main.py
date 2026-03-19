@@ -8,6 +8,9 @@ from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import BaseFilter, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     KeyboardButton,
@@ -26,7 +29,7 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from db import AsyncSessionMaker, init_db
-from models import Account, AccountRole, AccountStatus
+from models import Account, AccountRole, AccountStatus, ControllerSettings
 from sqlalchemy import func, select
 
 
@@ -58,6 +61,14 @@ class AccountsCallback(str, Enum):
     ACTIVE = "accounts_active"
     BANNED = "accounts_banned"
     UPLOAD = "accounts_upload"
+
+
+class AccountUploadState(StatesGroup):
+    waiting_for_accounts_file = State()
+
+
+class ControllerDeathPointsState(StatesGroup):
+    waiting_for_death_points = State()
 
 
 @dataclass
@@ -306,15 +317,180 @@ def build_router(config: Config) -> Router:
         await callback.message.answer_document(InputFile(bio))
         await callback.answer()
 
+    @router.callback_query(
+        F.data == AccountsCallback.UPLOAD.value,
+        AdminFilter(config.admin_id),
+    )
+    async def on_accounts_upload(callback: CallbackQuery, state: FSMContext):
+        await callback.message.answer(
+            "Пришли файл `.txt` со строками формата `LOGIN:PASSWORD`.\n"
+            "Бот распределит 70% аккаунтов на `FARMER` и 30% на `STORAGE`."
+        )
+        await state.set_state(AccountUploadState.waiting_for_accounts_file)
+        await callback.answer()
+
+    @router.message(F.document, AccountUploadState.waiting_for_accounts_file, AdminFilter(config.admin_id))
+    async def on_accounts_file(message: Message, state: FSMContext):
+        if not message.document or not message.document.file_name:
+            await message.answer("Не вижу имя файла. Пришли `.txt` файл.")
+            return
+
+        file_name = message.document.file_name
+        if not file_name.lower().endswith(".txt"):
+            await message.answer("Нужен именно файл `.txt`. Попробуй ещё раз.")
+            return
+
+        # Скачиваем файл из Telegram в память
+        doc = message.document
+        tg_file = await message.bot.get_file(doc.file_id)
+        downloaded = await message.bot.download_file(tg_file.file_path)
+
+        try:
+            raw = downloaded.getvalue()
+        except AttributeError:
+            raw = downloaded.read()
+
+        text = raw.decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        parsed: list[tuple[str, str]] = []
+        for ln in lines:
+            if ":" not in ln:
+                continue
+            login, password = ln.split(":", 1)
+            login = login.strip()
+            password = password.strip()
+            if not login or not password:
+                continue
+            parsed.append((login, password))
+
+        # Убираем дубликаты логинов, сохраняя порядок
+        unique: list[tuple[str, str]] = []
+        seen_logins: set[str] = set()
+        for login, password in parsed:
+            if login in seen_logins:
+                continue
+            seen_logins.add(login)
+            unique.append((login, password))
+
+        if not unique:
+            await message.answer("Файл пустой или не удалось распарсить `LOGIN:PASSWORD`.")
+            await state.clear()
+            return
+
+        total = len(unique)
+        farmers_count = int(total * 0.7)  # округление вниз
+        storages_count = total - farmers_count
+
+        inserted = 0
+        updated = 0
+
+        async with AsyncSessionMaker() as session:
+            for idx, (login, password) in enumerate(unique):
+                role = AccountRole.FARMER.value if idx < farmers_count else AccountRole.STORAGE.value
+
+                existing = await session.scalar(select(Account).where(Account.login == login))
+                if existing:
+                    updated += 1
+                    existing.password = password
+                    existing.role = role
+                    if existing.status != AccountStatus.BANNED.value:
+                        existing.status = AccountStatus.ACTIVE.value
+                    continue
+
+                session.add(
+                    Account(
+                        login=login,
+                        password=password,
+                        role=role,
+                        status=AccountStatus.ACTIVE.value,
+                    )
+                )
+                inserted += 1
+
+            await session.commit()
+
+        # Обновим счетчики, чтобы показать адекватный результат
+        async with AsyncSessionMaker() as session:
+            farmers_active = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            storages_active = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            farmers_banned = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+            storages_banned = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+
+        await message.answer(
+            "Загрузка аккаунтов завершена.\n"
+            f"Всего строк: {total}\n"
+            f"FARMER (70%): {farmers_count}\n"
+            f"STORAGE (30%): {storages_count}\n\n"
+            f"Добавлено: {inserted}\n"
+            f"Обновлено: {updated}\n\n"
+            "Текущие счетчики:\n"
+            f"Действующие: фермеров {farmers_active}, складов {storages_active}\n"
+            f"Забаненные: фермеров {farmers_banned}, складов {storages_banned}"
+        )
+
+        await state.clear()
+
     @router.message(F.text == MainMenuButtons.DEATH_POINTS.value, AdminFilter(config.admin_id))
-    async def on_death_points(message: Message):
+    async def on_death_points(message: Message, state: FSMContext):
         await message.answer(
             "Введите количество очков смерти для цикла фарма "
             "(например 600 или 1200).",
             reply_markup=ReplyKeyboardRemove(),
         )
-        # Здесь можно сохранить состояние диалога через FSM/Redis,
-        # но пока только текстовое сообщение-заглушка.
+        await state.set_state(ControllerDeathPointsState.waiting_for_death_points)
+
+    @router.message(
+        F.text.regexp(r"^\d+$"),
+        ControllerDeathPointsState.waiting_for_death_points,
+        AdminFilter(config.admin_id),
+    )
+    async def on_death_points_value(message: Message, state: FSMContext):
+        # Парсим значение и сохраняем в Postgres
+        points = int((message.text or "").strip())
+        if points <= 0:
+            await message.answer("Значение должно быть больше 0.")
+            return
+
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                session.add(
+                    ControllerSettings(
+                        id=1,
+                        death_points_target=points,
+                        farming_enabled=False,
+                        sales_enabled=False,
+                    )
+                )
+            else:
+                settings.death_points_target = points
+            await session.commit()
+
+        await message.answer(f"Ок. Целевые `Очки смерти` установлены на {points}.")
+        await state.clear()
 
     @router.message(F.text == MainMenuButtons.SET_PRICE.value, AdminFilter(config.admin_id))
     async def on_set_price(message: Message):
@@ -324,23 +500,83 @@ def build_router(config: Config) -> Router:
 
     @router.message(F.text == MainMenuButtons.START_FARM.value, AdminFilter(config.admin_id))
     async def on_start_farm(message: Message):
-        # TODO: включить глобальный флаг фарма и раздать задания
-        await message.answer("Фарм запущен (пока только логическое состояние).")
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                settings = ControllerSettings(
+                    id=1,
+                    death_points_target=600,
+                    farming_enabled=True,
+                    sales_enabled=False,
+                )
+                session.add(settings)
+            else:
+                settings.farming_enabled = True
+            await session.commit()
+
+        await message.answer("Фарм включен.")
 
     @router.message(F.text == MainMenuButtons.STOP_FARM.value, AdminFilter(config.admin_id))
     async def on_stop_farm(message: Message):
-        # TODO: выключить фарм
-        await message.answer("Фарм остановлен (пока только логическое состояние).")
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                settings = ControllerSettings(
+                    id=1,
+                    death_points_target=600,
+                    farming_enabled=False,
+                    sales_enabled=False,
+                )
+                session.add(settings)
+            else:
+                settings.farming_enabled = False
+            await session.commit()
+
+        await message.answer("Фарм выключен.")
 
     @router.message(F.text == MainMenuButtons.START_SALES.value, AdminFilter(config.admin_id))
     async def on_start_sales(message: Message):
-        # TODO: включить продажи на складах
-        await message.answer("Продажи запущены (пока только логическое состояние).")
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                settings = ControllerSettings(
+                    id=1,
+                    death_points_target=600,
+                    farming_enabled=False,
+                    sales_enabled=True,
+                )
+                session.add(settings)
+            else:
+                settings.sales_enabled = True
+            await session.commit()
+
+        await message.answer("Продажи включены.")
 
     @router.message(F.text == MainMenuButtons.STOP_SALES.value, AdminFilter(config.admin_id))
     async def on_stop_sales(message: Message):
-        # TODO: выключить продажи
-        await message.answer("Продажи остановлены (пока только логическое состояние).")
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                settings = ControllerSettings(
+                    id=1,
+                    death_points_target=600,
+                    farming_enabled=False,
+                    sales_enabled=False,
+                )
+                session.add(settings)
+            else:
+                settings.sales_enabled = False
+            await session.commit()
+
+        await message.answer("Продажи выключены.")
 
     return router
 
@@ -351,7 +587,7 @@ async def main() -> None:
         token=config.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
 
     router = build_router(config)
 
