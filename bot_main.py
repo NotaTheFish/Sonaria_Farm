@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
+from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import BaseFilter, CommandStart
@@ -15,12 +16,18 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Document,
+    CallbackQuery,
+    InputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram import Router
 from aiogram.client.default import DefaultBotProperties
 
 from dotenv import load_dotenv
+
+from db import AsyncSessionMaker, init_db
+from models import Account, AccountRole, AccountStatus
+from sqlalchemy import func, select
 
 
 logging.basicConfig(
@@ -80,8 +87,9 @@ class AdminFilter(BaseFilter):
     def __init__(self, admin_id: int) -> None:
         self.admin_id = admin_id
 
-    async def __call__(self, message: Message) -> bool:
-        return bool(message.from_user and message.from_user.id == self.admin_id)
+    async def __call__(self, event: object) -> bool:
+        from_user = getattr(event, "from_user", None)
+        return bool(from_user and from_user.id == self.admin_id)
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
     buttons = [
@@ -189,13 +197,114 @@ def build_router(config: Config) -> Router:
 
     @router.message(F.text == SettingsButtons.ACCOUNTS.value, AdminFilter(config.admin_id))
     async def on_accounts(message: Message):
-        # TODO: посчитать реальные цифры активных/забаненных
+        async with AsyncSessionMaker() as session:
+            farmers_active = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            storages_active = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            farmers_banned = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+            storages_banned = await session.scalar(
+                select(func.count()).select_from(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+
         text = (
-            "Аккаунты (заглушка):\n"
-            "Действующие: фермеров 0, складов 0.\n"
-            "Забаненные: фермеров 0, складов 0."
+            "Аккаунты:\n"
+            f"Действующие: фермеров {farmers_active}, складов {storages_active}.\n"
+            f"Забаненные: фермеров {farmers_banned}, складов {storages_banned}."
         )
         await message.answer(text, reply_markup=accounts_inline_kb())
+
+    @router.callback_query(
+        F.data == AccountsCallback.ACTIVE.value,
+        AdminFilter(config.admin_id),
+    )
+    async def on_accounts_active(callback: CallbackQuery):
+        async with AsyncSessionMaker() as session:
+            farmers = await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+            storages = await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+
+            farmers_list = list(farmers)
+            storages_list = list(storages)
+
+        lines: list[str] = []
+        lines.append("FARMERS")
+        for acc in farmers_list:
+            lines.append(f"{acc.login}:{acc.password}")
+        lines.append("")
+        lines.append("STORAGES")
+        for acc in storages_list:
+            lines.append(f"{acc.login}:{acc.password}")
+
+        content = "\n".join(lines).encode("utf-8")
+        bio = BytesIO(content)
+        bio.name = "active_accounts.txt"
+
+        await callback.message.answer_document(InputFile(bio))
+        await callback.answer()
+
+    @router.callback_query(
+        F.data == AccountsCallback.BANNED.value,
+        AdminFilter(config.admin_id),
+    )
+    async def on_accounts_banned(callback: CallbackQuery):
+        async with AsyncSessionMaker() as session:
+            farmers = await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+            storages = await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.BANNED.value,
+                )
+            )
+
+            farmers_list = list(farmers)
+            storages_list = list(storages)
+
+        lines: list[str] = []
+        lines.append("FARMERS")
+        for acc in farmers_list:
+            lines.append(f"{acc.login}:{acc.password}")
+        lines.append("")
+        lines.append("STORAGES")
+        for acc in storages_list:
+            lines.append(f"{acc.login}:{acc.password}")
+
+        content = "\n".join(lines).encode("utf-8")
+        bio = BytesIO(content)
+        bio.name = "banned_accounts.txt"
+
+        await callback.message.answer_document(InputFile(bio))
+        await callback.answer()
 
     @router.message(F.text == MainMenuButtons.DEATH_POINTS.value, AdminFilter(config.admin_id))
     async def on_death_points(message: Message):
@@ -245,6 +354,8 @@ async def main() -> None:
     dp = Dispatcher()
 
     router = build_router(config)
+
+    await init_db()
 
     dp.include_router(router)
 
