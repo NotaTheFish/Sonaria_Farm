@@ -30,7 +30,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from dotenv import load_dotenv
 
-from db import AsyncSessionMaker, init_db
+from db import AsyncSessionMaker, ensure_migrations_applied
 from models import (
     Account,
     AccountRole,
@@ -1070,7 +1070,7 @@ async def main() -> None:
 
     router = build_router(config)
 
-    await init_db()
+    await ensure_migrations_applied()
 
     dp.include_router(router)
 

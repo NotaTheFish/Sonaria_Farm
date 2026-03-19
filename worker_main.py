@@ -7,6 +7,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from db import ensure_migrations_applied
 from models import AccountStatus, TaskType
 from task_queue import (
     append_task_log,
@@ -177,6 +178,7 @@ async def process_task(task, worker_id: str) -> None:
 
 async def main() -> None:
     load_dotenv()
+    await ensure_migrations_applied()
 
     role = os.getenv("WORKER_ROLE", "farmer")
     account_id = os.getenv("WORKER_ACCOUNT_ID")

@@ -2,6 +2,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -58,4 +59,50 @@ async def init_db(*, drop: bool = False) -> None:
         if drop:
             await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def ensure_migrations_applied() -> None:
+    """
+    Fail-fast проверка, что Alembic миграции действительно применены.
+    Runtime больше не должен создавать таблицы автоматически.
+
+    - Если ALEMBIC_EXPECTED_REVISION не задана или пустая: достаточно наличия
+      таблицы alembic_version и непустой version_num (любой применённый head).
+    - Если задана: текущая ревизия в БД должна совпадать с ней (pin для релизов).
+    """
+    expected_revision = (os.getenv("ALEMBIC_EXPECTED_REVISION") or "").strip()
+
+    async with engine.begin() as conn:
+        exists = await conn.scalar(
+            text(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM information_schema.tables
+                  WHERE table_schema = 'public'
+                    AND table_name = 'alembic_version'
+                )
+                """
+            )
+        )
+        if not exists:
+            raise RuntimeError(
+                "Database is not migrated: missing table alembic_version. "
+                "Run `alembic upgrade head` before starting services."
+            )
+
+        current_revision = await conn.scalar(
+            text("SELECT version_num FROM alembic_version LIMIT 1")
+        )
+        if not current_revision:
+            raise RuntimeError(
+                "Database migration state is empty. Run `alembic upgrade head`."
+            )
+
+        if expected_revision and current_revision != expected_revision:
+            raise RuntimeError(
+                f"Database revision mismatch: current={current_revision}, "
+                f"expected={expected_revision} (ALEMBIC_EXPECTED_REVISION). "
+                "Run `alembic upgrade head` or update the env var."
+            )
 
