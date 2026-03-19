@@ -6,7 +6,7 @@ from enum import Enum, auto
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import BaseFilter, CommandStart
 from aiogram.types import (
     Message,
     KeyboardButton,
@@ -18,6 +18,7 @@ from aiogram.types import (
 )
 from aiogram.enums import ParseMode
 from aiogram import Router
+from aiogram.client.default import DefaultBotProperties
 
 from dotenv import load_dotenv
 
@@ -75,10 +76,12 @@ def load_config() -> Config:
 
     return Config(bot_token=token, admin_id=admin_id)
 
+class AdminFilter(BaseFilter):
+    def __init__(self, admin_id: int) -> None:
+        self.admin_id = admin_id
 
-def is_admin(message: Message, config: Config) -> bool:
-    return message.from_user and message.from_user.id == config.admin_id
-
+    async def __call__(self, message: Message) -> bool:
+        return bool(message.from_user and message.from_user.id == self.admin_id)
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
     buttons = [
@@ -149,50 +152,26 @@ def accounts_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def admin_only(handler):
-    """
-    Декоратор для хэндлеров сообщений, чтобы реагировать только на админа.
-    Обычным пользователям бот просто игнорирует сообщения.
-    """
-
-    async def wrapper(message: Message, *args, **kwargs):
-        dp: Dispatcher = kwargs.get("dp")  # not used, kept for compat
-        config: Config = kwargs.get("config")
-        if not config:
-            logger.error("Config is not passed to handler")
-            return
-        if not is_admin(message, config):
-            # Молча игнорируем
-            return
-        return await handler(message, *args, **kwargs)
-
-    return wrapper
-
-
 def build_router(config: Config) -> Router:
     router = Router()
 
-    @router.message(CommandStart())
-    @admin_only
-    async def cmd_start(message: Message, config: Config):
+    @router.message(CommandStart(), AdminFilter(config.admin_id))
+    async def cmd_start(message: Message):
         await message.answer(
             "Привет, админ.\nЭто контроллер ботов для Creatures of Sonaria.",
             reply_markup=main_menu_kb(),
         )
 
-    @router.message(F.text == MainMenuButtons.SETTINGS.value)
-    @admin_only
-    async def on_settings(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.SETTINGS.value, AdminFilter(config.admin_id))
+    async def on_settings(message: Message):
         await message.answer("Меню настроек.", reply_markup=settings_kb())
 
-    @router.message(F.text == SettingsButtons.BACK.value)
-    @admin_only
-    async def on_back_to_main(message: Message, config: Config):
+    @router.message(F.text == SettingsButtons.BACK.value, AdminFilter(config.admin_id))
+    async def on_back_to_main(message: Message):
         await message.answer("Главное меню.", reply_markup=main_menu_kb())
 
-    @router.message(F.text == SettingsButtons.INVENTORY.value)
-    @admin_only
-    async def on_inventory(message: Message, config: Config):
+    @router.message(F.text == SettingsButtons.INVENTORY.value, AdminFilter(config.admin_id))
+    async def on_inventory(message: Message):
         # TODO: подставить реальные данные из хранилища
         text = (
             "Инвентарь (пока заглушка):\n"
@@ -201,17 +180,15 @@ def build_router(config: Config) -> Router:
         )
         await message.answer(text)
 
-    @router.message(F.text == SettingsButtons.TO_STORAGE.value)
-    @admin_only
-    async def on_to_storage(message: Message, config: Config):
+    @router.message(F.text == SettingsButtons.TO_STORAGE.value, AdminFilter(config.admin_id))
+    async def on_to_storage(message: Message):
         # TODO: создать задания передачи токенов со всех фермеров на склады
         await message.answer(
             "Создаю задачи на перевод токенов на склады (пока заглушка)."
         )
 
-    @router.message(F.text == SettingsButtons.ACCOUNTS.value)
-    @admin_only
-    async def on_accounts(message: Message, config: Config):
+    @router.message(F.text == SettingsButtons.ACCOUNTS.value, AdminFilter(config.admin_id))
+    async def on_accounts(message: Message):
         # TODO: посчитать реальные цифры активных/забаненных
         text = (
             "Аккаунты (заглушка):\n"
@@ -220,9 +197,8 @@ def build_router(config: Config) -> Router:
         )
         await message.answer(text, reply_markup=accounts_inline_kb())
 
-    @router.message(F.text == MainMenuButtons.DEATH_POINTS.value)
-    @admin_only
-    async def on_death_points(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.DEATH_POINTS.value, AdminFilter(config.admin_id))
+    async def on_death_points(message: Message):
         await message.answer(
             "Введите количество очков смерти для цикла фарма "
             "(например 600 или 1200).",
@@ -231,34 +207,29 @@ def build_router(config: Config) -> Router:
         # Здесь можно сохранить состояние диалога через FSM/Redis,
         # но пока только текстовое сообщение-заглушка.
 
-    @router.message(F.text == MainMenuButtons.SET_PRICE.value)
-    @admin_only
-    async def on_set_price(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.SET_PRICE.value, AdminFilter(config.admin_id))
+    async def on_set_price(message: Message):
         await message.answer(
             "Настройка цены для складов пока не реализована (заглушка)."
         )
 
-    @router.message(F.text == MainMenuButtons.START_FARM.value)
-    @admin_only
-    async def on_start_farm(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.START_FARM.value, AdminFilter(config.admin_id))
+    async def on_start_farm(message: Message):
         # TODO: включить глобальный флаг фарма и раздать задания
         await message.answer("Фарм запущен (пока только логическое состояние).")
 
-    @router.message(F.text == MainMenuButtons.STOP_FARM.value)
-    @admin_only
-    async def on_stop_farm(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.STOP_FARM.value, AdminFilter(config.admin_id))
+    async def on_stop_farm(message: Message):
         # TODO: выключить фарм
         await message.answer("Фарм остановлен (пока только логическое состояние).")
 
-    @router.message(F.text == MainMenuButtons.START_SALES.value)
-    @admin_only
-    async def on_start_sales(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.START_SALES.value, AdminFilter(config.admin_id))
+    async def on_start_sales(message: Message):
         # TODO: включить продажи на складах
         await message.answer("Продажи запущены (пока только логическое состояние).")
 
-    @router.message(F.text == MainMenuButtons.STOP_SALES.value)
-    @admin_only
-    async def on_stop_sales(message: Message, config: Config):
+    @router.message(F.text == MainMenuButtons.STOP_SALES.value, AdminFilter(config.admin_id))
+    async def on_stop_sales(message: Message):
         # TODO: выключить продажи
         await message.answer("Продажи остановлены (пока только логическое состояние).")
 
@@ -267,16 +238,13 @@ def build_router(config: Config) -> Router:
 
 async def main() -> None:
     config = load_config()
-    bot = Bot(token=config.bot_token, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=config.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
 
     router = build_router(config)
-
-    # В aiogram v3 нет глобального контекста, передадим config через middleware
-    @dp.update.outer_middleware()
-    async def config_middleware(handler, event, data):
-        data["config"] = config
-        return await handler(event, data)
 
     dp.include_router(router)
 
