@@ -50,10 +50,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 async def init_db(*, drop: bool = False) -> None:
     """
-    Минимальная инициализация. Для продакшена потом лучше сделать Alembic миграции.
+    Только для локальной отладки. В проде — Alembic.
     """
-    # Импортируем модели, чтобы их таблицы зарегистрировались в Base.metadata.
-    import models  # noqa: F401
+    import farm.models  # noqa: F401
 
     async with engine.begin() as conn:
         if drop:
@@ -63,12 +62,7 @@ async def init_db(*, drop: bool = False) -> None:
 
 async def ensure_migrations_applied() -> None:
     """
-    Fail-fast проверка, что Alembic миграции действительно применены.
-    Runtime больше не должен создавать таблицы автоматически.
-
-    - Если ALEMBIC_EXPECTED_REVISION не задана или пустая: достаточно наличия
-      таблицы alembic_version и непустой version_num (любой применённый head).
-    - Если задана: текущая ревизия в БД должна совпадать с ней (pin для релизов).
+    Fail-fast: миграции Alembic применены.
     """
     expected_revision = (os.getenv("ALEMBIC_EXPECTED_REVISION") or "").strip()
 
@@ -105,4 +99,3 @@ async def ensure_migrations_applied() -> None:
                 f"expected={expected_revision} (ALEMBIC_EXPECTED_REVISION). "
                 "Run `alembic upgrade head` or update the env var."
             )
-

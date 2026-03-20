@@ -1,0 +1,9 @@
+# Минимум для bot_main.py + worker_main.py + PostgreSQL (без OCR/автоклика).
+# Если полный requirements.txt не ставится (права pip / лишние пакеты):
+#   pip install -r requirements-minimal.txt
+
+aiogram==3.7.0
+SQLAlchemy==2.0.29
+alembic==1.13.1
+python-dotenv==1.0.1
+asyncpg

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from db import Base
+from farm.database import Base
 
 
 class AccountRole(str, enum.Enum):
@@ -47,10 +47,6 @@ class Account(Base):
 
 
 class ControllerSettings(Base):
-    """
-    Глобальные настройки контроллера.
-    """
-
     __tablename__ = "controller_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
@@ -76,12 +72,9 @@ class Worker(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     role: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-
-    # Как минимум один worker должен быть привязан к account_id.
     account_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("accounts.id"), nullable=True, index=True
     )
-
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
     heartbeat_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -96,7 +89,6 @@ class Worker(Base):
         index=True,
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -130,29 +122,16 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-
     task_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-
-    # Чем больше число - тем раньше задача.
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
-
-    # Привязки к account и worker
     account_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("accounts.id"), nullable=True, index=True)
     worker_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("workers.id"), nullable=True, index=True)
-
-    # Для остановки: worker периодически читает cancel_requested.
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
-
-    # Lease для восстановления задач, если воркер умер.
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-
-    # Небольшие параметры для воркера (например death_points_target, price ranges, и т.д.)
     payload: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -165,7 +144,6 @@ class Task(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
-
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -199,4 +177,3 @@ __all__ = [
     "TaskType",
     "TaskLog",
 ]
-

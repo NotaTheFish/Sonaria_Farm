@@ -6,8 +6,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from db import Base
-import models  # noqa: F401 - ensures model metadata is registered
+from farm.database import Base
+import farm.models  # noqa: F401 - ensures model metadata is registered
 
 
 config = context.config

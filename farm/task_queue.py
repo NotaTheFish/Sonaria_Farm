@@ -5,8 +5,8 @@ from typing import Any
 
 from sqlalchemy import and_, select, update, text
 
-from db import AsyncSessionMaker
-from models import Account, Task, TaskLog, TaskStatus, Worker
+from farm.database import AsyncSessionMaker
+from farm.models import Account, Task, TaskLog, TaskStatus, Worker
 
 
 def _now_utc() -> datetime:
@@ -20,10 +20,6 @@ async def ensure_worker(
     account_id: str | None,
     hostname: str | None = None,
 ) -> str:
-    """
-    Регистрирует воркера (если его нет) или обновляет базовую инфу.
-    Возвращает worker_id.
-    """
     if worker_id is None:
         worker_id = str(uuid.uuid4())
 
@@ -70,10 +66,6 @@ async def renew_running_tasks_lease(
     worker_id: str,
     lease_seconds: int = 90,
 ) -> None:
-    """
-    Продлевает lease для задач, которые сейчас выполняются данным worker'ом.
-    Нужно, чтобы claim_next_task не забирал эти задачи обратно, пока worker жив.
-    """
     async with AsyncSessionMaker() as session:
         lease_literal = f"interval '{int(lease_seconds)} seconds'"
         await session.execute(
@@ -139,11 +131,6 @@ async def request_cancel_tasks(
     account_id: str | None = None,
     only_pending: bool = False,
 ) -> int:
-    """
-    Просит отмену задач.
-    - pending: переводим сразу в cancelled
-    - running: выставляем cancel_requested=True (worker потом сам завершит)
-    """
     where = []
     if task_type is not None:
         where.append(Task.task_type == task_type)
@@ -159,7 +146,7 @@ async def request_cancel_tasks(
 
         if only_pending:
             if pending_ids:
-                res = await session.execute(
+                await session.execute(
                     update(Task)
                     .where(Task.id.in_(pending_ids))
                     .values(status=TaskStatus.CANCELLED.value, cancelled_at=_now_utc(), updated_at=_now_utc())
@@ -190,16 +177,6 @@ async def claim_next_task(
     lease_seconds: int = 90,
     max_tasks: int = 1,
 ) -> list[Task]:
-    """
-    Атомарно забирает задачи без гонок.
-
-    Логика выбора:
-    - status='pending'
-    - или status='running' с истекшим lease_expires_at
-    - cancel_requested исключается
-
-    Используется FOR UPDATE SKIP LOCKED.
-    """
     limit = max_tasks
 
     sql = text(
@@ -328,4 +305,3 @@ async def get_task_account(*, task_id: str) -> Account | None:
         if not task or not task.account_id:
             return None
         return await session.scalar(select(Account).where(Account.id == task.account_id))
-
