@@ -179,8 +179,7 @@ async def claim_next_task(
 ) -> list[Task]:
     limit = max_tasks
 
-    sql = text(
-        """
+    base_sql = """
         WITH cte AS (
           SELECT id
           FROM tasks
@@ -188,7 +187,30 @@ async def claim_next_task(
             status = 'pending'
             OR (status = 'running' AND lease_expires_at < now())
           )
-          AND (:worker_account_id IS NULL OR account_id IS NULL OR account_id = :worker_account_id)
+    """
+
+    if worker_account_id is None:
+        account_clause = ""
+        params = {
+            "worker_id": worker_id,
+            "limit": limit,
+            "lease_seconds": lease_seconds,
+        }
+    else:
+        # Важно: сюда мы НЕ передаём NULL-параметры, поэтому asyncpg не сможет
+        # «не определить тип параметра».
+        account_clause = " AND (account_id IS NULL OR account_id = :account_id) "
+        params = {
+            "worker_id": worker_id,
+            "account_id": worker_account_id,
+            "limit": limit,
+            "lease_seconds": lease_seconds,
+        }
+
+    sql = text(
+        base_sql
+        + account_clause
+        + """
           ORDER BY priority DESC, created_at ASC
           LIMIT :limit
           FOR UPDATE SKIP LOCKED
@@ -208,15 +230,7 @@ async def claim_next_task(
     )
 
     async with AsyncSessionMaker() as session:
-        res = await session.execute(
-            sql,
-            {
-                "worker_id": worker_id,
-                "worker_account_id": worker_account_id,
-                "limit": limit,
-                "lease_seconds": lease_seconds,
-            },
-        )
+        res = await session.execute(sql, params)
         rows = res.fetchall()
         await session.commit()
 
