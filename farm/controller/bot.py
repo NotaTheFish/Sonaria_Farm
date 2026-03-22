@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -292,6 +293,73 @@ async def rebalance_active_account_roles() -> tuple[int, int, int]:
         await session.commit()
 
     return total, farmers_count, storages_count
+
+
+async def enqueue_set_sell_price_for_active_storages(
+    ranges: dict[str, dict[str, int]],
+    priority_tokens: list[str],
+) -> tuple[int, str | None]:
+    """
+    Создаёт задачи SET_SELL_PRICE для всех активных складов.
+    Возвращает (число складов, текст ошибки или None).
+    """
+    await rebalance_active_account_roles()
+    async with AsyncSessionMaker() as session:
+        storages = (
+            await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+        ).all()
+
+    if not storages:
+        return 0, "Нет активных аккаунтов-складов."
+
+    for storage in storages:
+        await request_cancel_tasks(
+            task_type=TaskType.SET_SELL_PRICE.value,
+            account_id=storage.id,
+            only_pending=False,
+        )
+        await create_task(
+            task_type=TaskType.SET_SELL_PRICE.value,
+            priority=300,
+            account_id=storage.id,
+            payload={
+                "ranges": ranges,
+                "priority_tokens": priority_tokens,
+                "fallback_non_priority_mode": "sell_all_when_priority_empty",
+            },
+        )
+    return len(storages), None
+
+
+async def save_sell_price_snapshot(
+    ranges: dict[str, dict[str, int]],
+    priority_tokens: list[str],
+) -> None:
+    """Сохраняет последний набор диапазонов и приоритетов для повтора по «Запустить продажи»."""
+    ranges_s = json.dumps(ranges, ensure_ascii=False)
+    prio_s = json.dumps(priority_tokens, ensure_ascii=False)
+    async with AsyncSessionMaker() as session:
+        settings = await session.scalar(select(ControllerSettings).where(ControllerSettings.id == 1))
+        if not settings:
+            settings = ControllerSettings(
+                id=1,
+                death_points_target=600,
+                farmer_ratio_percent=70,
+                farming_enabled=False,
+                sales_enabled=False,
+                sell_ranges_json=ranges_s,
+                sell_priority_tokens_json=prio_s,
+            )
+            session.add(settings)
+        else:
+            settings.sell_ranges_json = ranges_s
+            settings.sell_priority_tokens_json = prio_s
+        await session.commit()
 
 
 def build_router(config: Config) -> Router:
@@ -995,41 +1063,15 @@ def build_router(config: Config) -> Router:
         data = await state.get_data()
         ranges = data.get("price_ranges", {})
 
-        await rebalance_active_account_roles()
-        async with AsyncSessionMaker() as session:
-            storages = (
-                await session.scalars(
-                    select(Account).where(
-                        Account.role == AccountRole.STORAGE.value,
-                        Account.status == AccountStatus.ACTIVE.value,
-                    )
-                )
-            ).all()
-
-        if not storages:
-            await message.answer("Нет активных аккаунтов-складов.", reply_markup=control_kb())
+        count, err = await enqueue_set_sell_price_for_active_storages(ranges, unique)
+        if err:
+            await message.answer(err, reply_markup=control_kb())
             await state.clear()
             return
 
-        for storage in storages:
-            await request_cancel_tasks(
-                task_type=TaskType.SET_SELL_PRICE.value,
-                account_id=storage.id,
-                only_pending=False,
-            )
-            await create_task(
-                task_type=TaskType.SET_SELL_PRICE.value,
-                priority=300,
-                account_id=storage.id,
-                payload={
-                    "ranges": ranges,
-                    "priority_tokens": unique,
-                    "fallback_non_priority_mode": "sell_all_when_priority_empty",
-                },
-            )
-
+        await save_sell_price_snapshot(ranges, unique)
         await message.answer(
-            f"Созданы задачи `Выставить цену` для {len(storages)} складов.\n"
+            f"Созданы задачи `Выставить цену` для {count} складов.\n"
             f"Приоритеты: {', '.join(unique)}",
             reply_markup=control_kb(),
         )
@@ -1176,7 +1218,60 @@ def build_router(config: Config) -> Router:
                 settings.sales_enabled = True
             await session.commit()
 
-        await message.answer("Продажи включены.", reply_markup=control_kb())
+        async with AsyncSessionMaker() as session:
+            settings_row = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+        ranges_raw = (settings_row.sell_ranges_json if settings_row else None) or ""
+        prio_raw = (settings_row.sell_priority_tokens_json if settings_row else None) or ""
+
+        if not ranges_raw.strip() or not prio_raw.strip():
+            await message.answer(
+                "Продажи включены.\n\n"
+                "Нет сохранённого набора цен: один раз пройди «Выставить цену» "
+                "(диапазоны и 4 приоритета) — тогда настройки сохранятся в БД. "
+                "После этого «Запустить продажи» снова поставит задачи `Выставить цену` на склады.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        try:
+            ranges = json.loads(ranges_raw)
+            priority_tokens = json.loads(prio_raw)
+        except json.JSONDecodeError:
+            await message.answer(
+                "Продажи включены, но сохранённые настройки цен в БД повреждены. "
+                "Пройди «Выставить цену» заново.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        if not isinstance(ranges, dict) or not isinstance(priority_tokens, list):
+            await message.answer(
+                "Продажи включены, но сохранённые настройки цен имеют неверный формат. "
+                "Пройди «Выставить цену» заново.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        if len(priority_tokens) != 4 or any(p not in SELLABLE_TOKENS for p in priority_tokens):
+            await message.answer(
+                "Продажи включены, но сохранённые приоритеты устарели или некорректны. "
+                "Пройди «Выставить цену» заново.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        count, err = await enqueue_set_sell_price_for_active_storages(ranges, priority_tokens)
+        if err:
+            await message.answer(f"Продажи включены. {err}", reply_markup=control_kb())
+            return
+
+        await message.answer(
+            f"Продажи включены. Созданы задачи `Выставить цену` для {count} складов.\n"
+            f"Приоритеты: {', '.join(priority_tokens)}",
+            reply_markup=control_kb(),
+        )
 
     @router.message(F.text == MainMenuButtons.STOP_SALES.value, AdminFilter(config.admin_id))
     async def on_stop_sales(message: Message):

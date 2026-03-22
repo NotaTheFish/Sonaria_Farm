@@ -54,6 +54,9 @@ class ControllerSettings(Base):
     farmer_ratio_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=70)
     farming_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sales_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Последний успешный набор из мастера «Выставить цену» (JSON) — для повтора задач по «Запустить продажи».
+    sell_ranges_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sell_priority_tokens_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
