@@ -11,7 +11,8 @@
 | `farm/task_queue.py` | Создание/claim/отмена задач, lease, логи |
 | `farm/controller/bot.py` | Telegram-бот (только админ) |
 | `farm/worker/main.py` | Polling-воркер |
-| `farm/game/adapter.py` | **Точка расширения**: Roblox / Sonaria (твоя реализация) |
+| `farm/game/adapter.py` | Файловые мосты Windows / `GameAdapter` |
+| `scripts/file_bridge_echo.py` | Авто-`response.json` для теста мостов |
 | `alembic/` | Миграции PostgreSQL |
 
 Корневые шимы для удобства деплоя:
@@ -122,8 +123,12 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 Каждый вызов `WindowsGameAdapter.farm_tick()` — один шаг через файловый мост:
 
 1. Воркер создаёт запрос: `FARM_TICK_DIR/<task_id>.request.json` (по умолчанию `runtime/farm_tick/`).
-2. Внешний процесс (инжектор/скрипт) читает запрос, выполняет шаг в игре, пишет ответ: `FARM_TICK_DIR/<task_id>.response.json`.
+2. Внешний процесс читает запрос и пишет ответ: **`FARM_TICK_DIR/<task_id>.response.json`** (каталог по умолчанию: **`…\sonaria_farm\runtime\farm_tick`**, не корень репозитория в Проводнике). Допустимо имя **`<task_id>.resp.json`** — если сократил «response» по привычке.
 3. Адаптер читает ответ, при необходимости обновляет статус аккаунта, удаляет оба файла.
+
+При **каждом** новом тике для текущей задачи воркер удаляет из `FARM_TICK_DIR` все `*.request.json` / `*.response.json` с **другим** `task_id` — чтобы не копились хвосты после смены задачи «Запустить фарм» или падения прошлого цикла.
+
+Если после сбоя остался «лишний» `response` для **той же** задачи (не удалился из‑за блокировки файла), включи в `.env` **`FARM_TICK_CLEAN_ON_START=1`** — при следующем запуске воркера каталог моста обнулится (один воркер на эту папку).
 
 **request.json** (пример):
 
@@ -162,7 +167,42 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 
 Переменные окружения: `FARM_TICK_DIR`, `FARM_TICK_TIMEOUT_SECONDS`, `FARM_TICK_POLL_SECONDS`.
 
-**Windows:** в Проводнике включи **«Расширения имён файлов»**. Иначе легко сохранить файл как `…response.json.txt` — воркер ждёт ровно `…response.json` и по таймауту удалит только request; ответ он не увидит.
+**Windows / Блокнот:** если создаёшь ответ как **новый текстовый файл**, вставляешь JSON и **переименовываешь** в `…response.json`, содержимое часто остаётся в **UTF-16** (так пишет Notepad). Воркер теперь пробует и UTF-8, и UTF-16. Надёжнее: **«Сохранить как» → UTF-8** или сразу создавай файл в Cursor/VS Code с кодировкой UTF-8.
+
+Если при переименовании осталось скрытое **`.txt`** (`…response.json.txt`) — такой файл тоже принимается.
+
+В Проводнике полезно включить **«Расширения имён файлов»**, чтобы видеть полное имя.
+
+Если ответ не подхватывается: смотри **консоль воркера** — раз в `FARM_TICK_DIAGNOSTIC_SECONDS` (по умолчанию 15 с) пишется **полный путь** ожидаемого файла и список имён в `FARM_TICK_DIR` с этим `task_id`. Частая ошибка — положить JSON в **другую копию** репозитория (другой диск/папка), чем та, откуда запущен `worker_main.py`.
+
+### Transfer → склад и выставление цен (`GAME_ADAPTER=windows`)
+
+Один обмен на задачу (без цикла, как один `farm_tick`):
+
+| Задача бота | Каталог (по умолчанию) | `request.json` содержит |
+|-------------|------------------------|-------------------------|
+| `transfer_to_storage` | `runtime/transfer_bridge/` | `bridge`, `task_id`, `worker_id`, `farmer_account_id`, `payload` (как в боте) |
+| `set_sell_price` | `runtime/sell_bridge/` | `bridge`, `task_id`, `worker_id`, `storage_account_id`, `payload` |
+
+**response.json** (как у farm_tick):
+
+```json
+{ "ok": true, "log": "optional", "account_status": null, "reason": null }
+```
+
+или `{ "ok": false, "error": "..." }`.
+
+Переменные: `TRANSFER_BRIDGE_DIR`, `TRANSFER_BRIDGE_TIMEOUT_SECONDS`, `SELL_BRIDGE_DIR`, `SELL_BRIDGE_*` (по умолчанию те же таймауты, что у `FARM_TICK_*`).
+
+### Скрипт авто-ответа (тест очереди)
+
+Из корня репозитория:
+
+```bash
+python scripts/file_bridge_echo.py
+```
+
+Следит за `runtime/farm_tick`, `transfer_bridge`, `sell_bridge` и на каждый новый `*.request.json` пишет `*.response.json` с `"ok": true`. **Не запускай** одновременно с ручной отладкой фарма, если не хочешь мгновенных тиков.
 
 ## Старые наброски
 
