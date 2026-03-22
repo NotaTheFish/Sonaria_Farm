@@ -1,0 +1,5 @@
+# Разработка и тесты (опционально):
+#   pip install -r requirements-minimal.txt -r requirements-dev.txt
+# Рекомендуемый Python: 3.11–3.12 (см. README; 3.14 может не собрать pydantic-core).
+
+pytest>=7.4.0

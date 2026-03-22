@@ -34,6 +34,13 @@ class Account(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     banned_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Снимок токенов/инвентаря с последнего успешного ответа моста (farm_tick / transfer / sell).
+    inventory_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inventory_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

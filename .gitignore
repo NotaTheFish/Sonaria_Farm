@@ -52,3 +52,6 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Локальный клиент моста / бинарники (раскомментируй при необходимости)
+# external/my_injector/

@@ -19,138 +19,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("farm.game.adapter")
-
-# Корень репозитория: farm/game/adapter.py -> parents[2] == <repo>/
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _bridge_dir_from_env(var_name: str, default_relative: str) -> Path:
-    """
-    Каталог для файлового моста. Относительные пути считаются от корня репозитория,
-    а не от текущего cwd процесса (иначе воркер не находит файлы при запуске из другой папки).
-    """
-    raw = os.getenv(var_name, default_relative)
-    p = Path(raw)
-    if not p.is_absolute():
-        p = _REPO_ROOT / p
-    return p
-
 from sqlalchemy import update
 
 from farm.database import AsyncSessionMaker
+from farm.game import file_bridge as fb
 from farm.models import Account, AccountStatus
 from farm.task_queue import append_task_log, get_task_account
 
-# Длинные суффиксы первыми (иначе .response.json «съест» .response.json.txt)
-_FARM_TICK_BRIDGE_SUFFIXES: tuple[str, ...] = (
-    ".response.json.txt",
-    ".response.json",
-    ".resp.json",
-    ".request.json",
-)
-_FARM_TICK_RESPONSE_SUFFIXES: tuple[str, ...] = (
-    ".response.json.txt",
-    ".response.json",
-    ".resp.json",
-)
-
-
-def _farm_tick_bridge_task_id(name: str) -> str | None:
-    """UUID задачи из имени файла моста или None."""
-    for suf in _FARM_TICK_BRIDGE_SUFFIXES:
-        if name.endswith(suf):
-            tid = name[: -len(suf)].strip()
-            return tid or None
-    return None
-
-
-def _is_farm_tick_bridge_file(name: str) -> bool:
-    return _farm_tick_bridge_task_id(name) is not None
-
-
-def _is_farm_tick_response_filename(name: str) -> bool:
-    return any(name.endswith(s) for s in _FARM_TICK_RESPONSE_SUFFIXES)
-
-
-def _read_json_from_file_bytes(path: Path) -> Any:
-    """
-    JSON из файла, созданного в Блокноте и переименованного в .json:
-    по умолчанию Notepad часто пишет UTF-16 LE, а мы раньше читали только utf-8.
-    """
-    raw = path.read_bytes()
-    if not raw.strip():
-        raise ValueError("empty file")
-    errs: list[str] = []
-    for encoding in ("utf-8-sig", "utf-8", "utf-16-le", "utf-16-be", "utf-16", "cp1251"):
-        try:
-            text = raw.decode(encoding)
-            return json.loads(text)
-        except UnicodeDecodeError as e:
-            errs.append(f"{encoding}: decode {e}")
-        except json.JSONDecodeError as e:
-            errs.append(f"{encoding}: json {e}")
-    raise ValueError("; ".join(errs))
-
-
-def _find_farm_tick_response_file(farm_tick_dir: Path, task_id: str) -> Path | None:
-    """
-    Ищет файл ответа (канон и распространённые варианты на Windows).
-    """
-    norm_tid = task_id.strip().lower()
-    try:
-        for suf in _FARM_TICK_RESPONSE_SUFFIXES:
-            p = farm_tick_dir / f"{task_id}{suf}"
-            if p.is_file():
-                return p.resolve()
-        for p in farm_tick_dir.iterdir():
-            if not p.is_file() or not _is_farm_tick_response_filename(p.name):
-                continue
-            tid = _farm_tick_bridge_task_id(p.name)
-            if tid is not None and tid.strip().lower() == norm_tid:
-                return p.resolve()
-    except OSError:
-        pass
-    return None
-
-
-def _cleanup_other_task_bridge_files(bridge_dir: Path, current_task_id: str) -> list[str]:
-    """
-    Удаляет файлы моста (*.request.json / *.response* / *.resp*) с другим task_id.
-    """
-    removed: list[str] = []
-    cur = current_task_id.strip().lower()
-    try:
-        for p in list(bridge_dir.iterdir()):
-            if not p.is_file():
-                continue
-            tid = _farm_tick_bridge_task_id(p.name)
-            if tid is not None and tid.strip().lower() != cur:
-                try:
-                    p.unlink(missing_ok=True)
-                    removed.append(p.name)
-                except OSError as exc:
-                    logger.warning("farm_tick orphan cleanup: cannot remove %s: %s", p, exc)
-    except OSError as exc:
-        logger.warning("bridge orphan cleanup: listdir %s: %s", bridge_dir, exc)
-    return removed
-
-
-def _wipe_all_farm_tick_bridge_files(farm_tick_dir: Path) -> list[str]:
-    """Удаляет все файлы моста в каталоге (чистый старт воркера)."""
-    removed: list[str] = []
-    try:
-        for p in list(farm_tick_dir.iterdir()):
-            if not p.is_file() or not _is_farm_tick_bridge_file(p.name):
-                continue
-            try:
-                p.unlink(missing_ok=True)
-                removed.append(p.name)
-            except OSError as exc:
-                logger.warning("farm_tick wipe: cannot remove %s: %s", p, exc)
-    except OSError as exc:
-        logger.warning("farm_tick wipe: listdir %s: %s", farm_tick_dir, exc)
-    return removed
+logger = logging.getLogger("farm.game.adapter")
 
 
 class GameAdapter(ABC):
@@ -200,7 +76,7 @@ class WindowsGameAdapter(GameAdapter):
 
     Как подключать:
       1) В .env или переменных окружения: GAME_ADAPTER=windows
-      2) Методы `login_and_check`, `farm_tick`, `transfer_to_storage`, `set_sell_price` используют файловые мосты; реальную игру делает твой процесс по JSON в `runtime/`.
+      2) Методы `login_and_check`, `farm_tick`, `transfer_to_storage`, `set_sell_price` используют файловые мосты; реальную игру делает твой процесс по JSON в `runtime/` (или см. `FILE_BRIDGE_ROOT` / `FILE_BRIDGE_UNIFIED_DIR` в `farm.game.file_bridge`).
 
     Общий поток (наводки, без деталей клиента):
       - Храни сессию «один аккаунт = один процесс Roblox» в полях экземпляра
@@ -220,26 +96,32 @@ class WindowsGameAdapter(GameAdapter):
     """
 
     def __init__(self) -> None:
-        self.check_results_dir = _bridge_dir_from_env(
-            "LOGIN_CHECK_RESULTS_DIR",
-            "runtime/login_check_results",
+        self.check_results_dir = fb.resolve_repo_relative(
+            os.getenv("LOGIN_CHECK_RESULTS_DIR", "runtime/login_check_results")
         )
         self.check_timeout_seconds = int(os.getenv("LOGIN_CHECK_TIMEOUT_SECONDS", "180"))
         self.check_poll_seconds = float(os.getenv("LOGIN_CHECK_POLL_SECONDS", "1.0"))
         self.check_results_dir.mkdir(parents=True, exist_ok=True)
 
-        self.farm_tick_dir = _bridge_dir_from_env("FARM_TICK_DIR", "runtime/farm_tick")
+        self.farm_tick_dir, self.transfer_bridge_dir, self.sell_bridge_dir = fb.bridge_directories_for_worker()
+        unified = fb.get_unified_bridge_dir() is not None
+        self._bridge_tag_farm = fb.TAG_FARM_TICK if unified else None
+        self._bridge_tag_transfer = fb.TAG_TRANSFER if unified else None
+        self._bridge_tag_sell = fb.TAG_SELL if unified else None
+
         self.farm_tick_timeout_seconds = int(os.getenv("FARM_TICK_TIMEOUT_SECONDS", "120"))
         self.farm_tick_poll_seconds = float(os.getenv("FARM_TICK_POLL_SECONDS", "1.0"))
         self.farm_tick_dir.mkdir(parents=True, exist_ok=True)
         self._farm_tick_seq: dict[str, int] = defaultdict(int)
 
         if os.getenv("FARM_TICK_CLEAN_ON_START", "").strip().lower() in ("1", "true", "yes"):
-            wiped = _wipe_all_farm_tick_bridge_files(self.farm_tick_dir)
+            if self._bridge_tag_farm:
+                wiped = fb.wipe_unified_tag_files(self.farm_tick_dir, fb.TAG_FARM_TICK)
+            else:
+                wiped = fb.wipe_all_legacy_bridge_files(self.farm_tick_dir)
             if wiped:
                 logger.info("FARM_TICK_CLEAN_ON_START: удалены файлы моста: %s", wiped)
 
-        self.transfer_bridge_dir = _bridge_dir_from_env("TRANSFER_BRIDGE_DIR", "runtime/transfer_bridge")
         self.transfer_bridge_dir.mkdir(parents=True, exist_ok=True)
         self.transfer_bridge_timeout_seconds = int(
             os.getenv("TRANSFER_BRIDGE_TIMEOUT_SECONDS", os.getenv("FARM_TICK_TIMEOUT_SECONDS", "120"))
@@ -248,7 +130,6 @@ class WindowsGameAdapter(GameAdapter):
             os.getenv("TRANSFER_BRIDGE_POLL_SECONDS", os.getenv("FARM_TICK_POLL_SECONDS", "1.0"))
         )
 
-        self.sell_bridge_dir = _bridge_dir_from_env("SELL_BRIDGE_DIR", "runtime/sell_bridge")
         self.sell_bridge_dir.mkdir(parents=True, exist_ok=True)
         self.sell_bridge_timeout_seconds = int(
             os.getenv("SELL_BRIDGE_TIMEOUT_SECONDS", os.getenv("FARM_TICK_TIMEOUT_SECONDS", "120"))
@@ -257,6 +138,12 @@ class WindowsGameAdapter(GameAdapter):
             os.getenv("SELL_BRIDGE_POLL_SECONDS", os.getenv("FARM_TICK_POLL_SECONDS", "1.0"))
         )
 
+        if unified:
+            logger.info(
+                "WindowsGameAdapter: FILE_BRIDGE_UNIFIED_DIR — один каталог %s "
+                "(имена: {task_id}.farm_tick|transfer|sell.request.json)",
+                self.farm_tick_dir.resolve(),
+            )
         logger.info(
             "WindowsGameAdapter paths (absolute): LOGIN_CHECK=%s FARM_TICK=%s TRANSFER=%s SELL=%s",
             self.check_results_dir.resolve(),
@@ -303,6 +190,7 @@ class WindowsGameAdapter(GameAdapter):
         *,
         kind: str,
         bridge_dir: Path,
+        bridge_tag: str | None,
         task_id: str,
         worker_id: str,
         request_document: dict[str, Any],
@@ -313,15 +201,12 @@ class WindowsGameAdapter(GameAdapter):
         Один обмен request.json → response.json (как farm_tick, без tick_seq).
         """
         bridge_dir.mkdir(parents=True, exist_ok=True)
-        request_path = bridge_dir / f"{task_id}.request.json"
-        response_path = bridge_dir / f"{task_id}.response.json"
+        request_path = fb.bridge_request_path(bridge_dir, task_id, bridge_tag)
+        response_name = fb.bridge_canonical_response_name(task_id, bridge_tag)
+        response_path = bridge_dir / response_name
 
-        removed_orphans = _cleanup_other_task_bridge_files(bridge_dir, task_id)
-        for suf in _FARM_TICK_RESPONSE_SUFFIXES:
-            try:
-                (bridge_dir / f"{task_id}{suf}").unlink(missing_ok=True)
-            except Exception:
-                pass
+        removed_orphans = fb.cleanup_bridge_orphans(bridge_dir, task_id, bridge_tag)
+        fb.pre_exchange_remove_stale_responses(bridge_dir, task_id, bridge_tag)
 
         request_path.write_text(
             json.dumps(request_document, ensure_ascii=False, indent=2),
@@ -343,10 +228,10 @@ class WindowsGameAdapter(GameAdapter):
 
         waited = 0.0
         last_diagnostic = -1e9
-        diagnostic_every = float(os.getenv("FARM_TICK_DIAGNOSTIC_SECONDS", "15"))
+        diagnostic_every = float(os.getenv(fb.ENV_DIAGNOSTIC_SECONDS, "15"))
         response_found: Path | None = None
         while waited < timeout_seconds:
-            response_found = _find_farm_tick_response_file(bridge_dir, task_id)
+            response_found = fb.find_bridge_response_file(bridge_dir, task_id, bridge_tag)
             if response_found is not None:
                 break
             if waited - last_diagnostic >= diagnostic_every:
@@ -376,7 +261,7 @@ class WindowsGameAdapter(GameAdapter):
             )
 
         try:
-            parsed = _read_json_from_file_bytes(response_found)
+            parsed = fb.read_json_from_file_bytes(response_found)
             if not isinstance(parsed, dict):
                 raise ValueError(f"ожидался JSON-объект, получен {type(parsed).__name__}")
             data = parsed
@@ -424,6 +309,19 @@ class WindowsGameAdapter(GameAdapter):
             message=f"[windows] {kind} ok.{tail}",
         )
 
+    async def _maybe_save_inventory_from_response(
+        self,
+        data: dict[str, Any],
+        account_id: str,
+    ) -> None:
+        """Если в ответе моста есть объект inventory — сохраняем снимок в accounts."""
+        inv = data.get("inventory")
+        if not isinstance(inv, dict) or not inv:
+            return
+        from farm.account_inventory import save_account_inventory_snapshot
+
+        await save_account_inventory_snapshot(account_id, inv)
+
     async def login_and_check(self, *, task_id: str, worker_id: str, account: Account) -> None:
         """
         Рабочий базовый контракт:
@@ -461,7 +359,7 @@ class WindowsGameAdapter(GameAdapter):
             )
 
         try:
-            parsed = _read_json_from_file_bytes(result_path)
+            parsed = fb.read_json_from_file_bytes(result_path)
             if not isinstance(parsed, dict):
                 raise ValueError(f"ожидался JSON-объект, получен {type(parsed).__name__}")
             data = parsed
@@ -522,9 +420,10 @@ class WindowsGameAdapter(GameAdapter):
         """
         Один шаг цикла фарма через файловый мост (как login_and_check):
 
-        1) Адаптер пишет: FARM_TICK_DIR/{task_id}.request.json
-        2) Внешний процесс пишет ответ: FARM_TICK_DIR/{task_id}.response.json
-           (алиас: {task_id}.resp.json — см. README)
+        1) Адаптер пишет request в FARM_TICK_DIR (или FILE_BRIDGE_UNIFIED_DIR):
+           ``{task_id}.request.json`` либо ``{task_id}.farm_tick.request.json`` — см. ``farm.game.file_bridge``.
+        2) Внешний процесс пишет ответ с тем же префиксом/тегом
+           (алиас: ``.resp.json`` / ``.response.json.txt`` — см. README).
         3) Адаптер читает ответ, опционально обновляет статус аккаунта, удаляет response.
 
         request.json:
@@ -538,7 +437,8 @@ class WindowsGameAdapter(GameAdapter):
 
         response.json:
           { "ok": true, "log": "optional", "death_points_current": 123,
-            "account_status": null, "reason": null }
+            "account_status": null, "reason": null,
+            "inventory": { "Revive Token": 1, ... } }
         или
           { "ok": false, "error": "..." }
 
@@ -548,22 +448,18 @@ class WindowsGameAdapter(GameAdapter):
         self._farm_tick_seq[task_id] += 1
         tick_seq = self._farm_tick_seq[task_id]
 
-        request_path = self.farm_tick_dir / f"{task_id}.request.json"
-        response_path = self.farm_tick_dir / f"{task_id}.response.json"
+        tag = self._bridge_tag_farm
+        request_path = fb.bridge_request_path(self.farm_tick_dir, task_id, tag)
+        response_path = self.farm_tick_dir / fb.bridge_canonical_response_name(task_id, tag)
 
-        removed_orphans = _cleanup_other_task_bridge_files(self.farm_tick_dir, task_id)
+        removed_orphans = fb.cleanup_bridge_orphans(self.farm_tick_dir, task_id, tag)
         if removed_orphans:
             logger.info(
                 "farm_tick: removed bridge files from other task_id(s): %s",
                 removed_orphans,
             )
 
-        for suf in _FARM_TICK_RESPONSE_SUFFIXES:
-            _pre = self.farm_tick_dir / f"{task_id}{suf}"
-            try:
-                _pre.unlink(missing_ok=True)
-            except Exception:
-                pass
+        fb.pre_exchange_remove_stale_responses(self.farm_tick_dir, task_id, tag)
 
         request_payload = {
             "task_id": task_id,
@@ -595,10 +491,10 @@ class WindowsGameAdapter(GameAdapter):
 
         waited = 0.0
         last_diagnostic = -1e9
-        diagnostic_every = float(os.getenv("FARM_TICK_DIAGNOSTIC_SECONDS", "15"))
+        diagnostic_every = float(os.getenv(fb.ENV_DIAGNOSTIC_SECONDS, "15"))
         response_found: Path | None = None
         while waited < self.farm_tick_timeout_seconds:
-            response_found = _find_farm_tick_response_file(self.farm_tick_dir, task_id)
+            response_found = fb.find_bridge_response_file(self.farm_tick_dir, task_id, tag)
             if response_found is not None:
                 break
             if waited - last_diagnostic >= diagnostic_every:
@@ -654,19 +550,20 @@ class WindowsGameAdapter(GameAdapter):
                 "На Windows иногда лишнее расширение .txt (включи отображение расширений)."
             )
 
-        if response_found.name.lower() != f"{task_id}.response.json".lower():
+        canonical = fb.bridge_canonical_response_name(task_id, tag)
+        if response_found.name.lower() != canonical.lower():
             await append_task_log(
                 task_id=task_id,
                 worker_id=worker_id,
                 level="warning",
                 message=(
                     f"[windows] farm_tick: ответ в файле {response_found.name!r} "
-                    f"(каноническое имя: {task_id}.response.json; .resp.json — допустимый алиас)."
+                    f"(каноническое имя: {canonical}; .resp.json — допустимый алиас)."
                 ),
             )
 
         try:
-            parsed = _read_json_from_file_bytes(response_found)
+            parsed = fb.read_json_from_file_bytes(response_found)
             if not isinstance(parsed, dict):
                 raise ValueError(f"ожидался JSON-объект {{}}, получен {type(parsed).__name__}")
             data = parsed
@@ -709,6 +606,8 @@ class WindowsGameAdapter(GameAdapter):
                 reason=reason if isinstance(reason, str) else None,
             )
 
+        await self._maybe_save_inventory_from_response(data, account.id)
+
         log_msg = data.get("log")
         dp_cur = data.get("death_points_current")
         extra = f" death_points_current={dp_cur}" if dp_cur is not None else ""
@@ -734,6 +633,7 @@ class WindowsGameAdapter(GameAdapter):
         data = await self._file_bridge_exchange(
             kind="transfer_to_storage",
             bridge_dir=self.transfer_bridge_dir,
+            bridge_tag=self._bridge_tag_transfer,
             task_id=task_id,
             worker_id=worker_id,
             request_document={
@@ -753,6 +653,7 @@ class WindowsGameAdapter(GameAdapter):
             worker_id=worker_id,
             kind="transfer_to_storage",
         )
+        await self._maybe_save_inventory_from_response(data, farmer_account.id)
 
     async def set_sell_price(
         self,
@@ -770,6 +671,7 @@ class WindowsGameAdapter(GameAdapter):
         data = await self._file_bridge_exchange(
             kind="set_sell_price",
             bridge_dir=self.sell_bridge_dir,
+            bridge_tag=self._bridge_tag_sell,
             task_id=task_id,
             worker_id=worker_id,
             request_document={
@@ -789,6 +691,7 @@ class WindowsGameAdapter(GameAdapter):
             worker_id=worker_id,
             kind="set_sell_price",
         )
+        await self._maybe_save_inventory_from_response(data, storage_account.id)
 
 
 class StubGameAdapter(GameAdapter):
@@ -833,6 +736,17 @@ class StubGameAdapter(GameAdapter):
                 f"death_points_target={death_points_target}"
             ),
         )
+        if os.getenv("STUB_INVENTORY_DEMO", "").strip().lower() in ("1", "true", "yes"):
+            from farm.account_inventory import save_account_inventory_snapshot
+
+            await save_account_inventory_snapshot(
+                account.id,
+                {
+                    "Revive Token": 0,
+                    "Max Growth Token": 0,
+                    "_demo": "STUB_INVENTORY_DEMO=1 в .env — убери в проде",
+                },
+            )
         await asyncio.sleep(1)
 
     async def transfer_to_storage(

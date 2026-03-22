@@ -1,6 +1,6 @@
 # Sonaria Farm — контроллер + очередь + воркеры (Windows)
 
-**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`env.template`** → скопировать в `.env`.
+**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`config.example.env`** → скопировать в `.env`. Внешний клиент файлового моста: **[docs/EXTERNAL_BRIDGE_CLIENT.md](docs/EXTERNAL_BRIDGE_CLIENT.md)**.
 
 ## Структура
 
@@ -12,7 +12,15 @@
 | `farm/controller/bot.py` | Telegram-бот (только админ) |
 | `farm/worker/main.py` | Polling-воркер |
 | `farm/game/adapter.py` | Файловые мосты Windows / `GameAdapter` |
+| `farm/game/file_bridge.py` | Общие пути/суффиксы моста, `FILE_BRIDGE_ROOT` / `FILE_BRIDGE_UNIFIED_DIR` |
+| `farm/account_inventory.py` | Сохранение снимка `inventory` из ответа моста в `accounts` |
+| `farm/inventory_formatting.py` | Разбор JSON и HTML для кнопки «Инвентарь» в боте |
 | `scripts/file_bridge_echo.py` | Авто-`response.json` для теста мостов |
+| `scripts/bridge_sidecar.py` | Шаблон sidecar: лог + заглушка ответа |
+| `docs/EXTERNAL_BRIDGE_CLIENT.md` | Контракт моста для внешнего клиента / инжектора |
+| `external/` | Опционально: твой локальный код рядом с репо (см. `external/README.md`) |
+| `tests/` | Pytest: `file_bridge`, sidecar, при наличии SQLAlchemy — `task_queue`, `models` |
+| `requirements-dev.txt` | `pytest` и прочее для разработки |
 | `alembic/` | Миграции PostgreSQL |
 
 Корневые шимы для удобства деплоя:
@@ -21,6 +29,8 @@
 - `worker_main.py` → `farm.worker.main`
 
 ## Окружение Python (Windows)
+
+**Версия интерпретатора:** ориентируйся на **Python 3.11 или 3.12** (в CI и у большинства зависимостей есть готовые колёса). **Python 3.14** сейчас часто даёт ошибку сборки **`pydantic-core`** (`PyO3` / Rust: «newer than maximum supported») при `pip install` — проще поставить 3.12 с [python.org](https://www.python.org/downloads/), создать venv именно на нём и повторить установку.
 
 Ошибки `ModuleNotFoundError: No module named 'sqlalchemy'` / `'aiogram'` значат, что зависимости не установлены в **том** интерпретаторе, которым ты запускаешь `python`.
 
@@ -51,6 +61,19 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 Дальше запускай `python bot_main.py` / `python worker_main.py` **только с активированным venv** (или укажи полный путь: `.\.venv\Scripts\python.exe bot_main.py`).
 
 На Windows можно запускать по щелчку: **`run_bot.bat`**, **`run_worker.bat`** (корень репозитория; ищут `.venv` или `venv`). Переменные берутся из **`.env`** в том же каталоге.
+
+## Тесты
+
+Без PostgreSQL: `tests/test_file_bridge.py`, `tests/test_bridge_sidecar.py` (контракт моста и заглушка sidecar).
+
+С установленным **SQLAlchemy** (как в `requirements-minimal.txt`) дополнительно гоняются `tests/test_task_queue_helpers.py` и `tests/test_models_contracts.py` — хелперы env и строки enum.
+
+```powershell
+pip install -r requirements-minimal.txt -r requirements-dev.txt
+pytest
+```
+
+Если SQLAlchemy не установлен, часть тестов будет **пропущена** (skip). В CI (`.github/workflows/tests.yml`) ставится minimal + dev — полный набор.
 
 ## Запуск
 
@@ -150,11 +173,17 @@ python -c "import sqlalchemy, aiogram; print('ok')"
   "log": "optional текст в task_logs",
   "death_points_current": 123,
   "account_status": null,
-  "reason": null
+  "reason": null,
+  "inventory": {
+    "Revive Token": 2,
+    "Max Growth Token": 0
+  }
 }
 ```
 
 Опционально `account_status` / `reason` — как у `login_and_check` (если статус не `active`, воркер на следующей итерации остановит фарм).
+
+Опционально **`inventory`** — словарь «имя токена → число»; сохраняется в `accounts.inventory_json` и показывается в боте (кнопка «Инвентарь»). То же поле можно вернуть в ответах `transfer_to_storage` и `set_sell_price`.
 
 **response.json** — ошибка:
 
@@ -194,6 +223,13 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 
 Переменные: `TRANSFER_BRIDGE_DIR`, `TRANSFER_BRIDGE_TIMEOUT_SECONDS`, `SELL_BRIDGE_DIR`, `SELL_BRIDGE_*` (по умолчанию те же таймауты, что у `FARM_TICK_*`).
 
+**Один корень или одна папка (инжектор):** см. `farm/game/file_bridge.py`.
+
+- **`FILE_BRIDGE_ROOT`** — если не заданы отдельные `FARM_TICK_DIR` / `TRANSFER_BRIDGE_DIR` / `SELL_BRIDGE_DIR`, используются подкаталоги `farm_tick`, `transfer_bridge`, `sell_bridge` внутри корня.
+- **`FILE_BRIDGE_UNIFIED_DIR`** — один каталог; имена с тегом: `{task_id}.farm_tick.request.json`, `{task_id}.transfer.request.json`, `{task_id}.sell.request.json` (ответы — `.response.json` или `.resp.json` с тем же тегом). Удобно повесить **один** вотчер на каталог. Имеет приоритет над `FILE_BRIDGE_ROOT`; отдельные `FARM_TICK_DIR` / `TRANSFER_*` / `SELL_*` в этом режиме для трёх мостов не используются.
+
+Интеграционный тест очереди без инжектора: воркер с `GAME_ADAPTER=windows` + рядом **`python scripts/file_bridge_echo.py`** (читает те же env, что и адаптер).
+
 ### Telegram: «Выставить цену» и «Запустить продажи»
 
 После мастера **«Выставить цену»** (диапазоны по токенам + ровно 4 приоритета) бот ставит задачи `set_sell_price` на активные склады и **сохраняет последний набор** в `controller_settings` (`sell_ranges_json`, `sell_priority_tokens_json`).
@@ -208,7 +244,7 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 python scripts/file_bridge_echo.py
 ```
 
-Следит за `runtime/farm_tick`, `transfer_bridge`, `sell_bridge` и на каждый новый `*.request.json` пишет `*.response.json` с `"ok": true`. **Не запускай** одновременно с ручной отладкой фарма, если не хочешь мгновенных тиков.
+Следит за теми же каталогами, что и `WindowsGameAdapter` (три папки по умолчанию, один при `FILE_BRIDGE_UNIFIED_DIR`), и на каждый новый `*.request.json` пишет парный `*.response.json` с `"ok": true`. **Не запускай** одновременно с ручной отладкой фарма, если не хочешь мгновенных тиков.
 
 ## Старые наброски
 

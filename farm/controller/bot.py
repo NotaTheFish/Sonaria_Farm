@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import html
 import json
 import logging
 import os
@@ -32,6 +33,12 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from farm.database import AsyncSessionMaker, ensure_migrations_applied
+from farm.inventory_formatting import (
+    format_inventory_timestamp,
+    format_token_lines_html,
+    parse_inventory_json,
+    split_telegram_chunks,
+)
 from farm.models import (
     Account,
     AccountRole,
@@ -405,13 +412,77 @@ def build_router(config: Config) -> Router:
 
     @router.message(F.text == SettingsButtons.INVENTORY.value, AdminFilter(config.admin_id))
     async def on_inventory(message: Message):
-        # TODO: подставить реальные данные из хранилища
-        text = (
-            "Инвентарь (пока заглушка):\n"
-            "Фермеры: токены не посчитаны.\n"
-            "Склады: токены не посчитаны."
-        )
-        await message.answer(text, reply_markup=accounts_checks_kb())
+        async with AsyncSessionMaker() as session:
+            farmers = (
+                await session.scalars(
+                    select(Account)
+                    .where(
+                        Account.role == AccountRole.FARMER.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                    .order_by(Account.login.asc())
+                )
+            ).all()
+            storages = (
+                await session.scalars(
+                    select(Account)
+                    .where(
+                        Account.role == AccountRole.STORAGE.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                    .order_by(Account.login.asc())
+                )
+            ).all()
+
+        lines: list[str] = [
+            "<b>Инвентарь</b>",
+            "",
+            "Снимок из поля <code>inventory</code> в JSON-ответе моста "
+            "(<code>farm_tick</code>, <code>transfer_to_storage</code>, <code>set_sell_price</code>).",
+            "Имена токенов — как в мастере цен (см. список ниже).",
+            "",
+        ]
+        if not farmers and not storages:
+            lines.append("<i>Нет active аккаунтов с ролями фермер / склад.</i>")
+            full = "\n".join(lines)
+            for chunk in split_telegram_chunks(full):
+                await message.answer(chunk, parse_mode=ParseMode.HTML, reply_markup=accounts_checks_kb())
+            return
+
+        lines.append(f"<b>Фермеры</b> (active, {len(farmers)})")
+        if not farmers:
+            lines.append("<i>нет</i>")
+        for a in farmers:
+            inv = parse_inventory_json(a.inventory_json)
+            lines.append("")
+            lines.append(f"<code>{html.escape(a.login[:64])}</code>")
+            lines.append(
+                f"<i>обновлено:</i> {html.escape(format_inventory_timestamp(a.inventory_updated_at))}"
+            )
+            lines.append(format_token_lines_html(inv, SELLABLE_TOKENS))
+
+        lines.append("")
+        lines.append(f"<b>Склады</b> (active, {len(storages)})")
+        if not storages:
+            lines.append("<i>нет</i>")
+        for a in storages:
+            inv = parse_inventory_json(a.inventory_json)
+            lines.append("")
+            lines.append(f"<code>{html.escape(a.login[:64])}</code>")
+            lines.append(
+                f"<i>обновлено:</i> {html.escape(format_inventory_timestamp(a.inventory_updated_at))}"
+            )
+            lines.append(format_token_lines_html(inv, SELLABLE_TOKENS))
+
+        full = "\n".join(lines)
+        chunks = split_telegram_chunks(full)
+        for i, chunk in enumerate(chunks):
+            prefix = f"<i>продолжение {i + 1}/{len(chunks)}</i>\n\n" if i else ""
+            await message.answer(
+                prefix + chunk,
+                parse_mode=ParseMode.HTML,
+                reply_markup=accounts_checks_kb() if i == len(chunks) - 1 else None,
+            )
 
     @router.message(F.text == SettingsButtons.QUEUE_STATUS.value, AdminFilter(config.admin_id))
     async def on_queue_status(message: Message):

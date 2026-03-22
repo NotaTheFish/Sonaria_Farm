@@ -44,7 +44,7 @@ python bot_main.py
 
 ### 2.2 Windows (только воркер)
 
-В корне репозитория файл **`.env`** (скопируй из `env.template` в корне проекта и заполни).
+В корне репозитория файл **`.env`** (скопируй из `config.example.env` в корне проекта и заполни).
 
 Минимум для воркера:
 
@@ -97,9 +97,11 @@ python -m pip install -U pip
 pip install -r requirements.txt
 ```
 
-Скопируй `env.template` → `.env`, впиши `DATABASE_URL` (и при желании сгенерируй постоянный `WORKER_ID`).
+Скопируй `config.example.env` → `.env`, впиши `DATABASE_URL` (и при желании сгенерируй постоянный `WORKER_ID`).
 
-Запуск воркера **всегда из корня репозитория** (чтобы пути `runtime/login_check_results` и `runtime/farm_tick` совпадали с ожиданиями адаптера):
+Запуск воркера **всегда из корня репозитория** (чтобы относительные пути вроде `runtime/login_check_results` резолвились от корня репозитория, а не от `cwd`).
+
+Опционально **`FILE_BRIDGE_UNIFIED_DIR`** — один каталог для `farm_tick` + `transfer` + `sell` (разные теги в имени файла); удобно для одного FileSystemWatcher / инжектора. См. `farm/game/file_bridge.py`, **`docs/EXTERNAL_BRIDGE_CLIENT.md`** и `config.example.env`.
 
 ```cmd
 cd /d C:\sonaria_farm
@@ -201,5 +203,5 @@ python worker_main.py
 
 ## 8. Файлы в репозитории
 
-- **`env.template`** — скопируй в **`.env`** на машине с воркером (и используй как чеклист переменных для Railway).
+- **`config.example.env`** — скопируй в **`.env`** на машине с воркером (и используй как чеклист переменных для Railway).
 - Подробности форматов мостов — в **`README.md`**.
