@@ -24,11 +24,14 @@ from farm.database import AsyncSessionMaker, ensure_migrations_applied
 from farm.game.adapter import GameAdapter, get_game_adapter, load_account_or_raise
 from farm.models import Account, AccountStatus, TaskType
 from farm.task_queue import (
+    acquire_instance_for_worker,
     append_task_log,
     claim_next_task,
     ensure_worker,
+    heartbeat_instance,
     heartbeat_worker,
     is_task_cancel_requested,
+    request_cancel_tasks,
     mark_task_cancelled,
     mark_task_done,
     mark_task_failed,
@@ -91,6 +94,12 @@ async def _run_farm_loop(
                 level="warning",
                 message="Cancel requested. Stopping farm loop.",
             )
+            # Чтобы stop_farm tasks не копились в pending после отмены start_farm
+            await request_cancel_tasks(
+                task_type=TaskType.STOP_FARM.value,
+                account_id=account_id,
+                only_pending=True,
+            )
             await mark_task_cancelled(task_id=task_id)
             return
 
@@ -100,6 +109,11 @@ async def _run_farm_loop(
                 worker_id=worker_id,
                 level="error",
                 message=f"Account inactive (status={account.status}). Stopping farm.",
+            )
+            # Убираем pending-задачи, которые могут пытаться использовать этот аккаунт
+            await request_cancel_tasks(
+                account_id=account_id,
+                only_pending=True,
             )
             await mark_task_failed(
                 task_id=task_id,
@@ -145,6 +159,18 @@ async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
 
         if task.task_type == TaskType.TRANSFER_TO_STORAGE.value:
             farmer = await load_account_or_raise(task.id)
+            if farmer.status in _inactive_account_statuses():
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="error",
+                    message=f"Farmer account inactive status={farmer.status}. Skip transfer.",
+                )
+                await mark_task_failed(
+                    task_id=task.id,
+                    error=f"account_inactive:{farmer.status}",
+                )
+                return
             await adapter.transfer_to_storage(
                 task_id=task.id,
                 worker_id=worker_id,
@@ -156,6 +182,18 @@ async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
 
         if task.task_type == TaskType.SET_SELL_PRICE.value:
             storage = await load_account_or_raise(task.id)
+            if storage.status in _inactive_account_statuses():
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="error",
+                    message=f"Storage account inactive status={storage.status}. Skip sell-price.",
+                )
+                await mark_task_failed(
+                    task_id=task.id,
+                    error=f"account_inactive:{storage.status}",
+                )
+                return
             await adapter.set_sell_price(
                 task_id=task.id,
                 worker_id=worker_id,
@@ -186,6 +224,7 @@ async def main() -> None:
     account_id = os.getenv("WORKER_ACCOUNT_ID")
     worker_id = os.getenv("WORKER_ID")
     hostname = socket.gethostname()
+    instance_name = os.getenv("WORKER_INSTANCE_NAME", f"{hostname}-instance-1")
 
     worker_id = await ensure_worker(
         worker_id=worker_id,
@@ -193,17 +232,25 @@ async def main() -> None:
         account_id=account_id,
         hostname=hostname,
     )
+    await acquire_instance_for_worker(
+        worker_id=worker_id,
+        instance_name=instance_name,
+        host=hostname,
+        account_id=account_id,
+    )
     logger.info(
-        "Worker started: id=%s role=%s account_id=%s adapter=%s",
+        "Worker started: id=%s role=%s account_id=%s instance=%s adapter=%s",
         worker_id,
         role,
         account_id,
+        instance_name,
         os.getenv("GAME_ADAPTER", "stub"),
     )
 
     while True:
         try:
             await heartbeat_worker(worker_id=worker_id)
+            await heartbeat_instance(instance_name=instance_name)
             tasks = await claim_next_task(
                 worker_id=worker_id,
                 worker_account_id=account_id,

@@ -9,7 +9,7 @@ from typing import Optional
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import BaseFilter, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -22,7 +22,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Document,
     CallbackQuery,
-    InputFile,
+    BufferedInputFile,
 )
 from aiogram.enums import ParseMode
 from aiogram import Router
@@ -53,7 +53,10 @@ logger = logging.getLogger(__name__)
 
 
 class MainMenuButtons(str, Enum):
-    SETTINGS = "Настройка"
+    SETTINGS = "Настройка"  # legacy alias
+    SECTION_CONTROL = "Управление"
+    SECTION_ACCOUNTS = "Аккаунты и проверки"
+    SECTION_PARAMS = "Параметры"
     DEATH_POINTS = "Очки смерти"
     SET_PRICE = "Выставить цену"
     START_FARM = "Запустить фарм"
@@ -67,8 +70,9 @@ class SettingsButtons(str, Enum):
     TO_STORAGE = "На склад"
     ACCOUNTS = "Аккаунты"
     QUEUE_STATUS = "Статус очереди"
+    RECHECK_ACCOUNTS = "Перепроверить аккаунты"
     ROLE_RATIO = "Соотношение ролей"
-    BACK = "Назад"
+    BACK = "⬅️ Главное меню"
 
 
 class AccountsCallback(str, Enum):
@@ -128,12 +132,24 @@ class AdminFilter(BaseFilter):
 def main_menu_kb() -> ReplyKeyboardMarkup:
     buttons = [
         [
-            KeyboardButton(text=MainMenuButtons.SETTINGS.value),
-            KeyboardButton(text=MainMenuButtons.DEATH_POINTS.value),
+            KeyboardButton(text=MainMenuButtons.SECTION_CONTROL.value),
         ],
         [
-            KeyboardButton(text=MainMenuButtons.SET_PRICE.value),
+            KeyboardButton(text=MainMenuButtons.SECTION_ACCOUNTS.value),
         ],
+        [
+            KeyboardButton(text=MainMenuButtons.SECTION_PARAMS.value),
+        ],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите раздел",
+    )
+
+
+def control_kb() -> ReplyKeyboardMarkup:
+    buttons = [
         [
             KeyboardButton(text=MainMenuButtons.START_FARM.value),
             KeyboardButton(text=MainMenuButtons.STOP_FARM.value),
@@ -142,24 +158,47 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             KeyboardButton(text=MainMenuButtons.START_SALES.value),
             KeyboardButton(text=MainMenuButtons.STOP_SALES.value),
         ],
+        [
+            KeyboardButton(text=MainMenuButtons.DEATH_POINTS.value),
+            KeyboardButton(text=MainMenuButtons.SET_PRICE.value),
+        ],
+        [
+            KeyboardButton(text=SettingsButtons.BACK.value),
+        ],
     ]
     return ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
-        input_field_placeholder="Выберите действие",
+        input_field_placeholder="Управление ботами",
     )
 
 
-def settings_kb() -> ReplyKeyboardMarkup:
+def accounts_checks_kb() -> ReplyKeyboardMarkup:
     buttons = [
         [
+            KeyboardButton(text=SettingsButtons.ACCOUNTS.value),
             KeyboardButton(text=SettingsButtons.INVENTORY.value),
+        ],
+        [
+            KeyboardButton(text=SettingsButtons.RECHECK_ACCOUNTS.value),
+            KeyboardButton(text=SettingsButtons.QUEUE_STATUS.value),
+        ],
+        [
             KeyboardButton(text=SettingsButtons.TO_STORAGE.value),
         ],
         [
-            KeyboardButton(text=SettingsButtons.ACCOUNTS.value),
-            KeyboardButton(text=SettingsButtons.QUEUE_STATUS.value),
+            KeyboardButton(text=SettingsButtons.BACK.value),
         ],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Аккаунты и проверки",
+    )
+
+
+def params_kb() -> ReplyKeyboardMarkup:
+    buttons = [
         [
             KeyboardButton(text=SettingsButtons.ROLE_RATIO.value),
         ],
@@ -170,7 +209,7 @@ def settings_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
-        input_field_placeholder="Настройки",
+        input_field_placeholder="Параметры системы",
     )
 
 
@@ -261,13 +300,36 @@ def build_router(config: Config) -> Router:
     @router.message(CommandStart(), AdminFilter(config.admin_id))
     async def cmd_start(message: Message):
         await message.answer(
-            "Привет, админ.\nЭто контроллер ботов для Creatures of Sonaria.",
+            "Привет. Это центр управления фермой Creatures of Sonaria.\n"
+            "Используй /help для краткой карты меню.",
             reply_markup=main_menu_kb(),
         )
 
-    @router.message(F.text == MainMenuButtons.SETTINGS.value, AdminFilter(config.admin_id))
+    @router.message(Command("help"), AdminFilter(config.admin_id))
+    async def cmd_help(message: Message):
+        await message.answer(
+            "Навигация:\n"
+            "• Управление — запуск/остановка фарма и продаж, очки смерти, цены.\n"
+            "• Аккаунты и проверки — импорт, выгрузка списков, очередь, перепроверка.\n"
+            "• Параметры — соотношение farmer/storage.\n\n"
+            "Подсказка: кнопка `⬅️ Главное меню` возвращает в корень.",
+            reply_markup=main_menu_kb(),
+        )
+
+    @router.message(
+        (F.text == MainMenuButtons.SECTION_CONTROL.value) | (F.text == MainMenuButtons.SETTINGS.value),
+        AdminFilter(config.admin_id),
+    )
     async def on_settings(message: Message):
-        await message.answer("Меню настроек.", reply_markup=settings_kb())
+        await message.answer("Раздел: Управление", reply_markup=control_kb())
+
+    @router.message(F.text == MainMenuButtons.SECTION_ACCOUNTS.value, AdminFilter(config.admin_id))
+    async def on_accounts_section(message: Message):
+        await message.answer("Раздел: Аккаунты и проверки", reply_markup=accounts_checks_kb())
+
+    @router.message(F.text == MainMenuButtons.SECTION_PARAMS.value, AdminFilter(config.admin_id))
+    async def on_params_section(message: Message):
+        await message.answer("Раздел: Параметры", reply_markup=params_kb())
 
     @router.message(F.text == SettingsButtons.BACK.value, AdminFilter(config.admin_id))
     async def on_back_to_main(message: Message):
@@ -281,7 +343,7 @@ def build_router(config: Config) -> Router:
             "Фермеры: токены не посчитаны.\n"
             "Склады: токены не посчитаны."
         )
-        await message.answer(text)
+        await message.answer(text, reply_markup=accounts_checks_kb())
 
     @router.message(F.text == SettingsButtons.QUEUE_STATUS.value, AdminFilter(config.admin_id))
     async def on_queue_status(message: Message):
@@ -341,7 +403,70 @@ def build_router(config: Config) -> Router:
             f"start_farm running={farm_running}\n"
             f"transfer_to_storage pending={transfer_pending}\n"
             f"set_sell_price pending={sell_pending}\n\n"
-            f"Воркеры: alive={workers_alive}, total={workers_total}"
+            f"Воркеры: alive={workers_alive}, total={workers_total}",
+            reply_markup=accounts_checks_kb(),
+        )
+
+    @router.message(F.text == SettingsButtons.RECHECK_ACCOUNTS.value, AdminFilter(config.admin_id))
+    async def on_recheck_accounts(message: Message):
+        """
+        Повторная проверка аккаунтов без переимпорта файла.
+        По умолчанию не трогаем banned/disabled, чтобы не перезапускать заведомо исключенные аккаунты.
+        """
+        eligible_statuses = {
+            AccountStatus.NEW.value,
+            AccountStatus.ACTIVE.value,
+            AccountStatus.INVALID_CREDENTIALS.value,
+            AccountStatus.CHECKPOINT.value,
+            AccountStatus.COOLDOWN.value,
+        }
+
+        async with AsyncSessionMaker() as session:
+            accounts = (
+                await session.scalars(
+                    select(Account).where(Account.status.in_(eligible_statuses))
+                )
+            ).all()
+
+            candidates = len(accounts)
+            created = 0
+            skipped_with_existing_job = 0
+
+            for acc in accounts:
+                existing_job_count = int(
+                    await session.scalar(
+                        select(func.count()).select_from(Task).where(
+                            Task.account_id == acc.id,
+                            Task.task_type == TaskType.LOGIN_AND_CHECK.value,
+                            Task.status.in_([TaskStatus.PENDING.value, TaskStatus.RUNNING.value]),
+                        )
+                    )
+                )
+                if existing_job_count > 0:
+                    skipped_with_existing_job += 1
+                    continue
+
+                session.add(
+                    Task(
+                        task_type=TaskType.LOGIN_AND_CHECK.value,
+                        status=TaskStatus.PENDING.value,
+                        priority=2000,
+                        account_id=acc.id,
+                        payload='{"source":"manual_recheck"}',
+                        attempts=0,
+                        cancel_requested=False,
+                    )
+                )
+                created += 1
+
+            await session.commit()
+
+        await message.answer(
+            "Перепроверка аккаунтов поставлена в очередь.\n"
+            f"Кандидатов: {candidates}\n"
+            f"Создано login_and_check задач: {created}\n"
+            f"Пропущено (уже есть pending/running): {skipped_with_existing_job}",
+            reply_markup=accounts_checks_kb(),
         )
 
     @router.message(F.text == SettingsButtons.ROLE_RATIO.value, AdminFilter(config.admin_id))
@@ -349,7 +474,8 @@ def build_router(config: Config) -> Router:
         settings = await get_or_create_settings()
         await message.answer(
             "Введи соотношение farmer/storage в формате `70/30` или одним числом `70`.\n"
-            f"Текущее значение: {settings.farmer_ratio_percent}/{100-settings.farmer_ratio_percent}"
+            f"Текущее значение: {settings.farmer_ratio_percent}/{100-settings.farmer_ratio_percent}",
+            reply_markup=params_kb(),
         )
         await state.set_state(RoleRatioState.waiting_for_ratio)
 
@@ -375,7 +501,7 @@ def build_router(config: Config) -> Router:
                 farmer_ratio = None
 
         if farmer_ratio is None or farmer_ratio < 0 or farmer_ratio > 100:
-            await message.answer("Неверный формат. Примеры: `70/30` или `70`.")
+            await message.answer("Неверный формат. Примеры: `70/30` или `70`.", reply_markup=params_kb())
             return
 
         async with AsyncSessionMaker() as session:
@@ -396,7 +522,8 @@ def build_router(config: Config) -> Router:
         active_total, farmers_count, storages_count = await rebalance_active_account_roles()
         await message.answer(
             f"Соотношение обновлено: farmer/storage = {farmer_ratio}/{100-farmer_ratio}\n"
-            f"Активных аккаунтов: {active_total} -> farmer={farmers_count}, storage={storages_count}"
+            f"Активных аккаунтов: {active_total} -> farmer={farmers_count}, storage={storages_count}",
+            reply_markup=params_kb(),
         )
         await state.clear()
 
@@ -422,10 +549,10 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not farmers:
-            await message.answer("Нет активных аккаунтов-фермеров.")
+            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=accounts_checks_kb())
             return
         if not storages:
-            await message.answer("Нет активных аккаунтов-складов.")
+            await message.answer("Нет активных аккаунтов-складов.", reply_markup=accounts_checks_kb())
             return
 
         # Чтобы не было дублей trade-операций, отменяем уже стоящие задачи переноса
@@ -463,7 +590,8 @@ def build_router(config: Config) -> Router:
             created += 1
 
         await message.answer(
-            f"Созданы задачи `На склад`: {created} штук (фермеров={len(farmers)}, складов={len(storages)})."
+            f"Созданы задачи `На склад`: {created} штук (фермеров={len(farmers)}, складов={len(storages)}).",
+            reply_markup=accounts_checks_kb(),
         )
 
     @router.message(F.text == SettingsButtons.ACCOUNTS.value, AdminFilter(config.admin_id))
@@ -536,7 +664,9 @@ def build_router(config: Config) -> Router:
         bio = BytesIO(content)
         bio.name = "active_accounts.txt"
 
-        await callback.message.answer_document(InputFile(bio))
+        await callback.message.answer_document(
+            BufferedInputFile(bio.getvalue(), filename="active_accounts.txt")
+        )
         await callback.answer()
 
     @router.callback_query(
@@ -574,7 +704,9 @@ def build_router(config: Config) -> Router:
         bio = BytesIO(content)
         bio.name = "banned_accounts.txt"
 
-        await callback.message.answer_document(InputFile(bio))
+        await callback.message.answer_document(
+            BufferedInputFile(bio.getvalue(), filename="banned_accounts.txt")
+        )
         await callback.answer()
 
     @router.callback_query(
@@ -593,12 +725,12 @@ def build_router(config: Config) -> Router:
     @router.message(F.document, AccountUploadState.waiting_for_accounts_file, AdminFilter(config.admin_id))
     async def on_accounts_file(message: Message, state: FSMContext):
         if not message.document or not message.document.file_name:
-            await message.answer("Не вижу имя файла. Пришли `.txt` или `.csv` файл.")
+            await message.answer("Не вижу имя файла. Пришли `.txt` или `.csv` файл.", reply_markup=accounts_checks_kb())
             return
 
         file_name = message.document.file_name
         if not (file_name.lower().endswith(".txt") or file_name.lower().endswith(".csv")):
-            await message.answer("Нужен файл `.txt` или `.csv`. Попробуй ещё раз.")
+            await message.answer("Нужен файл `.txt` или `.csv`. Попробуй ещё раз.", reply_markup=accounts_checks_kb())
             return
 
         # Скачиваем файл из Telegram в память
@@ -648,11 +780,14 @@ def build_router(config: Config) -> Router:
             unique.append((login, password))
 
         if not unique:
-            await message.answer("Файл пустой или не удалось распарсить `LOGIN:PASSWORD`.")
+            await message.answer("Файл пустой или не удалось распарсить `LOGIN:PASSWORD`.", reply_markup=accounts_checks_kb())
             await state.clear()
             return
 
         total = len(unique)
+        settings = await get_or_create_settings()
+        ratio = max(0, min(100, int(settings.farmer_ratio_percent)))
+        farmers_count = int(total * ratio / 100)
 
         inserted = 0
         updated = 0
@@ -660,28 +795,32 @@ def build_router(config: Config) -> Router:
 
         async with AsyncSessionMaker() as session:
             imported_account_ids: list[str] = []
-            for login, password in unique:
+            for idx, (login, password) in enumerate(unique):
+                role_value = (
+                    AccountRole.FARMER.value if idx < farmers_count else AccountRole.STORAGE.value
+                )
                 existing = await session.scalar(select(Account).where(Account.login == login))
                 if existing:
                     updated += 1
                     existing.password = password
-                    existing.status = AccountStatus.NEW.value
-                    existing.role = None
-                    imported_account_ids.append(existing.id)
+                    protected = existing.status in {AccountStatus.BANNED.value, AccountStatus.DISABLED.value}
+                    # Не снимаем бан/disabled, чтобы случайно не "разбанить" аккаунт.
+                    if not protected:
+                        existing.status = AccountStatus.NEW.value
+                    existing.role = role_value
+                    if not protected:
+                        imported_account_ids.append(existing.id)
                     continue
 
                 account = Account(
                     login=login,
                     password=password,
-                    role=None,
+                    role=role_value,
                     status=AccountStatus.NEW.value,
                 )
                 session.add(account)
                 await session.flush()
                 imported_account_ids.append(account.id)
-                session.add(
-                    account
-                )
                 inserted += 1
 
             await session.commit()
@@ -731,7 +870,8 @@ def build_router(config: Config) -> Router:
             f"checkpoint: {status_counts[AccountStatus.CHECKPOINT.value]}\n"
             f"disabled: {status_counts[AccountStatus.DISABLED.value]}\n"
             f"cooldown: {status_counts[AccountStatus.COOLDOWN.value]}\n\n"
-            f"Роли среди active (ratio {ratio}%/{100-ratio}%): farmer={farmers_count}, storage={storages_count}"
+            f"Роли среди active (ratio {ratio}%/{100-ratio}%): farmer={farmers_count}, storage={storages_count}",
+            reply_markup=accounts_checks_kb(),
         )
 
         await state.clear()
@@ -741,7 +881,7 @@ def build_router(config: Config) -> Router:
         await message.answer(
             "Введите количество очков смерти для цикла фарма "
             "(например 600 или 1200).",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=control_kb(),
         )
         await state.set_state(ControllerDeathPointsState.waiting_for_death_points)
 
@@ -754,7 +894,7 @@ def build_router(config: Config) -> Router:
         # Парсим значение и сохраняем в Postgres
         points = int((message.text or "").strip())
         if points <= 0:
-            await message.answer("Значение должно быть больше 0.")
+            await message.answer("Значение должно быть больше 0.", reply_markup=control_kb())
             return
 
         async with AsyncSessionMaker() as session:
@@ -774,7 +914,11 @@ def build_router(config: Config) -> Router:
                 settings.death_points_target = points
             await session.commit()
 
-        await message.answer(f"Ок. Целевые `Очки смерти` установлены на {points}.")
+        # Возвращаем reply-клавиатуру в главное меню, чтобы она не пропадала после ввода числа.
+        await message.answer(
+            f"Ок. Целевые `Очки смерти` установлены на {points}.",
+            reply_markup=control_kb(),
+        )
         await state.clear()
 
     @router.message(F.text == MainMenuButtons.SET_PRICE.value, AdminFilter(config.admin_id))
@@ -791,7 +935,8 @@ def build_router(config: Config) -> Router:
             "- Death Gacha Token\n\n"
             "Пример:\n"
             "Revive Token=2200-2400\n"
-            "Death Gacha Token=8000-9500"
+            "Death Gacha Token=8000-9500",
+            reply_markup=control_kb(),
         )
         await state.set_state(SetPriceState.waiting_for_ranges)
 
@@ -799,7 +944,7 @@ def build_router(config: Config) -> Router:
     async def on_set_price_ranges(message: Message, state: FSMContext):
         raw = (message.text or "").strip()
         if not raw:
-            await message.answer("Пустой ввод. Пришли диапазоны в формате Token=min-max.")
+            await message.answer("Пустой ввод. Пришли диапазоны в формате Token=min-max.", reply_markup=control_kb())
             return
 
         ranges: dict[str, dict[str, int]] = {}
@@ -822,7 +967,7 @@ def build_router(config: Config) -> Router:
             ranges[token] = {"min": mn, "max": mx}
 
         if not ranges:
-            await message.answer("Не удалось распарсить ни одного диапазона. Попробуй еще раз.")
+            await message.answer("Не удалось распарсить ни одного диапазона. Попробуй еще раз.", reply_markup=control_kb())
             return
 
         await state.update_data(price_ranges=ranges)
@@ -830,7 +975,8 @@ def build_router(config: Config) -> Router:
         await message.answer(
             "Теперь пришли 4 приоритетных токена через запятую.\n"
             "Пример:\n"
-            "Revive Token, Death Gacha Token, Max Growth Token, Partial Growth Token"
+            "Revive Token, Death Gacha Token, Max Growth Token, Partial Growth Token",
+            reply_markup=control_kb(),
         )
 
     @router.message(SetPriceState.waiting_for_priorities, AdminFilter(config.admin_id))
@@ -843,7 +989,7 @@ def build_router(config: Config) -> Router:
                 unique.append(p)
 
         if len(unique) != 4:
-            await message.answer("Нужно выбрать ровно 4 уникальных токена из списка.")
+            await message.answer("Нужно выбрать ровно 4 уникальных токена из списка.", reply_markup=control_kb())
             return
 
         data = await state.get_data()
@@ -861,7 +1007,7 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not storages:
-            await message.answer("Нет активных аккаунтов-складов.")
+            await message.answer("Нет активных аккаунтов-складов.", reply_markup=control_kb())
             await state.clear()
             return
 
@@ -884,7 +1030,8 @@ def build_router(config: Config) -> Router:
 
         await message.answer(
             f"Созданы задачи `Выставить цену` для {len(storages)} складов.\n"
-            f"Приоритеты: {', '.join(unique)}"
+            f"Приоритеты: {', '.join(unique)}",
+            reply_markup=control_kb(),
         )
         await state.clear()
 
@@ -920,7 +1067,7 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not farmers:
-            await message.answer("Нет активных аккаунтов-фермеров.")
+            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=control_kb())
             return
 
         # Убираем дубль-команды: отменяем уже существующие start_farm задачи
@@ -942,7 +1089,8 @@ def build_router(config: Config) -> Router:
             created += 1
 
         await message.answer(
-            f"Фарм включен: создано задач `Запустить фарм` = {created}."
+            f"Фарм включен: создано задач `Запустить фарм` = {created}.",
+            reply_markup=control_kb(),
         )
 
     @router.message(F.text == MainMenuButtons.STOP_FARM.value, AdminFilter(config.admin_id))
@@ -976,7 +1124,7 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not farmers:
-            await message.answer("Нет активных аккаунтов-фермеров.")
+            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=control_kb())
             return
 
         # Просим воркеры остановиться: отменяем farming-команды и добавляем explicit stop tasks
@@ -994,7 +1142,8 @@ def build_router(config: Config) -> Router:
             )
 
         await message.answer(
-            f"Фарм выключен: stop-задачи созданы по {len(farmers)} фермерам."
+            f"Фарм выключен: stop-задачи созданы по {len(farmers)} фермерам.",
+            reply_markup=control_kb(),
         )
 
     @router.message(F.text == MainMenuButtons.START_SALES.value, AdminFilter(config.admin_id))
@@ -1017,7 +1166,7 @@ def build_router(config: Config) -> Router:
                 settings.sales_enabled = True
             await session.commit()
 
-        await message.answer("Продажи включены.")
+        await message.answer("Продажи включены.", reply_markup=control_kb())
 
     @router.message(F.text == MainMenuButtons.STOP_SALES.value, AdminFilter(config.admin_id))
     async def on_stop_sales(message: Message):
@@ -1055,7 +1204,7 @@ def build_router(config: Config) -> Router:
                 only_pending=False,
             )
 
-        await message.answer("Продажи выключены. Текущие задачи продаж остановлены.")
+        await message.answer("Продажи выключены. Текущие задачи продаж остановлены.", reply_markup=control_kb())
 
     return router
 

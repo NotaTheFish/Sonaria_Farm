@@ -1,12 +1,16 @@
 import json
+import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+logger = logging.getLogger("farm.task_queue")
+
 from sqlalchemy import and_, select, update, text
 
 from farm.database import AsyncSessionMaker
-from farm.models import Account, Task, TaskLog, TaskStatus, Worker
+from farm.models import Account, Instance, InstanceStatus, Task, TaskLog, TaskStatus, Worker
 
 
 def _now_utc() -> datetime:
@@ -219,7 +223,8 @@ async def claim_next_task(
         SET status = 'running',
             worker_id = :worker_id,
             started_at = now(),
-            lease_expires_at = now() + ((:lease_seconds || ' seconds')::interval),
+            -- Используем make_interval, чтобы asyncpg корректно передавал int без конкатенации строк.
+            lease_expires_at = now() + make_interval(secs => :lease_seconds),
             updated_at = now(),
             attempts = attempts + 1
         WHERE tasks.id IN (SELECT id FROM cte)
@@ -319,3 +324,81 @@ async def get_task_account(*, task_id: str) -> Account | None:
         if not task or not task.account_id:
             return None
         return await session.scalar(select(Account).where(Account.id == task.account_id))
+
+
+async def acquire_instance_for_worker(
+    *,
+    worker_id: str,
+    instance_name: str,
+    host: str | None = None,
+    account_id: str | None = None,
+) -> str:
+    """
+    Резервирует инстанс за воркером. Один инстанс -> один активный воркер.
+    Если инстанса нет, создаем.
+    """
+    async with AsyncSessionMaker() as session:
+        instance = await session.scalar(select(Instance).where(Instance.name == instance_name))
+        if not instance:
+            instance = Instance(
+                name=instance_name,
+                host=host,
+                status=InstanceStatus.BUSY.value,
+                worker_id=worker_id,
+                account_id=account_id,
+                last_heartbeat_at=_now_utc(),
+            )
+            session.add(instance)
+            await session.commit()
+            return instance.id
+
+        # Инстанс занят другим worker_id: либо второй живой процесс, либо «зомби» после краша.
+        if instance.worker_id and instance.worker_id != worker_id and instance.status == InstanceStatus.BUSY.value:
+            stale_sec = int(os.getenv("WORKER_STALE_HEARTBEAT_SECONDS", "180"))
+            old_worker = await session.scalar(select(Worker).where(Worker.id == instance.worker_id))
+            now = _now_utc()
+            takeover = False
+            if old_worker is None:
+                takeover = True
+                reason = "worker row missing"
+            else:
+                age = (now - old_worker.heartbeat_at).total_seconds()
+                if age > stale_sec:
+                    takeover = True
+                    reason = f"heartbeat stale {age:.0f}s > {stale_sec}s"
+                else:
+                    reason = f"heartbeat fresh {age:.0f}s"
+
+            if not takeover:
+                raise RuntimeError(
+                    f"Instance '{instance_name}' is busy by another worker: {instance.worker_id}. "
+                    f"Stop the other process, set WORKER_ID={instance.worker_id}, or wait until its "
+                    f"heartbeat is older than WORKER_STALE_HEARTBEAT_SECONDS ({stale_sec}s). ({reason})"
+                )
+
+            logger.warning(
+                "Taking over instance %r from dead/stale worker %s (%s); new worker_id=%s",
+                instance_name,
+                instance.worker_id,
+                reason,
+                worker_id,
+            )
+
+        instance.host = host
+        instance.status = InstanceStatus.BUSY.value
+        instance.worker_id = worker_id
+        instance.account_id = account_id
+        instance.last_heartbeat_at = _now_utc()
+        await session.commit()
+        return instance.id
+
+
+async def heartbeat_instance(*, instance_name: str) -> None:
+    async with AsyncSessionMaker() as session:
+        instance = await session.scalar(select(Instance).where(Instance.name == instance_name))
+        if not instance:
+            return
+        instance.last_heartbeat_at = _now_utc()
+        if instance.status != InstanceStatus.BUSY.value:
+            instance.status = InstanceStatus.BUSY.value
+        await session.commit()

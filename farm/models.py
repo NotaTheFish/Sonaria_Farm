@@ -67,6 +67,42 @@ class WorkerRole(str, enum.Enum):
     STORAGE = "STORAGE"
 
 
+class InstanceStatus(str, enum.Enum):
+    FREE = "free"
+    BUSY = "busy"
+    OFFLINE = "offline"
+    ERROR = "error"
+
+
+class Instance(Base):
+    __tablename__ = "instances"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    host: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=InstanceStatus.FREE.value, index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("workers.id"), nullable=True, index=True)
+    account_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("accounts.id"), nullable=True, index=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+    meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class Worker(Base):
     __tablename__ = "workers"
 
@@ -170,6 +206,8 @@ __all__ = [
     "AccountRole",
     "AccountStatus",
     "ControllerSettings",
+    "Instance",
+    "InstanceStatus",
     "Worker",
     "WorkerRole",
     "Task",

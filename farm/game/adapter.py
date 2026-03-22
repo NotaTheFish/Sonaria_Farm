@@ -12,9 +12,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("farm.game.adapter")
+
+# Корень репозитория: farm/game/adapter.py -> parents[2] == <repo>/
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _bridge_dir_from_env(var_name: str, default_relative: str) -> Path:
+    """
+    Каталог для файлового моста. Относительные пути считаются от корня репозитория,
+    а не от текущего cwd процесса (иначе воркер не находит файлы при запуске из другой папки).
+    """
+    raw = os.getenv(var_name, default_relative)
+    p = Path(raw)
+    if not p.is_absolute():
+        p = _REPO_ROOT / p
+    return p
 
 from sqlalchemy import update
 
@@ -89,19 +109,142 @@ class WindowsGameAdapter(GameAdapter):
       - set_sell_price: ranges, priority_tokens, ...
     """
 
+    def __init__(self) -> None:
+        self.check_results_dir = _bridge_dir_from_env(
+            "LOGIN_CHECK_RESULTS_DIR",
+            "runtime/login_check_results",
+        )
+        self.check_timeout_seconds = int(os.getenv("LOGIN_CHECK_TIMEOUT_SECONDS", "180"))
+        self.check_poll_seconds = float(os.getenv("LOGIN_CHECK_POLL_SECONDS", "1.0"))
+        self.check_results_dir.mkdir(parents=True, exist_ok=True)
+
+        self.farm_tick_dir = _bridge_dir_from_env("FARM_TICK_DIR", "runtime/farm_tick")
+        self.farm_tick_timeout_seconds = int(os.getenv("FARM_TICK_TIMEOUT_SECONDS", "120"))
+        self.farm_tick_poll_seconds = float(os.getenv("FARM_TICK_POLL_SECONDS", "1.0"))
+        self.farm_tick_dir.mkdir(parents=True, exist_ok=True)
+        self._farm_tick_seq: dict[str, int] = defaultdict(int)
+
+        logger.info(
+            "WindowsGameAdapter paths (absolute): LOGIN_CHECK_RESULTS_DIR=%s FARM_TICK_DIR=%s",
+            self.check_results_dir.resolve(),
+            self.farm_tick_dir.resolve(),
+        )
+
+    @staticmethod
+    def _normalize_status(value: str | None) -> str | None:
+        if not value:
+            return None
+        norm = value.strip().lower()
+        allowed = {
+            AccountStatus.ACTIVE.value,
+            AccountStatus.BANNED.value,
+            AccountStatus.INVALID_CREDENTIALS.value,
+            AccountStatus.CHECKPOINT.value,
+            AccountStatus.DISABLED.value,
+            AccountStatus.COOLDOWN.value,
+        }
+        return norm if norm in allowed else None
+
+    async def _set_account_status(
+        self,
+        *,
+        account_id: str,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        async with AsyncSessionMaker() as session:
+            await session.execute(
+                update(Account)
+                .where(Account.id == account_id)
+                .values(
+                    status=status,
+                    banned_reason=reason,
+                )
+            )
+            await session.commit()
+
     async def login_and_check(self, *, task_id: str, worker_id: str, account: Account) -> None:
+        """
+        Рабочий базовый контракт:
+        - внешний процесс проверки должен записать JSON-файл результата в LOGIN_CHECK_RESULTS_DIR
+        - имя файла: <account_id>.json
+        - формат:
+            {
+              "status": "active|banned|invalid_credentials|checkpoint|disabled|cooldown",
+              "reason": "optional text"
+            }
+        """
+        result_path = (self.check_results_dir / f"{account.id}.json").resolve()
+
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
             message=(
-                "[windows] login_and_check: TODO — "
-                "1) Запустить Roblox под этим аккаунтом. "
-                "2) Проверить экран ошибки (wrong password, banned, verify, etc.). "
-                "3) Выставить Account.status (active / banned / invalid_credentials / checkpoint / …) в БД."
+                f"[windows] login_and_check started for account_id={account.id}. "
+                f"Waiting result file (absolute): {result_path}"
             ),
         )
-        raise NotImplementedError(
-            "WindowsGameAdapter.login_and_check: реализуй вход и классификацию статуса аккаунта."
+
+        waited = 0.0
+        while waited < self.check_timeout_seconds:
+            if result_path.exists():
+                break
+            await asyncio.sleep(self.check_poll_seconds)
+            waited += self.check_poll_seconds
+
+        if not result_path.exists():
+            # Ничего не меняем в БД, задача упадет и пойдет в retry/ручную проверку.
+            raise RuntimeError(
+                "login_and_check result not found. "
+                f"Expected file: {result_path} within {self.check_timeout_seconds}s"
+            )
+
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Invalid login_and_check result JSON: {exc}") from exc
+        finally:
+            # Одноразовый файл результата (на Windows может не удалиться, если файл открыт в редакторе)
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "login_and_check: could not delete result file %s: %s",
+                    result_path,
+                    exc,
+                )
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=(
+                        f"[windows] login_and_check: не удалось удалить файл результата "
+                        f"(закройте его в редакторе): {result_path} — {exc}"
+                    ),
+                )
+
+        status = self._normalize_status(str(data.get("status", "")))
+        reason = data.get("reason")
+
+        if not status:
+            raise RuntimeError(
+                "login_and_check result has unknown status. "
+                "Allowed: active,banned,invalid_credentials,checkpoint,disabled,cooldown"
+            )
+
+        await self._set_account_status(
+            account_id=account.id,
+            status=status,
+            reason=reason if isinstance(reason, str) else None,
+        )
+
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=(
+                f"[windows] login_and_check done for account_id={account.id}: "
+                f"status={status}, reason={reason!r}"
+            ),
         )
 
     async def farm_tick(
@@ -112,18 +255,113 @@ class WindowsGameAdapter(GameAdapter):
         account: Account,
         death_points_target: int,
     ) -> None:
+        """
+        Один шаг цикла фарма через файловый мост (как login_and_check):
+
+        1) Адаптер пишет: FARM_TICK_DIR/{task_id}.request.json
+        2) Внешний процесс (инжектор/скрипт) выполняет шаг и пишет: FARM_TICK_DIR/{task_id}.response.json
+        3) Адаптер читает ответ, опционально обновляет статус аккаунта, удаляет response.
+
+        request.json:
+          {
+            "task_id": "...",
+            "account_id": "...",
+            "worker_id": "...",
+            "death_points_target": 600,
+            "tick_seq": 1
+          }
+
+        response.json:
+          { "ok": true, "log": "optional", "death_points_current": 123,
+            "account_status": null, "reason": null }
+        или
+          { "ok": false, "error": "..." }
+
+        Если задан account_status (как в login_and_check) — обновляется accounts и воркер
+        на следующей итерации увидит inactive.
+        """
+        self._farm_tick_seq[task_id] += 1
+        tick_seq = self._farm_tick_seq[task_id]
+
+        request_path = self.farm_tick_dir / f"{task_id}.request.json"
+        response_path = self.farm_tick_dir / f"{task_id}.response.json"
+
+        try:
+            response_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        request_payload = {
+            "task_id": task_id,
+            "account_id": account.id,
+            "worker_id": worker_id,
+            "death_points_target": death_points_target,
+            "tick_seq": tick_seq,
+        }
+        request_path.write_text(
+            json.dumps(request_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
             message=(
-                f"[windows] farm_tick: TODO — один шаг цикла для account_id={account.id}, "
-                f"цель DP={death_points_target}. "
-                "Идея: открыть миссии / выполнить шаг миссии / проверить DP в UI или через твой канал чтения состояния. "
-                "После достижения цели — получить токен и инициировать смерть/рестарт по твоему сценарию."
+                f"[windows] farm_tick tick_seq={tick_seq} account_id={account.id} "
+                f"DP_target={death_points_target}. "
+                f"Wrote request: {request_path}, waiting response: {response_path}"
             ),
         )
-        raise NotImplementedError(
-            "WindowsGameAdapter.farm_tick: реализуй один игровой тик (Kaluaka / миссии / DP)."
+
+        waited = 0.0
+        while waited < self.farm_tick_timeout_seconds:
+            if response_path.exists():
+                break
+            await asyncio.sleep(self.farm_tick_poll_seconds)
+            waited += self.farm_tick_poll_seconds
+
+        if not response_path.exists():
+            raise RuntimeError(
+                "farm_tick response not found. "
+                f"Expected file: {response_path} within {self.farm_tick_timeout_seconds}s"
+            )
+
+        try:
+            data = json.loads(response_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Invalid farm_tick response JSON: {exc}") from exc
+        finally:
+            try:
+                response_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                request_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if not data.get("ok", False):
+            err = data.get("error") or "farm_tick failed"
+            raise RuntimeError(str(err))
+
+        acc_status = self._normalize_status(
+            str(data["account_status"]) if data.get("account_status") is not None else None
+        )
+        reason = data.get("reason")
+        if acc_status:
+            await self._set_account_status(
+                account_id=account.id,
+                status=acc_status,
+                reason=reason if isinstance(reason, str) else None,
+            )
+
+        log_msg = data.get("log")
+        dp_cur = data.get("death_points_current")
+        extra = f" death_points_current={dp_cur}" if dp_cur is not None else ""
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[windows] farm_tick ok tick_seq={tick_seq}{extra}. {log_msg or ''}",
         )
 
     async def transfer_to_storage(
