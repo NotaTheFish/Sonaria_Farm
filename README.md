@@ -1,6 +1,6 @@
 # Sonaria Farm — контроллер + очередь + воркеры (Windows)
 
-**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`config.example.env`** → скопировать в `.env`. Внешний клиент файлового моста: **[docs/EXTERNAL_BRIDGE_CLIENT.md](docs/EXTERNAL_BRIDGE_CLIENT.md)**.
+**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`config.example.env`** → скопировать в `.env`. Внешний клиент файлового моста: **[docs/EXTERNAL_BRIDGE_CLIENT.md](docs/EXTERNAL_BRIDGE_CLIENT.md)**. Целевая схема «воркер + инжектор + изолированные сессии Roblox»: **[docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md](docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md)** (ToS/риски — на стороне деплоя).
 
 ## Структура
 
@@ -18,6 +18,7 @@
 | `scripts/file_bridge_echo.py` | Авто-`response.json` для теста мостов |
 | `scripts/bridge_sidecar.py` | Шаблон sidecar: лог + заглушка ответа |
 | `docs/EXTERNAL_BRIDGE_CLIENT.md` | Контракт моста для внешнего клиента / инжектора |
+| `docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md` | Целевая архитектура: сессии Windows, инжектор, очередь |
 | `external/` | Опционально: твой локальный код рядом с репо (см. `external/README.md`) |
 | `tests/` | Pytest: `file_bridge`, sidecar, при наличии SQLAlchemy — `task_queue`, `models` |
 | `requirements-dev.txt` | `pytest` и прочее для разработки |
