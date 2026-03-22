@@ -55,6 +55,16 @@ python bot_main.py
 
 **Подключение с домашнего ПК к Railway Postgres:** на многих планах нужно включить **публичный доступ** / **TCP proxy** к БД и разрешить подключение с твоего IP (или 0.0.0.0 для теста — осторожно с безопасностью). Если коннект не идёт — смотри документацию Railway по Postgres networking.
 
+### Ошибка `socket.gaierror: [Errno 11001] getaddrinfo failed`
+
+Это **не находится хост** из `DATABASE_URL` (DNS). Частые причины:
+
+1. **Внутренний URL Railway** — строки вида `postgres.railway.internal` или hostname из **Private Network** работают **только внутри Railway**. С домашнего ПК нужен **публичный** хост: в панели **Postgres → Connect** возьми **Public Network** / **TCP Proxy** URL (и включи публичный доступ к плагину, если выключен).
+2. **Опечатка** в имени хоста или лишние пробелы в `.env` вокруг `DATABASE_URL`.
+3. **Нет интернета / DNS** на ПК (VPN, корпоративный DNS).
+
+Проверка: `ping <хост_из_url>` (без порта) — если не резолвится, воркер тоже не подключится.
+
 ---
 
 ## 3. Миграции Alembic
@@ -125,7 +135,8 @@ python worker_main.py
 
 ### 6.1 Условия
 
-- Аккаунт **не** в «мёртвом» статусе (`banned`, `invalid_credentials`, …).
+- Кнопка **«Запустить фарм»** в боте создаёт задачи только для аккаунтов с **`role=farmer`** и **`status=active`** в БД. После теста `login_and_check` с результатом `banned` таких аккаунтов может не остаться — нужен новый импорт или ручное `active` в PostgreSQL. **`WORKER_ACCOUNT_ID` в .env** не добавляет аккаунт в этот список.
+- Аккаунт **не** в «мёртвом» статусе (`banned`, `invalid_credentials`, …) — иначе воркер остановит цикл после старта.
 - В боте включены/доступны сценарии старта фарма (как у тебя настроено в меню).
 - Воркер с `GAME_ADAPTER=windows` запущен и смог занять инстанс (`WORKER_INSTANCE_NAME`, при необходимости `WORKER_ID` или ожидание `WORKER_STALE_HEARTBEAT_SECONDS`).
 
@@ -180,8 +191,11 @@ python worker_main.py
 | `Instance '...' is busy by another worker` | Постоянный `WORKER_ID` в `.env` или подожди `WORKER_STALE_HEARTBEAT_SECONDS` после убитого процесса |
 | Воркер не видит JSON | Запуск из `C:\sonaria_farm`, тот же `account_id` в имени файла, что в БД |
 | Файл не удаляется | Закрой JSON в редакторе (блокировка на Windows) |
-| Нет коннекта к БД с ПК | Публичный URL Postgres на Railway, firewall, верный пароль в `DATABASE_URL` |
+| Нет коннекта к БД с ПК | Публичный URL Postgres на Railway (не `*.internal`), firewall, верный пароль в `DATABASE_URL` |
+| `getaddrinfo failed` / 11001 | См. раздел выше — публичный hostname в `DATABASE_URL`, без опечаток |
+| Кракозябры в CMD | В `run_*.bat` уже стоит `chcp 65001` и `PYTHONUTF8=1`; сохраняй `.bat` как UTF-8 |
 | Бот на Railway не стартует | `DATABASE_URL`, миграции, `TELEGRAM_BOT_TOKEN`, `ADMIN_TELEGRAM_ID` |
+| `workers_account_id_fkey` / `Key (account_id)=()` | В `.env` была строка `WORKER_ACCOUNT_ID=` без UUID — удали переменную или укажи реальный id аккаунта (код теперь трактует пустое значение как «не задано») |
 
 ---
 

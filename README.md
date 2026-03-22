@@ -49,6 +49,8 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 
 Дальше запускай `python bot_main.py` / `python worker_main.py` **только с активированным venv** (или укажи полный путь: `.\.venv\Scripts\python.exe bot_main.py`).
 
+На Windows можно запускать по щелчку: **`run_bot.bat`**, **`run_worker.bat`** (корень репозитория; ищут `.venv` или `venv`). Переменные берутся из **`.env`** в том же каталоге.
+
 ## Запуск
 
 1. Переменные окружения — см. `config.example.env`
@@ -159,6 +161,8 @@ python -c "import sqlalchemy, aiogram; print('ok')"
 ```
 
 Переменные окружения: `FARM_TICK_DIR`, `FARM_TICK_TIMEOUT_SECONDS`, `FARM_TICK_POLL_SECONDS`.
+
+**Windows:** в Проводнике включи **«Расширения имён файлов»**. Иначе легко сохранить файл как `…response.json.txt` — воркер ждёт ровно `…response.json` и по таймауту удалит только request; ответ он не увидит.
 
 ## Старые наброски
 

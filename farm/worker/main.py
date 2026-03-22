@@ -31,6 +31,8 @@ from farm.task_queue import (
     heartbeat_instance,
     heartbeat_worker,
     is_task_cancel_requested,
+    _nullable_fk_account_id,
+    _nullable_worker_id,
     request_cancel_tasks,
     mark_task_cancelled,
     mark_task_done,
@@ -221,8 +223,8 @@ async def main() -> None:
     adapter = get_game_adapter()
 
     role = os.getenv("WORKER_ROLE", "farmer")
-    account_id = os.getenv("WORKER_ACCOUNT_ID")
-    worker_id = os.getenv("WORKER_ID")
+    account_id = _nullable_fk_account_id(os.getenv("WORKER_ACCOUNT_ID"))
+    worker_id = _nullable_worker_id(os.getenv("WORKER_ID"))
     hostname = socket.gethostname()
     instance_name = os.getenv("WORKER_INSTANCE_NAME", f"{hostname}-instance-1")
 

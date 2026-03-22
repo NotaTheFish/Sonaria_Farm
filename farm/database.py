@@ -1,7 +1,9 @@
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
+from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -22,6 +24,11 @@ def _normalize_database_url(database_url: str) -> str:
         return "postgresql+asyncpg://" + database_url[len("postgres://") :]
     return database_url
 
+
+# .env из корня репозитория (рядом с worker_main.py). До этого импорт farm.database
+# выполнялся раньше load_dotenv() в main() — переменные не подхватывались.
+_repo_root = Path(__file__).resolve().parents[1]
+load_dotenv(_repo_root / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:

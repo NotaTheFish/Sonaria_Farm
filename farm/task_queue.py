@@ -17,6 +17,24 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _nullable_fk_account_id(value: str | None) -> str | None:
+    """
+    WORKER_ACCOUNT_ID из .env часто задают как пустую строку — os.getenv даёт '', а не None.
+    Пустая строка ломает FK на accounts; в БД нужен NULL.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def _nullable_worker_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
 async def ensure_worker(
     *,
     worker_id: str | None,
@@ -24,6 +42,8 @@ async def ensure_worker(
     account_id: str | None,
     hostname: str | None = None,
 ) -> str:
+    worker_id = _nullable_worker_id(worker_id)
+    account_id = _nullable_fk_account_id(account_id)
     if worker_id is None:
         worker_id = str(uuid.uuid4())
 
@@ -337,6 +357,7 @@ async def acquire_instance_for_worker(
     Резервирует инстанс за воркером. Один инстанс -> один активный воркер.
     Если инстанса нет, создаем.
     """
+    account_id = _nullable_fk_account_id(account_id)
     async with AsyncSessionMaker() as session:
         instance = await session.scalar(select(Instance).where(Instance.name == instance_name))
         if not instance:

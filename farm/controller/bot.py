@@ -1067,7 +1067,14 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not farmers:
-            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=control_kb())
+            await message.answer(
+                "Нет аккаунтов с ролью <b>фермер</b> и статусом <b>active</b>.\n"
+                "Забаненные, checkpoint, invalid и т.п. сюда не входят.\n"
+                "Импортируй новый аккаунт или верни фермеру статус active в БД, затем снова «Запустить фарм».\n\n"
+                "<i>Привязка WORKER_ACCOUNT_ID в .env только ограничивает воркер одним аккаунтом; "
+                "задачи фарма бот создаёт только для active+farmer.</i>",
+                reply_markup=control_kb(),
+            )
             return
 
         # Убираем дубль-команды: отменяем уже существующие start_farm задачи
@@ -1124,7 +1131,10 @@ def build_router(config: Config) -> Router:
             ).all()
 
         if not farmers:
-            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=control_kb())
+            await message.answer(
+                "Нет аккаунтов с ролью <b>фермер</b> и статусом <b>active</b> — останавливать нечего.",
+                reply_markup=control_kb(),
+            )
             return
 
         # Просим воркеры остановиться: отменяем farming-команды и добавляем explicit stop tasks

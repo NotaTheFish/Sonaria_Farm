@@ -321,9 +321,32 @@ class WindowsGameAdapter(GameAdapter):
             waited += self.farm_tick_poll_seconds
 
         if not response_path.exists():
+            # Убираем request, иначе в папке висит «старый» тик после таймаута.
+            try:
+                request_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("farm_tick timeout: could not delete request %s: %s", request_path, exc)
+            # Подсказка: на Windows часто получается *.response.json.txt из-за скрытых расширений.
+            hint = ""
+            try:
+                parent = response_path.parent
+                if parent.exists():
+                    similar = sorted(
+                        p.name
+                        for p in parent.iterdir()
+                        if p.is_file()
+                        and p.name.startswith(f"{task_id}.")
+                        and "response" in p.name.lower()
+                    )
+                    if similar:
+                        hint = f" В папке есть похожие имена (проверь расширение): {similar!r}."
+            except OSError:
+                pass
             raise RuntimeError(
                 "farm_tick response not found. "
-                f"Expected file: {response_path} within {self.farm_tick_timeout_seconds}s"
+                f"Expected exact path: {response_path.resolve()} "
+                f"within {self.farm_tick_timeout_seconds}s.{hint} "
+                "В Проводнике включи «Расширения имён файлов»: не должно быть .json.txt."
             )
 
         try:
@@ -333,12 +356,24 @@ class WindowsGameAdapter(GameAdapter):
         finally:
             try:
                 response_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning("farm_tick: could not delete response %s: %s", response_path, exc)
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"[windows] farm_tick: не удалось удалить response (закрой файл в редакторе): {response_path} — {exc}",
+                )
             try:
                 request_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning("farm_tick: could not delete request %s: %s", request_path, exc)
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"[windows] farm_tick: не удалось удалить request: {request_path} — {exc}",
+                )
 
         if not data.get("ok", False):
             err = data.get("error") or "farm_tick failed"
