@@ -162,6 +162,12 @@ class TaskType(str, enum.Enum):
     STOP_FARM = "stop_farm"
     TRANSFER_TO_STORAGE = "transfer_to_storage"
     SET_SELL_PRICE = "set_sell_price"
+    # Универсальный скрипт Kimi (отдельно от legacy INJECTOR_SCRIPTS_DIR / farm.lua)
+    UNIVERSAL_FARM = "universal_farm"
+    UNIVERSAL_TRANSFER = "universal_transfer"
+    UNIVERSAL_SELL = "universal_sell"
+    UNIVERSAL_INVENTORY = "universal_inventory"
+    UNIVERSAL_DEX = "universal_dex"
 
 
 class Task(Base):

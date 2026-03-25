@@ -15,6 +15,11 @@ def test_task_type_values_match_snake_case() -> None:
     assert TaskType.STOP_FARM.value == "stop_farm"
     assert TaskType.TRANSFER_TO_STORAGE.value == "transfer_to_storage"
     assert TaskType.SET_SELL_PRICE.value == "set_sell_price"
+    assert TaskType.UNIVERSAL_FARM.value == "universal_farm"
+    assert TaskType.UNIVERSAL_TRANSFER.value == "universal_transfer"
+    assert TaskType.UNIVERSAL_SELL.value == "universal_sell"
+    assert TaskType.UNIVERSAL_INVENTORY.value == "universal_inventory"
+    assert TaskType.UNIVERSAL_DEX.value == "universal_dex"
 
 
 def test_task_status_values() -> None:

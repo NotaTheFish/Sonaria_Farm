@@ -29,7 +29,7 @@
 5. Пишешь **response** с полями из README (`ok`, при ошибке `error`, опционально `log`, `account_status`, … для `farm_tick` ещё `death_points_current`). Опционально **`inventory`**: объект «имя токена → число» — попадёт в БД и в Telegram «Инвентарь».
 6. Адаптер читает response, удаляет оба файла, воркер идёт дальше.
 
-Таймауты: `FARM_TICK_TIMEOUT_SECONDS`, `TRANSFER_BRIDGE_*`, `SELL_BRIDGE_*` (см. `config.example.env`).
+Таймауты: `FARM_TICK_TIMEOUT_SECONDS`, `TRANSFER_BRIDGE_*`, `SELL_BRIDGE_*` (см. `env.template`).
 
 ## Что использовать в этом репо
 
@@ -50,3 +50,5 @@
 Реализация клиента игры должна соблюдать **ToS Roblox** и законы. Этот проект описывает только **технический** контракт файлового обмена между воркером и внешним процессом.
 
 Целевая схема с изолированными сессиями Windows и инжектором — в **[ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md](ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md)**.
+
+Поле **`script_params`** внутри `request.json` (farm_tick / transfer / sell) — в **[SCRIPT_PARAMS_AND_LUA.md](SCRIPT_PARAMS_AND_LUA.md)**.

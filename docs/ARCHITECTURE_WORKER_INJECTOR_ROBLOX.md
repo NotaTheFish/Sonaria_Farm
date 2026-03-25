@@ -63,7 +63,13 @@ Roblox обычно не даёт несколько клиентов в одн�
 - Аргументы: `<PID> <script.lua> [json_args]`.
 - Поиск процесса, загрузка/исполнение Lua в контексте клиента (механизм — за пределами этого репо).
 
-Путь к exe задаётся окружением, например **`INJECTOR_PATH`** (см. `config.example.env`).
+Путь к exe задаётся окружением, например **`INJECTOR_PATH`**. Если путь содержит пробелы (`Program Files`), в `.env` используй кавычки:  
+`INJECTOR_PATH="C:\Program Files\jjsploit\jjsploit.exe"` (пример из `env.template`).
+
+В репозитории реализован **опциональный** запуск через `subprocess` в **`farm/game/injector_launcher.py`**:  
+`INJECTOR_ENABLED=1`, `INJECTOR_LAUNCH_WHEN=windows_adapter_init` (один раз при первой операции моста в процессе воркера) или `every_farm_tick` (на каждый `farm_tick`). Аргументы CLI — `INJECTOR_ARGS_JSON` (массив строк), если твой exe их поддерживает.
+
+Параметры для Lua в JSON моста — объект **`script_params`**, см. **[SCRIPT_PARAMS_AND_LUA.md](SCRIPT_PARAMS_AND_LUA.md)**.
 
 ## 4. Взаимодействие воркера с Lua
 
@@ -97,7 +103,7 @@ Roblox обычно не даёт несколько клиентов в одн�
 1. Скрипт(ы) создания пользователей Windows под аккаунты (однократно при развёртывании).
 2. Инжектор + набор Lua: логин, фарм, стоп, трейд, продажи; параметры и файловый IPC согласованы с JSON в README.
 3. Доработка **`WindowsGameAdapter`** (или отдельный класс): запуск Roblox от пользователя, `subprocess` к инжектору, учёт PID, перезапуск при падении, остановка по cancel.
-4. Переменные окружения: см. закомментированные строки в **`config.example.env`** (`INJECTOR_*`, `ROBLOX_*`, и т.д.).
+4. Переменные окружения: см. **`env.template`** (`INJECTOR_*`, `ROBLOX_*`, и т.д.).
 
 ## 8. Плюсы и минусы
 

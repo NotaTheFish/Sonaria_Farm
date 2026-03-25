@@ -1,0 +1,42 @@
+[
+  {
+    "file": "external\\dex_extracted\\0000_Folder__ScreenGui__Frame__LocalScript__RawApiJson_ModuleScript.lua",
+    "class": "ModuleScript",
+    "name": "RawApiJson",
+    "referent": "4",
+    "path": "Folder/ScreenGui/Frame/LocalScript/RawApiJson",
+    "source_len": 381325
+  },
+  {
+    "file": "external\\dex_extracted\\0001_Folder__ScreenGui__Frame__Properties_LocalScript.lua",
+    "class": "LocalScript",
+    "name": "Properties",
+    "referent": "3",
+    "path": "Folder/ScreenGui/Frame/Properties",
+    "source_len": 52647
+  },
+  {
+    "file": "external\\dex_extracted\\0002_Folder__ScreenGui__Selection_LocalScript.lua",
+    "class": "LocalScript",
+    "name": "Selection",
+    "referent": "11",
+    "path": "Folder/ScreenGui/Selection",
+    "source_len": 34488
+  },
+  {
+    "file": "external\\dex_extracted\\0003_Folder__ScreenGui__Frame__LocalScript_LocalScript.lua",
+    "class": "LocalScript",
+    "name": "LocalScript",
+    "referent": "108",
+    "path": "Folder/ScreenGui/Frame/LocalScript",
+    "source_len": 28596
+  },
+  {
+    "file": "external\\dex_extracted\\0004_Folder__ScreenGui__Frame__LocalScript_LocalScript.lua",
+    "class": "LocalScript",
+    "name": "LocalScript",
+    "referent": "154",
+    "path": "Folder/ScreenGui/Frame/LocalScript",
+    "source_len": 125039
+  }
+]

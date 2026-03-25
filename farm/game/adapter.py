@@ -19,10 +19,17 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from farm.database import AsyncSessionMaker
 from farm.game import file_bridge as fb
+from farm.game import injector_launcher as inj
+from farm.game.script_params import (
+    build_farm_tick_script_params,
+    build_sell_script_params,
+    build_transfer_script_params,
+    build_universal_script_params,
+)
 from farm.models import Account, AccountStatus
 from farm.task_queue import append_task_log, get_task_account
 
@@ -68,6 +75,65 @@ class GameAdapter(ABC):
         payload: dict[str, Any],
     ) -> None:
         """Торговый мир: выставить лоты по ranges и priority_tokens."""
+
+    @abstractmethod
+    async def universal_farm_tick(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        death_points_target: int,
+    ) -> None:
+        """Долгий фарм через ``universal_sonaria_bot.lua`` (задача ``universal_farm``)."""
+
+    @abstractmethod
+    async def universal_transfer(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        farmer_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        """Перенос через универсальный скрипт (задача ``universal_transfer``)."""
+
+    @abstractmethod
+    async def universal_sell(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        storage_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        """Продажи через универсальный скрипт (задача ``universal_sell``)."""
+
+    @abstractmethod
+    async def universal_inventory(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        """Снимок инвентаря через универсальный скрипт (задача ``universal_inventory``)."""
+
+    @abstractmethod
+    async def universal_dex(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        """Инжект Dex GUI через универсальный скрипт (задача ``universal_dex``)."""
+
+    async def on_start_farm_cancel(self, *, task_id: str, worker_id: str, account: Account) -> None:
+        """Опциональный хук: вызывается воркером при cancel start_farm."""
+        return None
 
 
 class WindowsGameAdapter(GameAdapter):
@@ -151,6 +217,292 @@ class WindowsGameAdapter(GameAdapter):
             self.transfer_bridge_dir.resolve(),
             self.sell_bridge_dir.resolve(),
         )
+        self._injector_launch_done = False
+        self._injector_farm_proc_by_task: dict[str, asyncio.subprocess.Process] = {}
+        self._universal_farm_proc_by_task: dict[str, asyncio.subprocess.Process] = {}
+
+    def _injector_scripts_ready(self) -> bool:
+        return (
+            inj.injector_enabled_flag()
+            and inj.injector_executable() is not None
+            and inj.injector_scripts_dir() is not None
+        )
+
+    def _universal_sonaria_ready(self) -> bool:
+        """Скрипт Kimi: отдельный путь от legacy ``INJECTOR_SCRIPTS_DIR``."""
+        return (
+            inj.injector_enabled_flag()
+            and inj.injector_executable() is not None
+            and inj.resolve_universal_sonaria_script_path() is not None
+        )
+
+    @staticmethod
+    def _parse_sonaria_stdout(text: str) -> dict[str, Any]:
+        """
+        Ожидает строку ``SONARIA_RESPONSE:{json}`` (см. universal_sonaria_bot.lua).
+        Fallback: последняя строка с валидным JSON-объектом.
+        """
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("SONARIA_RESPONSE:"):
+                raw = line[len("SONARIA_RESPONSE:") :].strip()
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise RuntimeError("SONARIA_RESPONSE JSON must be an object")
+                return parsed
+        for line in reversed(text.splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise RuntimeError("no SONARIA_RESPONSE line and no JSON object in injector stdout")
+
+    async def _run_universal_script(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        params: dict[str, Any],
+        wait_for_exit: bool,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any] | None:
+        exe = inj.injector_executable()
+        script_path = inj.resolve_universal_sonaria_script_path()
+        if not exe or not script_path:
+            raise RuntimeError(
+                "Универсальный скрипт не настроен: задай INJECTOR_ENABLED=1, INJECTOR_PATH "
+                "и положи universal_sonaria_bot.lua (или INJECTOR_UNIVERSAL_SCRIPT_PATH)."
+            )
+        pid = inj.resolve_roblox_pid()
+        if not pid:
+            raise RuntimeError(
+                "Не удалось определить PID Roblox. Укажи ROBLOX_PID или запусти RobloxPlayerBeta.exe."
+            )
+        params_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        argv = [
+            str(exe.resolve()),
+            *inj.injector_extra_argv(),
+            str(pid),
+            str(script_path.resolve()),
+            params_json,
+        ]
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message="[universal_sonaria] запуск (Kimi), wait_for_exit=%s" % wait_for_exit,
+        )
+
+        kwargs: dict[str, Any] = {}
+        if os.getenv("INJECTOR_NO_WINDOW", "").strip().lower() in ("1", "true", "yes", "on"):
+            import subprocess
+
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        if wait_for_exit:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **kwargs,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=(
+                        timeout_seconds if timeout_seconds is not None else inj.injector_timeout_seconds()
+                    ),
+                )
+            except TimeoutError as exc:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError("universal_sonaria inject timeout") from exc
+            if proc.returncode not in (0, None):
+                err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"universal_sonaria failed rc={proc.returncode}: {err_text or 'no stderr'}"
+                )
+            out_text = (stdout or b"").decode("utf-8", errors="replace")
+            if not out_text.strip():
+                return None
+            return self._parse_sonaria_stdout(out_text)
+
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            **kwargs,
+        )
+        self._universal_farm_proc_by_task[task_id] = proc
+        return None
+
+    async def _run_injector_script(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        script_name: str,
+        params: dict[str, Any],
+        wait_for_exit: bool,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any] | None:
+        exe = inj.injector_executable()
+        if not exe:
+            raise RuntimeError("INJECTOR_ENABLED=1, но не найден INJECTOR_PATH")
+        script_path = inj.resolve_injector_script_path(script_name)
+        if not script_path:
+            raise RuntimeError(
+                f"Не найден Lua-скрипт: {script_name!r}. Проверь INJECTOR_SCRIPTS_DIR и имя файла."
+            )
+        pid = inj.resolve_roblox_pid()
+        if not pid:
+            raise RuntimeError(
+                "Не удалось определить PID Roblox. Укажи ROBLOX_PID или запусти RobloxPlayerBeta.exe."
+            )
+
+        params_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        argv = [
+            str(exe.resolve()),
+            *inj.injector_extra_argv(),
+            str(pid),
+            str(script_path.resolve()),
+            params_json,
+        ]
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[injector] run script={script_name} pid={pid} wait={wait_for_exit}",
+        )
+
+        kwargs: dict[str, Any] = {}
+        if os.getenv("INJECTOR_NO_WINDOW", "").strip().lower() in ("1", "true", "yes", "on"):
+            import subprocess
+
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        if wait_for_exit:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **kwargs,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=(
+                        timeout_seconds if timeout_seconds is not None else inj.injector_timeout_seconds()
+                    ),
+                )
+            except TimeoutError as exc:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError(f"injector timeout for script={script_name}") from exc
+            if proc.returncode not in (0, None):
+                err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"injector script failed rc={proc.returncode} script={script_name}: {err_text or 'no stderr'}"
+                )
+            out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
+            if not out_text:
+                return None
+            last_line = out_text.splitlines()[-1].strip()
+            if not last_line:
+                return None
+            try:
+                parsed = json.loads(last_line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"script {script_name} returned non-JSON stdout tail: {last_line[:300]!r}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"script {script_name} expected JSON object, got {type(parsed).__name__}")
+            return parsed
+
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            **kwargs,
+        )
+        self._injector_farm_proc_by_task[task_id] = proc
+        return None
+
+    async def _farm_tick_via_injector(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        death_points_target: int,
+    ) -> None:
+        existing = self._injector_farm_proc_by_task.get(task_id)
+        if existing is None:
+            params = build_farm_tick_script_params(
+                account=account,
+                death_points_target=death_points_target,
+                tick_seq=1,
+            )
+            params["role"] = account.role or "farmer"
+            await self._run_injector_script(
+                task_id=task_id,
+                worker_id=worker_id,
+                script_name="farm.lua",
+                params=params,
+                wait_for_exit=False,
+            )
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message="[injector] farm.lua started (long-running).",
+            )
+            return
+        if existing.returncode is not None:
+            self._injector_farm_proc_by_task.pop(task_id, None)
+            if existing.returncode == 0:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message="[injector] farm.lua exited gracefully before cancel.",
+                )
+                return
+            raise RuntimeError(f"farm.lua exited unexpectedly rc={existing.returncode}")
+
+    async def on_start_farm_cancel(self, *, task_id: str, worker_id: str, account: Account) -> None:
+        proc = self._injector_farm_proc_by_task.pop(task_id, None)
+        if proc and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message=f"[injector] farm.lua process terminated for account_id={account.id}",
+            )
+
+        proc_u = self._universal_farm_proc_by_task.pop(task_id, None)
+        if proc_u and proc_u.returncode is None:
+            proc_u.terminate()
+            try:
+                await asyncio.wait_for(proc_u.wait(), timeout=5)
+            except TimeoutError:
+                proc_u.kill()
+                await proc_u.wait()
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message=f"[universal_sonaria] universal farm process terminated for account_id={account.id}",
+            )
 
     @staticmethod
     def _normalize_status(value: str | None) -> str | None:
@@ -184,6 +536,13 @@ class WindowsGameAdapter(GameAdapter):
                 )
             )
             await session.commit()
+
+    async def _storage_login_for_payload(self, target_storage_account_id: str | None) -> str | None:
+        if not target_storage_account_id:
+            return None
+        async with AsyncSessionMaker() as session:
+            acc = await session.scalar(select(Account).where(Account.id == target_storage_account_id))
+            return acc.login if acc else None
 
     async def _file_bridge_exchange(
         self,
@@ -322,6 +681,38 @@ class WindowsGameAdapter(GameAdapter):
 
         await save_account_inventory_snapshot(account_id, inv)
 
+    async def _hook_injector_if_configured(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        bridge: str,
+    ) -> None:
+        """См. farm.game.injector_launcher и INJECTOR_LAUNCH_WHEN."""
+        if not inj.injector_enabled_flag():
+            return
+        when = inj.injector_launch_when()
+        if when == "never":
+            return
+        if when == "every_farm_tick":
+            if bridge != "farm_tick":
+                return
+            await inj.launch_injector_subprocess(
+                task_id=task_id,
+                worker_id=worker_id,
+                trigger="every_farm_tick",
+            )
+            return
+        if when == "windows_adapter_init":
+            if self._injector_launch_done:
+                return
+            self._injector_launch_done = True
+            await inj.launch_injector_subprocess(
+                task_id=task_id,
+                worker_id=worker_id,
+                trigger="windows_adapter_init",
+            )
+
     async def login_and_check(self, *, task_id: str, worker_id: str, account: Account) -> None:
         """
         Рабочий базовый контракт:
@@ -342,6 +733,12 @@ class WindowsGameAdapter(GameAdapter):
                 f"[windows] login_and_check started for account_id={account.id}. "
                 f"Waiting result file (absolute): {result_path}"
             ),
+        )
+
+        await self._hook_injector_if_configured(
+            task_id=task_id,
+            worker_id=worker_id,
+            bridge="login_and_check",
         )
 
         waited = 0.0
@@ -428,11 +825,13 @@ class WindowsGameAdapter(GameAdapter):
 
         request.json:
           {
+            "bridge": "farm_tick",
             "task_id": "...",
             "account_id": "...",
             "worker_id": "...",
             "death_points_target": 600,
-            "tick_seq": 1
+            "tick_seq": 1,
+            "script_params": { ... }   # см. docs/SCRIPT_PARAMS_AND_LUA.md
           }
 
         response.json:
@@ -448,6 +847,21 @@ class WindowsGameAdapter(GameAdapter):
         self._farm_tick_seq[task_id] += 1
         tick_seq = self._farm_tick_seq[task_id]
 
+        await self._hook_injector_if_configured(
+            task_id=task_id,
+            worker_id=worker_id,
+            bridge="farm_tick",
+        )
+
+        if self._injector_scripts_ready():
+            await self._farm_tick_via_injector(
+                task_id=task_id,
+                worker_id=worker_id,
+                account=account,
+                death_points_target=death_points_target,
+            )
+            return
+
         tag = self._bridge_tag_farm
         request_path = fb.bridge_request_path(self.farm_tick_dir, task_id, tag)
         response_path = self.farm_tick_dir / fb.bridge_canonical_response_name(task_id, tag)
@@ -461,12 +875,19 @@ class WindowsGameAdapter(GameAdapter):
 
         fb.pre_exchange_remove_stale_responses(self.farm_tick_dir, task_id, tag)
 
+        script_params = build_farm_tick_script_params(
+            account=account,
+            death_points_target=death_points_target,
+            tick_seq=tick_seq,
+        )
         request_payload = {
+            "bridge": "farm_tick",
             "task_id": task_id,
             "account_id": account.id,
             "worker_id": worker_id,
             "death_points_target": death_points_target,
             "tick_seq": tick_seq,
+            "script_params": script_params,
         }
         request_path.write_text(
             json.dumps(request_payload, ensure_ascii=False, indent=2),
@@ -630,6 +1051,42 @@ class WindowsGameAdapter(GameAdapter):
         request: bridge, task_id, worker_id, farmer_account_id, payload (как в задаче бота).
         response: { "ok": true|false, "error"?, "log"?, "account_status"?, "reason"? }
         """
+        await self._hook_injector_if_configured(
+            task_id=task_id,
+            worker_id=worker_id,
+            bridge="transfer_to_storage",
+        )
+        storage_login = await self._storage_login_for_payload(
+            str(payload.get("target_storage_account_id") or "") or None
+        )
+        script_params = build_transfer_script_params(
+            farmer=farmer_account,
+            payload=payload,
+            target_storage_login=storage_login,
+        )
+        script_params["role"] = farmer_account.role or "farmer"
+        if self._injector_scripts_ready():
+            data = await self._run_injector_script(
+                task_id=task_id,
+                worker_id=worker_id,
+                script_name="transfer.lua",
+                params=script_params,
+                wait_for_exit=True,
+                timeout_seconds=self.transfer_bridge_timeout_seconds,
+            )
+            if data is None:
+                data = {"ok": True, "log": "transfer.lua completed without JSON response"}
+            if not data.get("ok", False):
+                raise RuntimeError(str(data.get("error") or "transfer_to_storage failed"))
+            await self._apply_optional_bridge_account_status(
+                data=data,
+                account=farmer_account,
+                task_id=task_id,
+                worker_id=worker_id,
+                kind="transfer_to_storage",
+            )
+            await self._maybe_save_inventory_from_response(data, farmer_account.id)
+            return
         data = await self._file_bridge_exchange(
             kind="transfer_to_storage",
             bridge_dir=self.transfer_bridge_dir,
@@ -642,6 +1099,7 @@ class WindowsGameAdapter(GameAdapter):
                 "worker_id": worker_id,
                 "farmer_account_id": farmer_account.id,
                 "payload": payload,
+                "script_params": script_params,
             },
             timeout_seconds=self.transfer_bridge_timeout_seconds,
             poll_seconds=self.transfer_bridge_poll_seconds,
@@ -668,6 +1126,35 @@ class WindowsGameAdapter(GameAdapter):
         request: bridge, task_id, worker_id, storage_account_id, payload.
         response: как у transfer_to_storage.
         """
+        await self._hook_injector_if_configured(
+            task_id=task_id,
+            worker_id=worker_id,
+            bridge="set_sell_price",
+        )
+        script_params = build_sell_script_params(storage=storage_account, payload=payload)
+        script_params["role"] = storage_account.role or "storage"
+        if self._injector_scripts_ready():
+            data = await self._run_injector_script(
+                task_id=task_id,
+                worker_id=worker_id,
+                script_name="sell.lua",
+                params=script_params,
+                wait_for_exit=True,
+                timeout_seconds=self.sell_bridge_timeout_seconds,
+            )
+            if data is None:
+                data = {"ok": True, "log": "sell.lua completed without JSON response"}
+            if not data.get("ok", False):
+                raise RuntimeError(str(data.get("error") or "set_sell_price failed"))
+            await self._apply_optional_bridge_account_status(
+                data=data,
+                account=storage_account,
+                task_id=task_id,
+                worker_id=worker_id,
+                kind="set_sell_price",
+            )
+            await self._maybe_save_inventory_from_response(data, storage_account.id)
+            return
         data = await self._file_bridge_exchange(
             kind="set_sell_price",
             bridge_dir=self.sell_bridge_dir,
@@ -680,6 +1167,7 @@ class WindowsGameAdapter(GameAdapter):
                 "worker_id": worker_id,
                 "storage_account_id": storage_account.id,
                 "payload": payload,
+                "script_params": script_params,
             },
             timeout_seconds=self.sell_bridge_timeout_seconds,
             poll_seconds=self.sell_bridge_poll_seconds,
@@ -692,6 +1180,204 @@ class WindowsGameAdapter(GameAdapter):
             kind="set_sell_price",
         )
         await self._maybe_save_inventory_from_response(data, storage_account.id)
+
+    async def universal_farm_tick(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        death_points_target: int,
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError(
+                "Универсальный скрипт Kimi недоступен. Нужны INJECTOR_ENABLED=1, INJECTOR_PATH "
+                "и файл universal_sonaria_bot.lua (см. INJECTOR_UNIVERSAL_SCRIPT_PATH)."
+            )
+        existing = self._universal_farm_proc_by_task.get(task_id)
+        if existing is None:
+            params = build_universal_script_params(
+                account,
+                "farm",
+                extra_params={
+                    "target_dp": death_points_target,
+                    "death_points_target": death_points_target,
+                    "tick_seq": 1,
+                },
+            )
+            await self._run_universal_script(
+                task_id=task_id,
+                worker_id=worker_id,
+                params=params,
+                wait_for_exit=False,
+            )
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message="[universal_sonaria] command=farm started (long-running).",
+            )
+            return
+        if existing.returncode is not None:
+            self._universal_farm_proc_by_task.pop(task_id, None)
+            if existing.returncode == 0:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message="[universal_sonaria] процесс завершился до отмены.",
+                )
+                return
+            raise RuntimeError(f"universal_sonaria farm exited unexpectedly rc={existing.returncode}")
+
+    async def universal_transfer(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        farmer_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
+        storage_login = await self._storage_login_for_payload(
+            str(payload.get("target_storage_account_id") or "") or None
+        )
+        extra = build_transfer_script_params(
+            farmer=farmer_account,
+            payload=payload,
+            target_storage_login=storage_login,
+        )
+        params = build_universal_script_params(
+            farmer_account,
+            "transfer",
+            extra_params=extra,
+        )
+        data = await self._run_universal_script(
+            task_id=task_id,
+            worker_id=worker_id,
+            params=params,
+            wait_for_exit=True,
+            timeout_seconds=self.transfer_bridge_timeout_seconds,
+        )
+        if data is None:
+            data = {"ok": True, "log": "universal transfer: no stdout response"}
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("error") or "universal_transfer failed"))
+        await self._apply_optional_bridge_account_status(
+            data=data,
+            account=farmer_account,
+            task_id=task_id,
+            worker_id=worker_id,
+            kind="universal_transfer",
+        )
+        await self._maybe_save_inventory_from_response(data, farmer_account.id)
+
+    async def universal_sell(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        storage_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
+        extra = build_sell_script_params(storage=storage_account, payload=payload)
+        params = build_universal_script_params(
+            storage_account,
+            "sell",
+            extra_params=extra,
+        )
+        data = await self._run_universal_script(
+            task_id=task_id,
+            worker_id=worker_id,
+            params=params,
+            wait_for_exit=True,
+            timeout_seconds=self.sell_bridge_timeout_seconds,
+        )
+        if data is None:
+            data = {"ok": True, "log": "universal sell: no stdout response"}
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("error") or "universal_sell failed"))
+        await self._apply_optional_bridge_account_status(
+            data=data,
+            account=storage_account,
+            task_id=task_id,
+            worker_id=worker_id,
+            kind="universal_sell",
+        )
+        await self._maybe_save_inventory_from_response(data, storage_account.id)
+
+    async def universal_inventory(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
+        inv_timeout = int(
+            os.getenv(
+                "UNIVERSAL_INVENTORY_TIMEOUT_SECONDS",
+                os.getenv("FARM_TICK_TIMEOUT_SECONDS", "120"),
+            )
+        )
+        params = build_universal_script_params(
+            account,
+            "inventory",
+            extra_params=dict(payload or {}),
+        )
+        data = await self._run_universal_script(
+            task_id=task_id,
+            worker_id=worker_id,
+            params=params,
+            wait_for_exit=True,
+            timeout_seconds=inv_timeout,
+        )
+        if data is None:
+            data = {"ok": True, "log": "universal inventory: no stdout response"}
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("error") or "universal_inventory failed"))
+        await self._maybe_save_inventory_from_response(data, account.id)
+
+    async def universal_dex(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
+        asset_path = (payload or {}).get("dex_asset_path") or os.getenv("DEX_MODEL_PATH", "Dex_roblox.rbxm")
+        dex_url = (payload or {}).get("dex_url") or os.getenv("DEX_LOADER_URL")
+        params = build_universal_script_params(
+            account,
+            "dex",
+            extra_params={
+                "dex_asset_path": str(asset_path),
+                **({"dex_url": str(dex_url)} if dex_url else {}),
+            },
+        )
+        data = await self._run_universal_script(
+            task_id=task_id,
+            worker_id=worker_id,
+            params=params,
+            wait_for_exit=True,
+            timeout_seconds=60,
+        )
+        if data is None:
+            data = {"ok": True, "log": "dex: no stdout response"}
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("error") or "universal_dex failed"))
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[universal_sonaria] dex ok. {data.get('log') or ''}",
+        )
 
 
 class StubGameAdapter(GameAdapter):
@@ -776,6 +1462,81 @@ class StubGameAdapter(GameAdapter):
             task_id=task_id,
             worker_id=worker_id,
             message=f"[stub] set_sell_price storage={storage_account.id} payload keys={list(payload)}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_farm_tick(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        death_points_target: int,
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_farm_tick account_id={account.id} dp={death_points_target}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_transfer(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        farmer_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_transfer farmer={farmer_account.id}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_sell(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        storage_account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_sell storage={storage_account.id}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_inventory(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_inventory account={account.id} payload_keys={list(payload)}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_dex(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_dex account={account.id} payload_keys={list(payload)}",
         )
         await asyncio.sleep(1)
 

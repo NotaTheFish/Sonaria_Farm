@@ -71,6 +71,12 @@ class MainMenuButtons(str, Enum):
     STOP_FARM = "Остановить фарм"
     START_SALES = "Запустить продажи"
     STOP_SALES = "Остановить продажи"
+    # Универсальный скрипт Kimi (отдельные типы задач; не смешивать с legacy INJECTOR_SCRIPTS_DIR)
+    UNIVERSAL_FARM = "Фарм (универсал)"
+    UNIVERSAL_TRANSFER = "Перенос (универсал)"
+    UNIVERSAL_SELL = "Продажи (универсал)"
+    UNIVERSAL_INVENTORY = "Инвентарь (универсал)"
+    UNIVERSAL_DEX = "Dex (универсал)"
 
 
 class SettingsButtons(str, Enum):
@@ -165,6 +171,17 @@ def control_kb() -> ReplyKeyboardMarkup:
         [
             KeyboardButton(text=MainMenuButtons.START_SALES.value),
             KeyboardButton(text=MainMenuButtons.STOP_SALES.value),
+        ],
+        [
+            KeyboardButton(text=MainMenuButtons.UNIVERSAL_FARM.value),
+            KeyboardButton(text=MainMenuButtons.UNIVERSAL_TRANSFER.value),
+        ],
+        [
+            KeyboardButton(text=MainMenuButtons.UNIVERSAL_SELL.value),
+            KeyboardButton(text=MainMenuButtons.UNIVERSAL_INVENTORY.value),
+        ],
+        [
+            KeyboardButton(text=MainMenuButtons.UNIVERSAL_DEX.value),
         ],
         [
             KeyboardButton(text=MainMenuButtons.DEATH_POINTS.value),
@@ -330,9 +347,57 @@ async def enqueue_set_sell_price_for_active_storages(
             account_id=storage.id,
             only_pending=False,
         )
+        await request_cancel_tasks(
+            task_type=TaskType.UNIVERSAL_SELL.value,
+            account_id=storage.id,
+            only_pending=False,
+        )
         await create_task(
             task_type=TaskType.SET_SELL_PRICE.value,
             priority=300,
+            account_id=storage.id,
+            payload={
+                "ranges": ranges,
+                "priority_tokens": priority_tokens,
+                "fallback_non_priority_mode": "sell_all_when_priority_empty",
+            },
+        )
+    return len(storages), None
+
+
+async def enqueue_universal_sell_for_active_storages(
+    ranges: dict[str, dict[str, int]],
+    priority_tokens: list[str],
+) -> tuple[int, str | None]:
+    """Задачи UNIVERSAL_SELL для активных складов (скрипт Kimi)."""
+    await rebalance_active_account_roles()
+    async with AsyncSessionMaker() as session:
+        storages = (
+            await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.STORAGE.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+        ).all()
+
+    if not storages:
+        return 0, "Нет активных аккаунтов-складов."
+
+    for storage in storages:
+        await request_cancel_tasks(
+            task_type=TaskType.UNIVERSAL_SELL.value,
+            account_id=storage.id,
+            only_pending=False,
+        )
+        await request_cancel_tasks(
+            task_type=TaskType.SET_SELL_PRICE.value,
+            account_id=storage.id,
+            only_pending=False,
+        )
+        await create_task(
+            task_type=TaskType.UNIVERSAL_SELL.value,
+            priority=310,
             account_id=storage.id,
             payload={
                 "ranges": ranges,
@@ -701,6 +766,11 @@ def build_router(config: Config) -> Router:
                 account_id=farmer.id,
                 only_pending=False,
             )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_TRANSFER.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
 
         created = 0
         for i, farmer in enumerate(farmers):
@@ -731,6 +801,79 @@ def build_router(config: Config) -> Router:
         await message.answer(
             f"Созданы задачи `На склад`: {created} штук (фермеров={len(farmers)}, складов={len(storages)}).",
             reply_markup=accounts_checks_kb(),
+        )
+
+    @router.message(F.text == MainMenuButtons.UNIVERSAL_TRANSFER.value, AdminFilter(config.admin_id))
+    async def on_universal_to_storage(message: Message):
+        """Перенос через ``universal_sonaria_bot.lua`` (отдельно от файлового/legacy transfer)."""
+        await rebalance_active_account_roles()
+        async with AsyncSessionMaker() as session:
+            farmers = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.FARMER.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
+            storages = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.STORAGE.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
+
+        if not farmers:
+            await message.answer("Нет активных аккаунтов-фермеров.", reply_markup=control_kb())
+            return
+        if not storages:
+            await message.answer("Нет активных аккаунтов-складов.", reply_markup=control_kb())
+            return
+
+        for farmer in farmers:
+            await request_cancel_tasks(
+                task_type=TaskType.TRANSFER_TO_STORAGE.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_TRANSFER.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+
+        created = 0
+        for i, farmer in enumerate(farmers):
+            storage = storages[i % len(storages)]
+            payload = {
+                "target_storage_account_id": storage.id,
+                "batch_size": 150,
+                "cooldown_seconds": 70,
+                "storage_gives": 1,
+                "token_kinds": [
+                    "Revive Token",
+                    "Max Growth Token",
+                    "Partial Growth Token",
+                    "Random Trial Creature Token",
+                    "Appearance Change Token",
+                    "Death Gacha Token",
+                ],
+                "transfer_mode": "FULL_BATCH_UNTIL_ZERO",
+            }
+            await create_task(
+                task_type=TaskType.UNIVERSAL_TRANSFER.value,
+                priority=510,
+                account_id=farmer.id,
+                payload=payload,
+            )
+            created += 1
+
+        await message.answer(
+            f"Универсальный перенос (Kimi): создано задач = {created}. "
+            f"Классическое «На склад» для этих фермеров отменено.",
+            reply_markup=control_kb(),
         )
 
     @router.message(F.text == SettingsButtons.ACCOUNTS.value, AdminFilter(config.admin_id))
@@ -1197,6 +1340,11 @@ def build_router(config: Config) -> Router:
                 account_id=farmer.id,
                 only_pending=False,
             )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_FARM.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
 
         created = 0
         for farmer in farmers:
@@ -1210,6 +1358,73 @@ def build_router(config: Config) -> Router:
 
         await message.answer(
             f"Фарм включен: создано задач `Запустить фарм` = {created}.",
+            reply_markup=control_kb(),
+        )
+
+    @router.message(F.text == MainMenuButtons.UNIVERSAL_FARM.value, AdminFilter(config.admin_id))
+    async def on_universal_start_farm(message: Message):
+        """Долгий фарм через ``universal_sonaria_bot.lua`` (Kimi), отдельно от legacy ``farm.lua``."""
+        await rebalance_active_account_roles()
+        async with AsyncSessionMaker() as session:
+            settings = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+            if not settings:
+                settings = ControllerSettings(
+                    id=1,
+                    death_points_target=600,
+                    farmer_ratio_percent=70,
+                    farming_enabled=True,
+                    sales_enabled=False,
+                )
+                session.add(settings)
+            else:
+                settings.farming_enabled = True
+            death_points_target = settings.death_points_target
+            await session.commit()
+
+        async with AsyncSessionMaker() as session:
+            farmers = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.FARMER.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
+
+        if not farmers:
+            await message.answer(
+                "Нет активных фермеров для универсального фарма.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        for farmer in farmers:
+            await request_cancel_tasks(
+                task_type=TaskType.START_FARM.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_FARM.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+
+        created = 0
+        for farmer in farmers:
+            await create_task(
+                task_type=TaskType.UNIVERSAL_FARM.value,
+                priority=1000,
+                account_id=farmer.id,
+                payload={"death_points_target": death_points_target, "loop": True},
+            )
+            created += 1
+
+        await message.answer(
+            f"Универсальный фарм (Kimi): создано задач = {created}. "
+            f"Классический «Запустить фарм» для этих аккаунтов отменён.",
             reply_markup=control_kb(),
         )
 
@@ -1254,6 +1469,11 @@ def build_router(config: Config) -> Router:
         for farmer in farmers:
             await request_cancel_tasks(
                 task_type=TaskType.START_FARM.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_FARM.value,
                 account_id=farmer.id,
                 only_pending=False,
             )
@@ -1344,6 +1564,114 @@ def build_router(config: Config) -> Router:
             reply_markup=control_kb(),
         )
 
+    @router.message(F.text == MainMenuButtons.UNIVERSAL_SELL.value, AdminFilter(config.admin_id))
+    async def on_universal_start_sales(message: Message):
+        """Продажи через ``universal_sonaria_bot.lua`` (тип задачи ``universal_sell``)."""
+        await rebalance_active_account_roles()
+        async with AsyncSessionMaker() as session:
+            settings_row = await session.scalar(
+                select(ControllerSettings).where(ControllerSettings.id == 1)
+            )
+        ranges_raw = (settings_row.sell_ranges_json if settings_row else None) or ""
+        prio_raw = (settings_row.sell_priority_tokens_json if settings_row else None) or ""
+
+        if not ranges_raw.strip() or not prio_raw.strip():
+            await message.answer(
+                "Сначала один раз пройди «Выставить цену» — без сохранённых диапазонов "
+                "универсальные продажи не запускаются.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        try:
+            ranges = json.loads(ranges_raw)
+            priority_tokens = json.loads(prio_raw)
+        except json.JSONDecodeError:
+            await message.answer(
+                "Сохранённые настройки цен в БД повреждены. Пройди «Выставить цену» заново.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        if not isinstance(ranges, dict) or not isinstance(priority_tokens, list):
+            await message.answer("Неверный формат сохранённых цен.", reply_markup=control_kb())
+            return
+
+        if len(priority_tokens) != 4 or any(p not in SELLABLE_TOKENS for p in priority_tokens):
+            await message.answer(
+                "Приоритеты некорректны. Пройди «Выставить цену» заново.",
+                reply_markup=control_kb(),
+            )
+            return
+
+        count, err = await enqueue_universal_sell_for_active_storages(ranges, priority_tokens)
+        if err:
+            await message.answer(err, reply_markup=control_kb())
+            return
+
+        await message.answer(
+            f"Универсальные продажи (Kimi): задачи для {count} складов.\n"
+            f"Классические `Выставить цену` для них отменены.\n"
+            f"Приоритеты: {', '.join(priority_tokens)}",
+            reply_markup=control_kb(),
+        )
+
+    @router.message(F.text == MainMenuButtons.UNIVERSAL_INVENTORY.value, AdminFilter(config.admin_id))
+    async def on_universal_inventory(message: Message):
+        await rebalance_active_account_roles()
+        async with AsyncSessionMaker() as session:
+            accounts = (
+                await session.scalars(
+                    select(Account).where(Account.status == AccountStatus.ACTIVE.value)
+                )
+            ).all()
+
+        if not accounts:
+            await message.answer("Нет активных аккаунтов.", reply_markup=control_kb())
+            return
+
+        created = 0
+        for acc in accounts:
+            await create_task(
+                task_type=TaskType.UNIVERSAL_INVENTORY.value,
+                priority=400,
+                account_id=acc.id,
+                payload={},
+            )
+            created += 1
+
+        await message.answer(
+            f"Созданы задачи `Инвентарь (универсал)` для {created} активных аккаунтов.",
+            reply_markup=control_kb(),
+        )
+
+    @router.message(F.text == MainMenuButtons.UNIVERSAL_DEX.value, AdminFilter(config.admin_id))
+    async def on_universal_dex(message: Message):
+        async with AsyncSessionMaker() as session:
+            accounts = (
+                await session.scalars(
+                    select(Account).where(Account.status == AccountStatus.ACTIVE.value)
+                )
+            ).all()
+        if not accounts:
+            await message.answer("Нет активных аккаунтов.", reply_markup=control_kb())
+            return
+
+        created = 0
+        for acc in accounts:
+            await create_task(
+                task_type=TaskType.UNIVERSAL_DEX.value,
+                priority=200,
+                account_id=acc.id,
+                payload={},
+            )
+            created += 1
+
+        await message.answer(
+            f"Созданы задачи `Dex (универсал)` для {created} активных аккаунтов.",
+            reply_markup=control_kb(),
+        )
+
     @router.message(F.text == MainMenuButtons.STOP_SALES.value, AdminFilter(config.admin_id))
     async def on_stop_sales(message: Message):
         await rebalance_active_account_roles()
@@ -1376,6 +1704,11 @@ def build_router(config: Config) -> Router:
         for storage in storages:
             await request_cancel_tasks(
                 task_type=TaskType.SET_SELL_PRICE.value,
+                account_id=storage.id,
+                only_pending=False,
+            )
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_SELL.value,
                 account_id=storage.id,
                 only_pending=False,
             )

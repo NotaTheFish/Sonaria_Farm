@@ -22,6 +22,7 @@ from sqlalchemy import select
 
 from farm.database import AsyncSessionMaker, ensure_migrations_applied
 from farm.game.adapter import GameAdapter, get_game_adapter, load_account_or_raise
+from farm.game.stop_flags import clear_stop_flag, write_stop_flag
 from farm.models import Account, AccountStatus, TaskType
 from farm.task_queue import (
     acquire_instance_for_worker,
@@ -81,6 +82,8 @@ async def _run_farm_loop(
         message=f"Farm loop started. death_points_target={death_points_target}",
     )
 
+    clear_stop_flag(account_id)
+
     while True:
         fresh = await _reload_account(account_id)
         if fresh is not None:
@@ -96,6 +99,29 @@ async def _run_farm_loop(
                 level="warning",
                 message="Cancel requested. Stopping farm loop.",
             )
+            try:
+                flag_path = write_stop_flag(account_id)
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    message=f"Stop flag written for Lua: {flag_path}",
+                )
+            except OSError as exc:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"Could not write stop flag: {exc}",
+                )
+            try:
+                await adapter.on_start_farm_cancel(task_id=task_id, worker_id=worker_id, account=account)
+            except Exception as exc:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"Adapter cancel hook failed: {exc}",
+                )
             # Чтобы stop_farm tasks не копились в pending после отмены start_farm
             await request_cancel_tasks(
                 task_type=TaskType.STOP_FARM.value,
@@ -131,6 +157,95 @@ async def _run_farm_loop(
         )
 
 
+async def _run_universal_farm_loop(
+    adapter: GameAdapter,
+    task_id: str,
+    worker_id: str,
+    payload: dict[str, Any],
+) -> None:
+    death_points_target = int(payload.get("death_points_target", 600))
+    account = await load_account_or_raise(task_id)
+    account_id = account.id
+
+    await append_task_log(
+        task_id=task_id,
+        worker_id=worker_id,
+        message=f"Universal farm loop started (Kimi). death_points_target={death_points_target}",
+    )
+
+    clear_stop_flag(account_id)
+
+    while True:
+        fresh = await _reload_account(account_id)
+        if fresh is not None:
+            account = fresh
+
+        await renew_running_tasks_lease(worker_id=worker_id, lease_seconds=LEASE_SECONDS)
+        await heartbeat_worker(worker_id=worker_id)
+
+        if await is_task_cancel_requested(task_id=task_id):
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                level="warning",
+                message="Cancel requested. Stopping universal farm loop.",
+            )
+            try:
+                flag_path = write_stop_flag(account_id)
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    message=f"Stop flag written for Lua: {flag_path}",
+                )
+            except OSError as exc:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"Could not write stop flag: {exc}",
+                )
+            try:
+                await adapter.on_start_farm_cancel(task_id=task_id, worker_id=worker_id, account=account)
+            except Exception as exc:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"Adapter cancel hook failed: {exc}",
+                )
+            await request_cancel_tasks(
+                task_type=TaskType.STOP_FARM.value,
+                account_id=account_id,
+                only_pending=True,
+            )
+            await mark_task_cancelled(task_id=task_id)
+            return
+
+        if account.status in _inactive_account_statuses():
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                level="error",
+                message=f"Account inactive (status={account.status}). Stopping universal farm.",
+            )
+            await request_cancel_tasks(
+                account_id=account_id,
+                only_pending=True,
+            )
+            await mark_task_failed(
+                task_id=task_id,
+                error=f"account_inactive:{account.status}",
+            )
+            return
+
+        await adapter.universal_farm_tick(
+            task_id=task_id,
+            worker_id=worker_id,
+            account=account,
+            death_points_target=death_points_target,
+        )
+
+
 async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
     payload: dict[str, Any] = {}
     if task.payload:
@@ -150,11 +265,110 @@ async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
             await _run_farm_loop(adapter, task.id, worker_id, payload)
             return
 
+        if task.task_type == TaskType.UNIVERSAL_FARM.value:
+            await _run_universal_farm_loop(adapter, task.id, worker_id, payload)
+            return
+
         if task.task_type == TaskType.STOP_FARM.value:
+            account = await load_account_or_raise(task.id)
             await append_task_log(
                 task_id=task.id,
                 worker_id=worker_id,
                 message="Stop-farm task received.",
+            )
+            try:
+                flag_path = write_stop_flag(account.id)
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    message=f"Stop flag written for Lua: {flag_path}",
+                )
+            except OSError as exc:
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"Could not write stop flag: {exc}",
+                )
+            await mark_task_done(task_id=task.id)
+            return
+
+        if task.task_type == TaskType.UNIVERSAL_TRANSFER.value:
+            farmer = await load_account_or_raise(task.id)
+            if farmer.status in _inactive_account_statuses():
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="error",
+                    message=f"Farmer account inactive status={farmer.status}. Skip universal transfer.",
+                )
+                await mark_task_failed(
+                    task_id=task.id,
+                    error=f"account_inactive:{farmer.status}",
+                )
+                return
+            await adapter.universal_transfer(
+                task_id=task.id,
+                worker_id=worker_id,
+                farmer_account=farmer,
+                payload=payload,
+            )
+            await mark_task_done(task_id=task.id)
+            return
+
+        if task.task_type == TaskType.UNIVERSAL_SELL.value:
+            storage = await load_account_or_raise(task.id)
+            if storage.status in _inactive_account_statuses():
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="error",
+                    message=f"Storage account inactive status={storage.status}. Skip universal sell.",
+                )
+                await mark_task_failed(
+                    task_id=task.id,
+                    error=f"account_inactive:{storage.status}",
+                )
+                return
+            await adapter.universal_sell(
+                task_id=task.id,
+                worker_id=worker_id,
+                storage_account=storage,
+                payload=payload,
+            )
+            await mark_task_done(task_id=task.id)
+            return
+
+        if task.task_type == TaskType.UNIVERSAL_INVENTORY.value:
+            account = await load_account_or_raise(task.id)
+            if account.status in _inactive_account_statuses():
+                await append_task_log(
+                    task_id=task.id,
+                    worker_id=worker_id,
+                    level="error",
+                    message=f"Account inactive status={account.status}. Skip universal inventory.",
+                )
+                await mark_task_failed(
+                    task_id=task.id,
+                    error=f"account_inactive:{account.status}",
+                )
+                return
+            await adapter.universal_inventory(
+                task_id=task.id,
+                worker_id=worker_id,
+                account=account,
+                payload=payload,
+            )
+            await mark_task_done(task_id=task.id)
+            return
+
+        if task.task_type == TaskType.UNIVERSAL_DEX.value:
+            account = await load_account_or_raise(task.id)
+            await adapter.universal_dex(
+                task_id=task.id,
+                worker_id=worker_id,
+                account=account,
+                payload=payload,
             )
             await mark_task_done(task_id=task.id)
             return

@@ -1,6 +1,6 @@
 # Sonaria Farm — контроллер + очередь + воркеры (Windows)
 
-**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`config.example.env`** → скопировать в `.env`. Внешний клиент файлового моста: **[docs/EXTERNAL_BRIDGE_CLIENT.md](docs/EXTERNAL_BRIDGE_CLIENT.md)**. Целевая схема «воркер + инжектор + изолированные сессии Roblox»: **[docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md](docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md)** (ToS/риски — на стороне деплоя).
+**Деплой:** бот на Railway, воркер на Windows — см. **[docs/GUIDE_WORKER_WINDOWS_RAILWAY.md](docs/GUIDE_WORKER_WINDOWS_RAILWAY.md)**. Шаблон переменных: **`env.template`** → `copy env.template .env` (Windows) и заполни секреты. Внешний клиент файлового моста: **[docs/EXTERNAL_BRIDGE_CLIENT.md](docs/EXTERNAL_BRIDGE_CLIENT.md)**. Параметры для универсальных Lua (`script_params`): **[docs/SCRIPT_PARAMS_AND_LUA.md](docs/SCRIPT_PARAMS_AND_LUA.md)**. Целевая схема «воркер + инжектор + сессии Roblox»: **[docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md](docs/ARCHITECTURE_WORKER_INJECTOR_ROBLOX.md)** (ToS/риски — на стороне деплоя).
 
 ## Структура
 
@@ -13,6 +13,9 @@
 | `farm/worker/main.py` | Polling-воркер |
 | `farm/game/adapter.py` | Файловые мосты Windows / `GameAdapter` |
 | `farm/game/file_bridge.py` | Общие пути/суффиксы моста, `FILE_BRIDGE_ROOT` / `FILE_BRIDGE_UNIFIED_DIR` |
+| `farm/game/injector_launcher.py` | Опциональный `subprocess` инжектора (`INJECTOR_*` в `.env`) |
+| `farm/game/script_params.py` | Сборка `script_params` для Lua из аккаунта + payload |
+| `docs/SCRIPT_PARAMS_AND_LUA.md` | Контракт параметров скриптов и стоп-флага |
 | `farm/account_inventory.py` | Сохранение снимка `inventory` из ответа моста в `accounts` |
 | `farm/inventory_formatting.py` | Разбор JSON и HTML для кнопки «Инвентарь» в боте |
 | `scripts/file_bridge_echo.py` | Авто-`response.json` для теста мостов |
@@ -78,7 +81,7 @@ pytest
 
 ## Запуск
 
-1. Переменные окружения — см. `config.example.env`
+1. Переменные окружения — см. `env.template` (копия в `.env`)
 2. Миграции:
    ```bash
    alembic upgrade head
@@ -154,15 +157,25 @@ pytest
 
 Если после сбоя остался «лишний» `response` для **той же** задачи (не удалился из‑за блокировки файла), включи в `.env` **`FARM_TICK_CLEAN_ON_START=1`** — при следующем запуске воркера каталог моста обнулится (один воркер на эту папку).
 
-**request.json** (пример):
+**request.json** (пример; подробно про `script_params`: **[docs/SCRIPT_PARAMS_AND_LUA.md](docs/SCRIPT_PARAMS_AND_LUA.md)**):
 
 ```json
 {
+  "bridge": "farm_tick",
   "task_id": "uuid-задачи-start_farm",
   "account_id": "uuid-аккаунта",
   "worker_id": "worker-1",
   "death_points_target": 600,
-  "tick_seq": 1
+  "tick_seq": 1,
+  "script_params": {
+    "target_dp": 600,
+    "death_points_target": 600,
+    "tick_seq": 1,
+    "account_id": "uuid-аккаунта",
+    "account_login": "player_login",
+    "account_password": "…",
+    "stop_flag_path": "C:\\\\sonaria_farm\\\\runtime\\\\stop_flags\\\\uuid-аккаунта.stop"
+  }
 }
 ```
 
