@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -23,6 +24,7 @@ from sqlalchemy import select, update
 
 from farm.database import AsyncSessionMaker
 from farm.game import file_bridge as fb
+from farm.game import injector_backend as ib
 from farm.game import injector_launcher as inj
 from farm.game.script_params import (
     build_farm_tick_script_params,
@@ -222,19 +224,11 @@ class WindowsGameAdapter(GameAdapter):
         self._universal_farm_proc_by_task: dict[str, asyncio.subprocess.Process] = {}
 
     def _injector_scripts_ready(self) -> bool:
-        return (
-            inj.injector_enabled_flag()
-            and inj.injector_executable() is not None
-            and inj.injector_scripts_dir() is not None
-        )
+        return ib.legacy_ready()
 
     def _universal_sonaria_ready(self) -> bool:
         """Скрипт Kimi: отдельный путь от legacy ``INJECTOR_SCRIPTS_DIR``."""
-        return (
-            inj.injector_enabled_flag()
-            and inj.injector_executable() is not None
-            and inj.resolve_universal_sonaria_script_path() is not None
-        )
+        return ib.universal_ready()
 
     @staticmethod
     def _parse_sonaria_stdout(text: str) -> dict[str, Any]:
@@ -271,73 +265,55 @@ class WindowsGameAdapter(GameAdapter):
         wait_for_exit: bool,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any] | None:
-        exe = inj.injector_executable()
         script_path = inj.resolve_universal_sonaria_script_path()
-        if not exe or not script_path:
+        if not script_path and not ib.is_mock_backend():
             raise RuntimeError(
                 "Универсальный скрипт не настроен: задай INJECTOR_ENABLED=1, INJECTOR_PATH "
                 "и положи universal_sonaria_bot.lua (или INJECTOR_UNIVERSAL_SCRIPT_PATH)."
             )
-        pid = inj.resolve_roblox_pid()
-        if not pid:
-            raise RuntimeError(
-                "Не удалось определить PID Roblox. Укажи ROBLOX_PID или запусти RobloxPlayerBeta.exe."
+        if ib.is_mock_backend():
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message=f"[injector:mock] universal command={params.get('command')} wait={wait_for_exit}",
             )
-        params_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
-        argv = [
-            str(exe.resolve()),
-            *inj.injector_extra_argv(),
-            str(pid),
-            str(script_path.resolve()),
-            params_json,
-        ]
+            if wait_for_exit:
+                return {"ok": True, "log": "mock backend"}
+            # Нужен живой процесс для long-running farm/cancel.
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(3600)"
+            )
+            self._universal_farm_proc_by_task[task_id] = proc
+            return None
+        assert script_path is not None
+        argv, pid = ib.build_argv(script_path=script_path, params=params)
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
-            message="[universal_sonaria] запуск (Kimi), wait_for_exit=%s" % wait_for_exit,
+            message="[universal_sonaria] запуск (Kimi), pid=%s wait_for_exit=%s" % (pid, wait_for_exit),
         )
 
-        kwargs: dict[str, Any] = {}
-        if os.getenv("INJECTOR_NO_WINDOW", "").strip().lower() in ("1", "true", "yes", "on"):
-            import subprocess
-
-            if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
         if wait_for_exit:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **kwargs,
-            )
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=(
+                stdout, stderr, returncode = await ib.run_wait(
+                    argv=argv,
+                    timeout_seconds=(
                         timeout_seconds if timeout_seconds is not None else inj.injector_timeout_seconds()
                     ),
                 )
             except TimeoutError as exc:
-                proc.kill()
-                await proc.wait()
                 raise RuntimeError("universal_sonaria inject timeout") from exc
-            if proc.returncode not in (0, None):
-                err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+            if returncode not in (0, None):
+                err_text = stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(
-                    f"universal_sonaria failed rc={proc.returncode}: {err_text or 'no stderr'}"
+                    f"universal_sonaria failed rc={returncode}: {err_text or 'no stderr'}"
                 )
-            out_text = (stdout or b"").decode("utf-8", errors="replace")
+            out_text = stdout.decode("utf-8", errors="replace")
             if not out_text.strip():
                 return None
             return self._parse_sonaria_stdout(out_text)
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs,
-        )
+        proc = await ib.run_detached(argv=argv)
         self._universal_farm_proc_by_task[task_id] = proc
         return None
 
@@ -351,65 +327,48 @@ class WindowsGameAdapter(GameAdapter):
         wait_for_exit: bool,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any] | None:
-        exe = inj.injector_executable()
-        if not exe:
-            raise RuntimeError("INJECTOR_ENABLED=1, но не найден INJECTOR_PATH")
         script_path = inj.resolve_injector_script_path(script_name)
-        if not script_path:
+        if not script_path and not ib.is_mock_backend():
             raise RuntimeError(
                 f"Не найден Lua-скрипт: {script_name!r}. Проверь INJECTOR_SCRIPTS_DIR и имя файла."
             )
-        pid = inj.resolve_roblox_pid()
-        if not pid:
-            raise RuntimeError(
-                "Не удалось определить PID Roblox. Укажи ROBLOX_PID или запусти RobloxPlayerBeta.exe."
+        if ib.is_mock_backend():
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message=f"[injector:mock] script={script_name} wait={wait_for_exit}",
             )
-
-        params_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
-        argv = [
-            str(exe.resolve()),
-            *inj.injector_extra_argv(),
-            str(pid),
-            str(script_path.resolve()),
-            params_json,
-        ]
+            if wait_for_exit:
+                return {"ok": True, "log": f"mock {script_name} done"}
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(3600)"
+            )
+            self._injector_farm_proc_by_task[task_id] = proc
+            return None
+        assert script_path is not None
+        argv, pid = ib.build_argv(script_path=script_path, params=params)
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
             message=f"[injector] run script={script_name} pid={pid} wait={wait_for_exit}",
         )
 
-        kwargs: dict[str, Any] = {}
-        if os.getenv("INJECTOR_NO_WINDOW", "").strip().lower() in ("1", "true", "yes", "on"):
-            import subprocess
-
-            if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
         if wait_for_exit:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **kwargs,
-            )
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=(
+                stdout, stderr, returncode = await ib.run_wait(
+                    argv=argv,
+                    timeout_seconds=(
                         timeout_seconds if timeout_seconds is not None else inj.injector_timeout_seconds()
                     ),
                 )
             except TimeoutError as exc:
-                proc.kill()
-                await proc.wait()
                 raise RuntimeError(f"injector timeout for script={script_name}") from exc
-            if proc.returncode not in (0, None):
-                err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
+            if returncode not in (0, None):
+                err_text = stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(
-                    f"injector script failed rc={proc.returncode} script={script_name}: {err_text or 'no stderr'}"
+                    f"injector script failed rc={returncode} script={script_name}: {err_text or 'no stderr'}"
                 )
-            out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
+            out_text = stdout.decode("utf-8", errors="replace").strip()
             if not out_text:
                 return None
             last_line = out_text.splitlines()[-1].strip()
@@ -425,12 +384,7 @@ class WindowsGameAdapter(GameAdapter):
                 raise RuntimeError(f"script {script_name} expected JSON object, got {type(parsed).__name__}")
             return parsed
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs,
-        )
+        proc = await ib.run_detached(argv=argv)
         self._injector_farm_proc_by_task[task_id] = proc
         return None
 

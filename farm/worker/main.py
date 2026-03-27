@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import socket
+from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
@@ -22,8 +23,9 @@ from sqlalchemy import select
 
 from farm.database import AsyncSessionMaker, ensure_migrations_applied
 from farm.game.adapter import GameAdapter, get_game_adapter, load_account_or_raise
+from farm.game.check_injector import collect_status
 from farm.game.stop_flags import clear_stop_flag, write_stop_flag
-from farm.models import Account, AccountStatus, TaskType
+from farm.models import Account, AccountStatus, Instance, InstanceStatus, TaskType, Worker
 from farm.task_queue import (
     acquire_instance_for_worker,
     append_task_log,
@@ -49,6 +51,94 @@ logger = logging.getLogger("farm.worker")
 
 POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "2.0"))
 LEASE_SECONDS = int(os.getenv("WORKER_LEASE_SECONDS", "90"))
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    val = (os.getenv(name, default) or "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _preflight_mode() -> str:
+    raw = (os.getenv("WORKER_PREFLIGHT_MODE") or "strict").strip().lower()
+    return raw if raw in ("strict", "warn") else "strict"
+
+
+def _run_worker_preflight_if_enabled() -> None:
+    if not _truthy_env("WORKER_PREFLIGHT_CHECK", "0"):
+        return
+    mode = _preflight_mode()
+    status = collect_status()
+    logger.info(
+        "Preflight: mode=%s backend=%s enabled=%s roblox_pid=%s legacy_ready=%s universal_ready=%s",
+        mode,
+        status.get("backend"),
+        status.get("enabled"),
+        status.get("roblox_pid"),
+        status.get("legacy_ready"),
+        status.get("universal_ready"),
+    )
+    issues = status.get("issues") or []
+    if issues:
+        joined = "; ".join(str(x) for x in issues)
+        if mode == "warn":
+            logger.warning("Worker preflight warnings: %s", joined)
+            return
+        raise RuntimeError(f"Worker preflight failed: {joined}")
+
+
+async def _preflight_instance_conflict(*, worker_id: str, instance_name: str) -> None:
+    """
+    Ранняя диагностика конфликта инстанса до acquire_instance_for_worker.
+    Использует ту же stale-логику, что и task_queue.acquire_instance_for_worker.
+    """
+    async with AsyncSessionMaker() as session:
+        instance = await session.scalar(select(Instance).where(Instance.name == instance_name))
+        if not instance:
+            logger.info("Preflight instance: %s is free (no row in instances).", instance_name)
+            return
+
+        if instance.status != InstanceStatus.BUSY.value:
+            logger.info(
+                "Preflight instance: %s exists with status=%s (not busy).",
+                instance_name,
+                instance.status,
+            )
+            return
+
+        if not instance.worker_id or instance.worker_id == worker_id:
+            logger.info(
+                "Preflight instance: %s is already assigned to current worker_id=%s.",
+                instance_name,
+                worker_id,
+            )
+            return
+
+        stale_sec = int(os.getenv("WORKER_STALE_HEARTBEAT_SECONDS", "180"))
+        old_worker = await session.scalar(select(Worker).where(Worker.id == instance.worker_id))
+        takeover = False
+        if old_worker is None:
+            reason = "worker row missing"
+            takeover = True
+        else:
+            age = (datetime.now(timezone.utc) - old_worker.heartbeat_at).total_seconds()
+            if age > stale_sec:
+                reason = f"heartbeat stale {age:.0f}s > {stale_sec}s"
+                takeover = True
+            else:
+                reason = f"heartbeat fresh {age:.0f}s"
+
+        mode = _preflight_mode() if _truthy_env("WORKER_PREFLIGHT_CHECK", "0") else "warn"
+        msg = (
+            f"Preflight instance conflict: '{instance_name}' busy by worker {instance.worker_id}. "
+            f"Set WORKER_ID={instance.worker_id}, stop old process, or wait stale timeout. ({reason})"
+        )
+        if takeover:
+            logger.warning("%s Will attempt takeover on acquire.", msg)
+            return
+        if mode == "warn":
+            logger.warning("%s", msg)
+            return
+        raise RuntimeError(msg)
 
 
 def _inactive_account_statuses() -> set[str]:
@@ -433,6 +523,7 @@ async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
 async def main() -> None:
     load_dotenv()
     await ensure_migrations_applied()
+    _run_worker_preflight_if_enabled()
 
     adapter = get_game_adapter()
 
@@ -448,6 +539,7 @@ async def main() -> None:
         account_id=account_id,
         hostname=hostname,
     )
+    await _preflight_instance_conflict(worker_id=worker_id, instance_name=instance_name)
     await acquire_instance_for_worker(
         worker_id=worker_id,
         instance_name=instance_name,

@@ -98,6 +98,54 @@ pytest
    python worker_main.py
    ```
 
+Перед запуском воркера можно проверить инжектор:
+```bash
+python -m farm.game.check_injector
+python -m farm.game.check_injector --json
+```
+
+Команды запускай из **корня репозитория** (`C:\sonaria_farm`): CLI читает `.env` из корня как источник конфигурации.
+
+Локальная сборка `stocker/injector.cpp` (стабильный выход в `stocker/build`):
+```powershell
+cd C:\sonaria_farm
+powershell -ExecutionPolicy Bypass -File stocker/build_injector.ps1
+```
+
+Опции toolchain:
+- `-Toolchain auto` (по умолчанию): сначала `cl.exe`, затем fallback на `g++.exe`;
+- `-Toolchain msvc`: только MSVC;
+- `-Toolchain mingw`: только MinGW.
+
+`-Toolchain msvc` поддерживает два сценария: `cl.exe` уже в `PATH` **или** автоподхват через `vswhere` + `VsDevCmd.bat` (Visual Studio Build Tools).
+
+Минимальная связка через корневой `.env`:
+```bash
+INJECTOR_BACKEND=external_cli
+INJECTOR_ENABLED=1
+INJECTOR_PATH=stocker/build/injector.exe
+INJECT_DLL_PATH=stocker/inject.dll
+```
+
+Используй `python -m farm.game.check_injector --json` как gate перед стартом воркера/пайплайна: `ok=true` — конфигурация валидна.
+По умолчанию gate также требует наличие текущего `ROBLOX_PID` (или запущенный `RobloxPlayerBeta.exe`); для config-only gate поставь `INJECTOR_PREFLIGHT_REQUIRE_ROBLOX_PID=0`.
+
+Чтобы воркер падал сразу при плохой конфигурации инжектора, включи в `.env`:
+```bash
+WORKER_PREFLIGHT_CHECK=1
+WORKER_PREFLIGHT_MODE=strict
+```
+
+Если нужен только лог без остановки процесса:
+```bash
+WORKER_PREFLIGHT_CHECK=1
+WORKER_PREFLIGHT_MODE=warn
+```
+
+Preflight также проверяет конфликт `WORKER_INSTANCE_NAME` до запуска цикла:
+- в `strict` при "busy by another worker" с fresh heartbeat воркер завершится сразу;
+- в `warn` выведет предупреждение и продолжит (дальше `acquire_instance_for_worker` решит takeover/ошибку).
+
 `WORKER_INSTANCE_NAME` должен быть уникальным на каждый параллельный воркер/сессию.
 Рекомендуемая модель: 1 воркер = 1 инстанс Roblox = 1 аккаунт в работе.
 

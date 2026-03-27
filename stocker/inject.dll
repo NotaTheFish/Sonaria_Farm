@@ -1,0 +1,100 @@
+// inject.cpp
+// Компилировать: cl /LD /EHsc inject.cpp /Fe:inject.dll /link user32.lib kernel32.lib
+#include <windows.h>
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <cstdint>
+
+// Структура для чтения аргументов
+struct InjectArgs {
+    char scriptPath[MAX_PATH];
+    char jsonArgs[8192];
+};
+
+// Поиск Lua-состояния в Roblox (сложная часть)
+// Для упрощения используем адрес, известный для определённой версии (нестабильно).
+// Вместо этого можно искать по сигнатуре или по потокам.
+// Здесь приведён упрощённый вариант: ищем глобальную переменную lua_state через pattern scan.
+// Но для рабочего кода потребуется полноценный сигнатурный поиск.
+// Для демонстрации я оставлю заглушку.
+
+typedef int(*luaL_loadstring_t)(void* L, const char* s);
+typedef int(*lua_pcall_t)(void* L, int nargs, int nresults, int errfunc);
+
+void* FindLuaState() {
+    // Здесь нужно реализовать поиск Lua-состояния в памяти Roblox.
+    // Это можно сделать, например, сканируя память модуля RobloxPlayerBeta.exe на наличие
+    // характерных паттернов (например, сигнатура для luaL_loadstring или lua_newstate).
+    // Для краткости возвращаем NULL.
+    return nullptr;
+}
+
+DWORD WINAPI WorkerThread(LPVOID lpParam) {
+    // Получаем путь к файлу аргументов
+    const char* argFile = (const char*)lpParam;
+    // Читаем аргументы
+    InjectArgs args;
+    FILE* f = fopen(argFile, "rb");
+    if (!f) {
+        // Не можем прочитать, выходим
+        return 1;
+    }
+    fread(&args, sizeof(args), 1, f);
+    fclose(f);
+    DeleteFileA(argFile);
+
+    // Находим Lua-состояние
+    void* L = FindLuaState();
+    if (!L) {
+        // Записываем ошибку в файл
+        std::ofstream out("inject_error.txt");
+        out << "Lua state not found";
+        out.close();
+        return 1;
+    }
+
+    // Загружаем скрипт
+    std::ifstream scriptFile(args.scriptPath);
+    if (!scriptFile) {
+        std::ofstream out("inject_error.txt");
+        out << "Cannot open script file: " << args.scriptPath;
+        out.close();
+        return 1;
+    }
+    std::string script((std::istreambuf_iterator<char>(scriptFile)), std::istreambuf_iterator<char>());
+    scriptFile.close();
+
+    // Получаем адреса функций Lua
+    // Для этого нужно либо получить их из экспорта, либо найти через сигнатуры.
+    // В Roblox Lua 5.1, функции обычно находятся по известным смещениям.
+    // Для реального инжектора потребуется найти эти адреса динамически.
+    // Здесь предположим, что мы их нашли и они в глобальных переменных.
+    // Вместо этого вызовем код, который встроен в DLL (например, используя luaL_loadstring, который уже экспортируется Roblox).
+    // Но проще: загружаем скрипт через luaL_loadstring, вызываем, захватываем возвращаемые значения.
+
+    // Для примера: используем функцию, которая вызывает Lua-код в текущем контексте.
+    // На самом деле нужно получить адреса функций из памяти Roblox.
+    // Реальный код должен быть намного сложнее.
+
+    // Заглушка:
+    // Создадим JSON-ответ для теста
+    std::string response = R"({"ok":true,"log":"injector stub","inventory":{}})";
+    // Записываем ответ в файл
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    char outFile[MAX_PATH];
+    sprintf_s(outFile, "%s%d.out.json", tempPath, GetCurrentProcessId()); // Упрощённо
+    std::ofstream out(outFile);
+    out << response;
+    out.close();
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        // Создаём поток, чтобы не блокировать загрузку
+        CreateThread(NULL, 0, WorkerThread, (LPVOID)lpReserved, 0, NULL);
+    }
+    return TRUE;
+}

@@ -66,8 +66,14 @@ Roblox обычно не даёт несколько клиентов в одн�
 Путь к exe задаётся окружением, например **`INJECTOR_PATH`**. Если путь содержит пробелы (`Program Files`), в `.env` используй кавычки:  
 `INJECTOR_PATH="C:\Program Files\jjsploit\jjsploit.exe"` (пример из `env.template`).
 
+Для локального launcher из репозитория (`stocker/injector.cpp`) рекомендуемый путь из корня:
+- `INJECTOR_PATH=stocker/build/injector.exe`
+- `INJECT_DLL_PATH=stocker/inject.dll`
+
 В репозитории реализован **опциональный** запуск через `subprocess` в **`farm/game/injector_launcher.py`**:  
 `INJECTOR_ENABLED=1`, `INJECTOR_LAUNCH_WHEN=windows_adapter_init` (один раз при первой операции моста в процессе воркера) или `every_farm_tick` (на каждый `farm_tick`). Аргументы CLI — `INJECTOR_ARGS_JSON` (массив строк), если твой exe их поддерживает.
+
+Проверку CLI (`python -m farm.game.check_injector --json`) используй как gate до запуска воркера; при запуске из корня проекта чекер читает корневой `.env`.
 
 Параметры для Lua в JSON моста — объект **`script_params`**, см. **[SCRIPT_PARAMS_AND_LUA.md](SCRIPT_PARAMS_AND_LUA.md)**.
 
