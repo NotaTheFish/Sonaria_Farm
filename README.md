@@ -127,6 +127,12 @@ INJECTOR_PATH=stocker/build/injector.exe
 INJECT_DLL_PATH=stocker/inject.dll
 ```
 
+Переключение Dex-команды в `Dex (универсал)`:
+```bash
+DEX_SCRIPT_MODE=0  # основной скрипт (DEX_LOADER_URL / payload)
+DEX_SCRIPT_MODE=1  # тестовый скрипт (test_dex/test_dex_command.txt)
+```
+
 Используй `python -m farm.game.check_injector --json` как gate перед стартом воркера/пайплайна: `ok=true` — конфигурация валидна.
 По умолчанию gate также требует наличие текущего `ROBLOX_PID` (или запущенный `RobloxPlayerBeta.exe`); для config-only gate поставь `INJECTOR_PREFLIGHT_REQUIRE_ROBLOX_PID=0`.
 

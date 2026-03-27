@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,30 @@ def _normalize_path(p: Path | None) -> str | None:
         return str(p)
 
 
+def _dex_script_mode() -> int:
+    raw = (os.getenv("DEX_SCRIPT_MODE") or os.getenv("DEX_TEST_MODE") or "0").strip()
+    return 1 if raw == "1" else 0
+
+
+def _test_dex_command_path() -> Path:
+    return REPO_ROOT / "test_dex" / "test_dex_command.txt"
+
+
+def _read_test_dex_url() -> str | None:
+    p = _test_dex_command_path()
+    if not p.is_file():
+        return None
+    raw = p.read_text(encoding="utf-8", errors="ignore").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith(("http://", "https://")):
+        return raw
+    m = re.search(r'HttpGet\(\s*["\']([^"\']+)["\']', raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
 def collect_status() -> dict[str, Any]:
     backend = ib.backend_name()
     enabled = inj.injector_enabled_flag()
@@ -43,6 +68,9 @@ def collect_status() -> dict[str, Any]:
     extra_argv = inj.injector_extra_argv()
     launch_when = inj.injector_launch_when()
     timeout_seconds = inj.injector_timeout_seconds()
+    dex_script_mode = _dex_script_mode()
+    test_dex_file = _test_dex_command_path()
+    test_dex_url = _read_test_dex_url()
 
     require_pid = (os.getenv("INJECTOR_PREFLIGHT_REQUIRE_ROBLOX_PID", "1") or "").strip().lower()
     require_pid_bool = require_pid in ("1", "true", "yes", "on")
@@ -60,6 +88,10 @@ def collect_status() -> dict[str, Any]:
             issues.append("Roblox PID not found (ROBLOX_PID missing and Roblox process not running).")
     if backend == "external_cli" and universal_script is None:
         issues.append("universal_sonaria_bot.lua not found (INJECTOR_UNIVERSAL_SCRIPT_PATH).")
+    if dex_script_mode == 1 and test_dex_url is None:
+        issues.append(
+            "DEX_SCRIPT_MODE=1, но test_dex/test_dex_command.txt отсутствует/пустой/без HttpGet URL."
+        )
 
     return {
         "backend": backend,
@@ -71,6 +103,9 @@ def collect_status() -> dict[str, Any]:
         "injector_args": extra_argv,
         "launch_when": launch_when,
         "timeout_seconds": timeout_seconds,
+        "dex_script_mode": dex_script_mode,
+        "test_dex_command_path": _normalize_path(test_dex_file),
+        "test_dex_url": test_dex_url,
         "legacy_ready": legacy_ready,
         "universal_ready": universal_ready,
         "require_pid": require_pid_bool,
@@ -91,6 +126,9 @@ def _print_human(status: dict[str, Any]) -> None:
     print(f"injector_args:      {status['injector_args']}")
     print(f"launch_when:        {status['launch_when']}")
     print(f"timeout_seconds:    {status['timeout_seconds']}")
+    print(f"dex_script_mode:    {status['dex_script_mode']} (0=main, 1=test)")
+    print(f"test_dex_command:   {status['test_dex_command_path'] or '-'}")
+    print(f"test_dex_url:       {status['test_dex_url'] or '-'}")
     print(f"legacy_ready:       {status['legacy_ready']}")
     print(f"universal_ready:    {status['universal_ready']}")
     if status["issues"]:

@@ -47,8 +47,13 @@ def universal_ready() -> bool:
     )
 
 
-def build_argv(*, script_path: Path, params: dict[str, Any]) -> tuple[list[str], int]:
-    exe = inj.injector_executable()
+def build_argv(
+    *,
+    script_path: Path,
+    params: dict[str, Any],
+    injector_executable: Path | None = None,
+) -> tuple[list[str], int]:
+    exe = injector_executable or inj.injector_executable()
     if not exe:
         raise RuntimeError("INJECTOR_ENABLED=1, но не найден INJECTOR_PATH")
     pid = inj.resolve_roblox_pid()

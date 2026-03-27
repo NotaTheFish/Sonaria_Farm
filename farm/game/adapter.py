@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -36,6 +37,36 @@ from farm.models import Account, AccountStatus
 from farm.task_queue import append_task_log, get_task_account
 
 logger = logging.getLogger("farm.game.adapter")
+
+
+def _truthy_env(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dex_script_mode() -> int:
+    """
+    Режим Dex-скрипта:
+      0 -> основной (DEX_LOADER_URL / payload)
+      1 -> тестовый (test_dex/test_dex_command.txt)
+    """
+    raw = (os.getenv("DEX_SCRIPT_MODE") or os.getenv("DEX_TEST_MODE") or "0").strip()
+    return 1 if raw == "1" else 0
+
+
+def _load_test_dex_url() -> str | None:
+    """Читает URL Dex из `test_dex/test_dex_command.txt`."""
+    command_path = inj.REPO_ROOT / "test_dex" / "test_dex_command.txt"
+    if not command_path.is_file():
+        return None
+    raw = command_path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith(("http://", "https://")):
+        return raw
+    m = re.search(r'HttpGet\(\s*["\']([^"\']+)["\']', raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).strip()
 
 
 class GameAdapter(ABC):
@@ -1306,8 +1337,34 @@ class WindowsGameAdapter(GameAdapter):
     ) -> None:
         if not self._universal_sonaria_ready():
             raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
+        stocker_exe = inj.stocker_injector_executable()
+        if not stocker_exe:
+            raise RuntimeError(
+                "Dex (универсал): не найден stocker/build/injector.exe. "
+                "Собери его через stocker/build_injector.ps1."
+            )
+        script_path = inj.resolve_universal_sonaria_script_path()
+        if not script_path and not ib.is_mock_backend():
+            raise RuntimeError(
+                "Универсальный скрипт не настроен: задай INJECTOR_UNIVERSAL_SCRIPT_PATH "
+                "или положи external/injector_scripts/universal_sonaria_bot.lua."
+            )
+        assert script_path is not None
         asset_path = (payload or {}).get("dex_asset_path") or os.getenv("DEX_MODEL_PATH", "Dex_roblox.rbxm")
         dex_url = (payload or {}).get("dex_url") or os.getenv("DEX_LOADER_URL")
+        if _dex_script_mode() == 1:
+            test_dex_url = _load_test_dex_url()
+            if not test_dex_url:
+                raise RuntimeError(
+                    "DEX_SCRIPT_MODE=1, но не удалось прочитать URL из "
+                    "test_dex/test_dex_command.txt."
+                )
+            dex_url = test_dex_url
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message="[universal_sonaria] dex mode=1: используем test_dex/test_dex_command.txt",
+            )
         params = build_universal_script_params(
             account,
             "dex",
@@ -1316,13 +1373,27 @@ class WindowsGameAdapter(GameAdapter):
                 **({"dex_url": str(dex_url)} if dex_url else {}),
             },
         )
-        data = await self._run_universal_script(
+        argv, pid = ib.build_argv(
+            script_path=script_path,
+            params=params,
+            injector_executable=stocker_exe,
+        )
+        await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
-            params=params,
-            wait_for_exit=True,
-            timeout_seconds=60,
+            message=f"[universal_sonaria] dex запуск через stocker injector, pid={pid}",
         )
+        try:
+            stdout, stderr, returncode = await ib.run_wait(argv=argv, timeout_seconds=60)
+        except TimeoutError as exc:
+            raise RuntimeError("Dex (универсал): таймаут запуска через stocker injector") from exc
+        if returncode not in (0, None):
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"Dex (универсал) failed rc={returncode}: {err_text or 'no stderr'}"
+            )
+        out_text = stdout.decode("utf-8", errors="replace")
+        data = self._parse_sonaria_stdout(out_text) if out_text.strip() else None
         if data is None:
             data = {"ok": True, "log": "dex: no stdout response"}
         if not data.get("ok", False):

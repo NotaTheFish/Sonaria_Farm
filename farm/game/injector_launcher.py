@@ -47,6 +47,12 @@ def injector_executable() -> Path | None:
     return p if p.is_file() else None
 
 
+def stocker_injector_executable() -> Path | None:
+    """Локальный C++ injector из репозитория (`stocker/build/injector.exe`)."""
+    p = REPO_ROOT / "stocker" / "build" / "injector.exe"
+    return p if p.is_file() else None
+
+
 def injector_configured() -> bool:
     return injector_enabled_flag() and injector_executable() is not None
 
