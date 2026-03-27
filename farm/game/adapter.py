@@ -334,11 +334,16 @@ class WindowsGameAdapter(GameAdapter):
                 )
             except TimeoutError as exc:
                 raise RuntimeError("universal_sonaria inject timeout") from exc
-            if returncode not in (0, None):
-                err_text = stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(
-                    f"universal_sonaria failed rc={returncode}: {err_text or 'no stderr'}"
-                )
+                if returncode not in (0, None):
+                    out_text = stdout.decode("utf-8", errors="replace").strip()
+                    err_text = stderr.decode("utf-8", errors="replace").strip()
+                    details = []
+                    if err_text:
+                        details.append(f"stderr={err_text!r}")
+                    if out_text:
+                        details.append(f"stdout={out_text!r}")
+                    tail = " ".join(details) if details else "no stdout/stderr"
+                    raise RuntimeError(f"universal_sonaria failed rc={returncode}: {tail}")
             out_text = stdout.decode("utf-8", errors="replace")
             if not out_text.strip():
                 return None
@@ -394,11 +399,18 @@ class WindowsGameAdapter(GameAdapter):
                 )
             except TimeoutError as exc:
                 raise RuntimeError(f"injector timeout for script={script_name}") from exc
-            if returncode not in (0, None):
-                err_text = stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(
-                    f"injector script failed rc={returncode} script={script_name}: {err_text or 'no stderr'}"
-                )
+                if returncode not in (0, None):
+                    out_text = stdout.decode("utf-8", errors="replace").strip()
+                    err_text = stderr.decode("utf-8", errors="replace").strip()
+                    details = []
+                    if err_text:
+                        details.append(f"stderr={err_text!r}")
+                    if out_text:
+                        details.append(f"stdout={out_text!r}")
+                    tail = " ".join(details) if details else "no stdout/stderr"
+                    raise RuntimeError(
+                        f"injector script failed rc={returncode} script={script_name}: {tail}"
+                    )
             out_text = stdout.decode("utf-8", errors="replace").strip()
             if not out_text:
                 return None
@@ -1388,10 +1400,15 @@ class WindowsGameAdapter(GameAdapter):
         except TimeoutError as exc:
             raise RuntimeError("Dex (универсал): таймаут запуска через stocker injector") from exc
         if returncode not in (0, None):
+            out_text = stdout.decode("utf-8", errors="replace").strip()
             err_text = stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"Dex (универсал) failed rc={returncode}: {err_text or 'no stderr'}"
-            )
+            details = []
+            if err_text:
+                details.append(f"stderr={err_text!r}")
+            if out_text:
+                details.append(f"stdout={out_text!r}")
+            tail = " ".join(details) if details else "no stdout/stderr"
+            raise RuntimeError(f"Dex (универсал) failed rc={returncode}: {tail}")
         out_text = stdout.decode("utf-8", errors="replace")
         data = self._parse_sonaria_stdout(out_text) if out_text.strip() else None
         if data is None:

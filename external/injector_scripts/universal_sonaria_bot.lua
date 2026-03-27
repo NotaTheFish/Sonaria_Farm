@@ -78,12 +78,22 @@ local function writeResponse(data)
     log("Response: " .. response)
     
     -- Если указан файл ответа - пишем туда (для файлового моста)
-    if RESPONSE_FILE and type(writefile) == "function" then
-        local success, err = pcall(function()
-            writefile(RESPONSE_FILE, response)
-        end)
-        if not success then
-            log("ERROR writing response file: " .. tostring(err))
+    if RESPONSE_FILE then
+        local writer = nil
+        if type(writefile) == "function" then
+            writer = writefile
+        elseif type(syn) == "table" and type(syn.writefile) == "function" then
+            writer = syn.writefile
+        end
+        if type(writer) == "function" then
+            local success, err = pcall(function()
+                writer(RESPONSE_FILE, response)
+            end)
+            if not success then
+                log("ERROR writing response file: " .. tostring(err))
+            end
+        else
+            log("WARN: response_file задан, но нет writefile/syn.writefile (IPC в injector.exe может не получить ответ)")
         end
     end
     
