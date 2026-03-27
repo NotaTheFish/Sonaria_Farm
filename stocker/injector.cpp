@@ -12,10 +12,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -288,6 +290,139 @@ DWORD FindRobloxPid() {
     return pid;
 }
 
+std::vector<std::string> ListDllExportNames(const fs::path& dll_path, size_t max_names, std::string& error) {
+    error.clear();
+    std::ifstream in(dll_path, std::ios::binary);
+    if (!in) {
+        error = "Cannot open DLL for export scan: " + dll_path.string();
+        return {};
+    }
+    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (buf.size() < sizeof(IMAGE_DOS_HEADER)) {
+        error = "DLL too small for DOS header.";
+        return {};
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(buf.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        error = "Invalid DOS signature.";
+        return {};
+    }
+    const size_t nt_off = static_cast<size_t>(dos->e_lfanew);
+    if (nt_off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > buf.size()) {
+        error = "Invalid NT header offset.";
+        return {};
+    }
+    const DWORD sig = *reinterpret_cast<const DWORD*>(buf.data() + nt_off);
+    if (sig != IMAGE_NT_SIGNATURE) {
+        error = "Invalid NT signature.";
+        return {};
+    }
+    const auto* file_hdr = reinterpret_cast<const IMAGE_FILE_HEADER*>(buf.data() + nt_off + sizeof(DWORD));
+    const auto opt_off = nt_off + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
+    if (opt_off + file_hdr->SizeOfOptionalHeader > buf.size()) {
+        error = "Optional header out of bounds.";
+        return {};
+    }
+
+    bool is64 = false;
+    IMAGE_DATA_DIRECTORY export_dir{};
+    std::vector<IMAGE_SECTION_HEADER> sections;
+
+    const WORD magic = *reinterpret_cast<const WORD*>(buf.data() + opt_off);
+    if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        is64 = true;
+        const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(buf.data() + opt_off);
+        export_dir = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        const auto sec_off = opt_off + file_hdr->SizeOfOptionalHeader;
+        const size_t sec_bytes = static_cast<size_t>(file_hdr->NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+        if (sec_off + sec_bytes > buf.size()) {
+            error = "Section headers out of bounds.";
+            return {};
+        }
+        sections.assign(
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(buf.data() + sec_off),
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(buf.data() + sec_off + sec_bytes)
+        );
+    } else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        is64 = false;
+        const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(buf.data() + opt_off);
+        export_dir = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        const auto sec_off = opt_off + file_hdr->SizeOfOptionalHeader;
+        const size_t sec_bytes = static_cast<size_t>(file_hdr->NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+        if (sec_off + sec_bytes > buf.size()) {
+            error = "Section headers out of bounds.";
+            return {};
+        }
+        sections.assign(
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(buf.data() + sec_off),
+            reinterpret_cast<const IMAGE_SECTION_HEADER*>(buf.data() + sec_off + sec_bytes)
+        );
+    } else {
+        error = "Unknown optional header magic.";
+        return {};
+    }
+    (void)is64;
+
+    auto rva_to_ptr = [&](DWORD rva, size_t size) -> const unsigned char* {
+        for (const auto& s : sections) {
+            const DWORD va = s.VirtualAddress;
+            const DWORD raw = s.PointerToRawData;
+            const DWORD raw_size = s.SizeOfRawData;
+            if (rva >= va && rva < va + raw_size) {
+                const size_t off = static_cast<size_t>(raw + (rva - va));
+                if (off + size <= buf.size()) {
+                    return buf.data() + off;
+                }
+                return nullptr;
+            }
+        }
+        return nullptr;
+    };
+
+    if (export_dir.VirtualAddress == 0 || export_dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
+        error = "No export directory.";
+        return {};
+    }
+    const auto* exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+        rva_to_ptr(export_dir.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY))
+    );
+    if (!exp) {
+        error = "Export directory out of bounds.";
+        return {};
+    }
+    const auto* names = reinterpret_cast<const DWORD*>(
+        rva_to_ptr(exp->AddressOfNames, static_cast<size_t>(exp->NumberOfNames) * sizeof(DWORD))
+    );
+    if (!names) {
+        error = "Export names table out of bounds.";
+        return {};
+    }
+
+    std::vector<std::string> out;
+    const size_t count = std::min<size_t>(exp->NumberOfNames, max_names);
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const DWORD name_rva = names[i];
+        const unsigned char* p = rva_to_ptr(name_rva, 1);
+        if (!p) {
+            continue;
+        }
+        const unsigned char* end = buf.data() + buf.size();
+        std::string s;
+        while (p < end && *p != 0) {
+            s.push_back(static_cast<char>(*p));
+            ++p;
+            if (s.size() > 2000) {
+                break;
+            }
+        }
+        if (!s.empty()) {
+            out.push_back(std::move(s));
+        }
+    }
+    return out;
+}
+
 bool InjectDllByPath(DWORD pid, const std::string& dll_path, std::string& error) {
     HANDLE h_process = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
@@ -357,6 +492,24 @@ bool InjectDllByPath(DWORD pid, const std::string& dll_path, std::string& error)
 using LaunchExploitFn = void(__cdecl*)();
 using IsInjectedFn = bool(__cdecl*)();
 using SendLuaScriptFn = void(__cdecl*)(const char*);
+using LaunchExploitStdFn = void(__stdcall*)();
+using IsInjectedStdFn = int(__stdcall*)();
+using SendLuaScriptStdFn = void(__stdcall*)(const char*);
+
+FARPROC GetProcAddressAny(HMODULE mod, const std::vector<const char*>& names, std::string& found) {
+    found.clear();
+    for (const char* n : names) {
+        if (!n || !*n) {
+            continue;
+        }
+        FARPROC p = GetProcAddress(mod, n);
+        if (p) {
+            found = n;
+            return p;
+        }
+    }
+    return nullptr;
+}
 
 bool ExecuteLuaViaExecutorApi(
     DWORD pid,
@@ -392,20 +545,89 @@ bool ExecuteLuaViaExecutorApi(
         return false;
     }
 
-    auto launch = reinterpret_cast<LaunchExploitFn>(GetProcAddress(h_api, "LaunchExploit"));
-    auto is_injected = reinterpret_cast<IsInjectedFn>(GetProcAddress(h_api, "IsInjected"));
-    auto send_script = reinterpret_cast<SendLuaScriptFn>(GetProcAddress(h_api, "SendLuaScript"));
-    if (!launch || !is_injected || !send_script) {
-        error = "Executor API exports not found (LaunchExploit/IsInjected/SendLuaScript).";
+    std::string launch_name;
+    std::string injected_name;
+    std::string send_name;
+    FARPROC launch_p = GetProcAddressAny(
+        h_api,
+        {
+            "LaunchExploit",
+            "_LaunchExploit@0",
+            "launchExploit",
+            "LAUNCH_EXPLOIT",
+        },
+        launch_name
+    );
+    FARPROC injected_p = GetProcAddressAny(
+        h_api,
+        {
+            "IsInjected",
+            "_IsInjected@0",
+            "isInjected",
+            "IS_INJECTED",
+        },
+        injected_name
+    );
+    FARPROC send_p = GetProcAddressAny(
+        h_api,
+        {
+            "SendLuaScript",
+            "_SendLuaScript@4",
+            "SendScript",
+            "_SendScript@4",
+            "ExecuteScript",
+            "_ExecuteScript@4",
+        },
+        send_name
+    );
+
+    if (!launch_p || !injected_p || !send_p) {
+        std::string scan_err;
+        const auto exports = ListDllExportNames(api_dll_path, 60, scan_err);
+        std::ostringstream msg;
+        msg << "Executor API exports not found. "
+            << "launch=" << (launch_p ? launch_name : "null")
+            << " injected=" << (injected_p ? injected_name : "null")
+            << " send=" << (send_p ? send_name : "null");
+        if (!exports.empty()) {
+            msg << " available_exports=[";
+            for (size_t i = 0; i < exports.size(); ++i) {
+                if (i) {
+                    msg << ",";
+                }
+                msg << "\"" << JsonEscape(exports[i]) << "\"";
+            }
+            msg << "]";
+        } else if (!scan_err.empty()) {
+            msg << " export_scan_error=" << scan_err;
+        }
+        error = msg.str();
         FreeLibrary(h_api);
         return false;
     }
 
-    launch();
+    const bool stdcall_mode = (!launch_name.empty() && launch_name.front() == '_')
+                              || (!injected_name.empty() && injected_name.front() == '_')
+                              || (!send_name.empty() && send_name.front() == '_');
+
+    auto launch_cdecl = reinterpret_cast<LaunchExploitFn>(launch_p);
+    auto injected_cdecl = reinterpret_cast<IsInjectedFn>(injected_p);
+    auto send_cdecl = reinterpret_cast<SendLuaScriptFn>(send_p);
+
+    auto launch_std = reinterpret_cast<LaunchExploitStdFn>(launch_p);
+    auto injected_std = reinterpret_cast<IsInjectedStdFn>(injected_p);
+    auto send_std = reinterpret_cast<SendLuaScriptStdFn>(send_p);
+
+    if (stdcall_mode) {
+        launch_std();
+    } else {
+        launch_cdecl();
+    }
     const auto attach_start = std::chrono::steady_clock::now();
     bool attached = false;
     while (true) {
-        if (is_injected()) {
+        const bool injected = stdcall_mode ? (injected_std() != 0) : injected_cdecl();
+        if (injected) {
             attached = true;
             break;
         }
@@ -423,7 +645,11 @@ bool ExecuteLuaViaExecutorApi(
         return false;
     }
 
-    send_script(lua_payload.c_str());
+    if (stdcall_mode) {
+        send_std(lua_payload.c_str());
+    } else {
+        send_cdecl(lua_payload.c_str());
+    }
     if (!WaitForFile(response_path, response_timeout_ms)) {
         error = "Lua response timeout (" + std::to_string(response_timeout_ms) + " ms).";
         FreeLibrary(h_api);
