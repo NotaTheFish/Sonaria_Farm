@@ -551,6 +551,9 @@ bool ExecuteLuaViaExecutorApi(
     FARPROC launch_p = GetProcAddressAny(
         h_api,
         {
+            "initialize",
+            "Initialize",
+            "_initialize@0",
             "LaunchExploit",
             "_LaunchExploit@0",
             "launchExploit",
@@ -561,6 +564,9 @@ bool ExecuteLuaViaExecutorApi(
     FARPROC injected_p = GetProcAddressAny(
         h_api,
         {
+            "isAttached",
+            "IsAttached",
+            "_isAttached@0",
             "IsInjected",
             "_IsInjected@0",
             "isInjected",
@@ -571,6 +577,9 @@ bool ExecuteLuaViaExecutorApi(
     FARPROC send_p = GetProcAddressAny(
         h_api,
         {
+            "execute",
+            "Execute",
+            "_execute@4",
             "SendLuaScript",
             "_SendLuaScript@4",
             "SendScript",
