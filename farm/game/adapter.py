@@ -1398,6 +1398,19 @@ class WindowsGameAdapter(GameAdapter):
             data = {"ok": True, "log": "dex: no stdout response"}
         if not data.get("ok", False):
             raise RuntimeError(str(data.get("error") or "universal_dex failed"))
+        # Защита от ложного "ok": stocker injector может вернуть успех только факта DLL-инжекта,
+        # без выполнения universal_sonaria_bot.lua (и тогда Dex в игре не появляется).
+        message = str(data.get("message") or "")
+        if message.strip().lower() == "dll injected successfully.":
+            raise RuntimeError(
+                "Dex не был выполнен: injector сообщил только DLL injected successfully. "
+                "Нужен ответ SONARIA_RESPONSE от universal_sonaria_bot.lua."
+            )
+        log_text = str(data.get("log") or "")
+        if not log_text.strip():
+            raise RuntimeError(
+                "Dex не подтверждён: в ответе нет поля 'log' от universal_sonaria_bot.lua."
+            )
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,

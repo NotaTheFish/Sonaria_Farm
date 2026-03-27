@@ -1,6 +1,7 @@
 param(
     [string]$Toolchain = "auto",
-    [switch]$VerboseBuild
+    [switch]$VerboseBuild,
+    [string]$LogPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,11 @@ $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $outputDir = Join-Path $root "stocker\build"
 $source = Join-Path $root "stocker\injector.cpp"
 $output = Join-Path $outputDir "injector.exe"
+$buildLog = if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    Join-Path $outputDir "injector_build.log"
+} else {
+    $LogPath
+}
 
 if (-not (Test-Path $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir | Out-Null
@@ -23,14 +29,30 @@ Write-Host "[build] root: $root"
 Write-Host "[build] source: $source"
 Write-Host "[build] output: $output"
 Write-Host "[build] toolchain: $Toolchain"
+Write-Host "[build] log: $buildLog"
+
+"" | Out-File -FilePath $buildLog -Encoding utf8
+
+function Write-BuildLog {
+    param([string]$Line)
+    if ($null -eq $Line) { return }
+    $Line | Out-File -FilePath $buildLog -Append -Encoding utf8
+}
 
 function Invoke-MsvcBuild {
     $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
     if ($cl) {
         Write-Host "[build] using MSVC (cl.exe in PATH)"
-        & $cl.Path /std:c++17 /EHsc /O2 $source /Fe:$output /link user32.lib kernel32.lib
+        Write-BuildLog "[build] using MSVC (cl.exe in PATH)"
+        $msvcOut = & $cl.Path /std:c++17 /EHsc /O2 $source /Fe:$output /link user32.lib kernel32.lib 2>&1
+        if ($msvcOut) {
+            $msvcOut | ForEach-Object {
+                Write-Host $_
+                Write-BuildLog "$_"
+            }
+        }
         if ($LASTEXITCODE -ne 0) {
-            throw "MSVC build failed with code $LASTEXITCODE"
+            throw "MSVC build failed with code $LASTEXITCODE. See log: $buildLog"
         }
         return $true
     }
@@ -52,6 +74,7 @@ function Invoke-MsvcBuild {
     }
 
     Write-Host "[build] using MSVC (VsDevCmd bootstrap)"
+    Write-BuildLog "[build] using MSVC (VsDevCmd bootstrap)"
     $cmd = @(
         "`"$vsDevCmd`"",
         "-arch=x64",
@@ -66,9 +89,15 @@ function Invoke-MsvcBuild {
         "user32.lib",
         "kernel32.lib"
     ) -join " "
-    cmd /c $cmd
+    $vsOut = cmd /c $cmd 2>&1
+    if ($vsOut) {
+        $vsOut | ForEach-Object {
+            Write-Host $_
+            Write-BuildLog "$_"
+        }
+    }
     if ($LASTEXITCODE -ne 0) {
-        throw "MSVC build via VsDevCmd failed with code $LASTEXITCODE"
+        throw "MSVC build via VsDevCmd failed with code $LASTEXITCODE. See log: $buildLog"
     }
     return $true
 }
@@ -79,6 +108,7 @@ function Invoke-MingwBuild {
         return $false
     }
     Write-Host "[build] using MinGW (g++.exe)"
+    Write-BuildLog "[build] using MinGW (g++.exe)"
     $args = @(
         "-std=c++17",
         "-O2",
@@ -92,10 +122,17 @@ function Invoke-MingwBuild {
     )
     if ($VerboseBuild) {
         Write-Host "[build] g++ args: $($args -join ' ')"
+        Write-BuildLog "[build] g++ args: $($args -join ' ')"
     }
-    & $gxx.Path @args
+    $gxxOut = & $gxx.Path @args 2>&1
+    if ($gxxOut) {
+        $gxxOut | ForEach-Object {
+            Write-Host $_
+            Write-BuildLog "$_"
+        }
+    }
     if ($LASTEXITCODE -ne 0) {
-        throw "MinGW build failed with code $LASTEXITCODE"
+        throw "MinGW build failed with code $LASTEXITCODE. See log: $buildLog"
     }
     return $true
 }
@@ -137,3 +174,4 @@ if (-not (Test-Path $output)) {
 }
 
 Write-Host "[build] ok: $output"
+Write-BuildLog "[build] ok: $output"
