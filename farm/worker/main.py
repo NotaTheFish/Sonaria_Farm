@@ -333,6 +333,7 @@ async def _run_universal_farm_loop(
             worker_id=worker_id,
             account=account,
             death_points_target=death_points_target,
+            payload=payload,
         )
 
 

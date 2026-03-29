@@ -31,6 +31,7 @@ from farm.game.script_params import (
     build_farm_tick_script_params,
     build_sell_script_params,
     build_transfer_script_params,
+    build_universal_farm_tick_params,
     build_universal_script_params,
 )
 from farm.models import Account, AccountStatus
@@ -117,6 +118,7 @@ class GameAdapter(ABC):
         worker_id: str,
         account: Account,
         death_points_target: int,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         """Долгий фарм через ``universal_sonaria_bot.lua`` (задача ``universal_farm``)."""
 
@@ -694,6 +696,12 @@ class WindowsGameAdapter(GameAdapter):
         if when == "every_farm_tick":
             if bridge != "farm_tick":
                 return
+            if inj.is_vd_executor_path(inj.injector_executable()):
+                logger.warning(
+                    "INJECTOR_LAUNCH_WHEN=every_farm_tick пропущен: INJECTOR_PATH — VD Executor.exe "
+                    "(не запускаем лаунчер на каждый тик). Используй Dex (универсал) или never."
+                )
+                return
             await inj.launch_injector_subprocess(
                 task_id=task_id,
                 worker_id=worker_id,
@@ -704,11 +712,18 @@ class WindowsGameAdapter(GameAdapter):
             if self._injector_launch_done:
                 return
             self._injector_launch_done = True
-            await inj.launch_injector_subprocess(
-                task_id=task_id,
-                worker_id=worker_id,
-                trigger="windows_adapter_init",
-            )
+            if inj.is_vd_executor_path(inj.injector_executable()):
+                await inj.launch_vd_executor_detached(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    trigger="windows_adapter_init",
+                )
+            else:
+                await inj.launch_injector_subprocess(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    trigger="windows_adapter_init",
+                )
 
     async def login_and_check(self, *, task_id: str, worker_id: str, account: Account) -> None:
         """
@@ -1185,6 +1200,7 @@ class WindowsGameAdapter(GameAdapter):
         worker_id: str,
         account: Account,
         death_points_target: int,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         if not self._universal_sonaria_ready():
             raise RuntimeError(
@@ -1193,14 +1209,10 @@ class WindowsGameAdapter(GameAdapter):
             )
         existing = self._universal_farm_proc_by_task.get(task_id)
         if existing is None:
-            params = build_universal_script_params(
-                account,
-                "farm",
-                extra_params={
-                    "target_dp": death_points_target,
-                    "death_points_target": death_points_target,
-                    "tick_seq": 1,
-                },
+            params = build_universal_farm_tick_params(
+                account=account,
+                death_points_target=death_points_target,
+                task_payload=payload,
             )
             await self._run_universal_script(
                 task_id=task_id,
@@ -1347,14 +1359,35 @@ class WindowsGameAdapter(GameAdapter):
         account: Account,
         payload: dict[str, Any],
     ) -> None:
+        launcher_exe = inj.injector_executable()
+        if not launcher_exe:
+            hint = inj.vd_executor_default_exe()
+            extra = (
+                f' Пример: INJECTOR_PATH="{hint}"' if hint else " Задай INJECTOR_PATH в .env."
+            )
+            raise RuntimeError(
+                "Dex (универсал): не настроен INJECTOR_PATH (исполняемый файл не найден)."
+                + extra
+            )
+
+        # VD Executor — не CLI ``pid script.lua JSON``: только отдельный старт процесса.
+        if inj.injector_dex_uses_vd_executor_start_only():
+            if not inj.injector_enabled_flag():
+                raise RuntimeError("Dex (универсал): включи INJECTOR_ENABLED=1 для запуска VD Executor.")
+            await inj.launch_vd_executor_detached(
+                task_id=task_id,
+                worker_id=worker_id,
+                trigger="universal_dex",
+            )
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                message="[vd_executor] Dex (универсал): лаунчер запущен; дальше attach/скрипты — вручную в окне VD Executor.",
+            )
+            return
+
         if not self._universal_sonaria_ready():
             raise RuntimeError("universal_sonaria: не настроен скрипт (см. universal_farm_tick).")
-        stocker_exe = inj.stocker_injector_executable()
-        if not stocker_exe:
-            raise RuntimeError(
-                "Dex (универсал): не найден stocker/build/injector.exe. "
-                "Собери его через stocker/build_injector.ps1."
-            )
         script_path = inj.resolve_universal_sonaria_script_path()
         if not script_path and not ib.is_mock_backend():
             raise RuntimeError(
@@ -1388,17 +1421,17 @@ class WindowsGameAdapter(GameAdapter):
         argv, pid = ib.build_argv(
             script_path=script_path,
             params=params,
-            injector_executable=stocker_exe,
+            injector_executable=launcher_exe,
         )
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
-            message=f"[universal_sonaria] dex запуск через stocker injector, pid={pid}",
+            message=f"[universal_sonaria] dex запуск лаунчером INJECTOR_PATH, pid={pid}",
         )
         try:
             stdout, stderr, returncode = await ib.run_wait(argv=argv, timeout_seconds=60)
         except TimeoutError as exc:
-            raise RuntimeError("Dex (универсал): таймаут запуска через stocker injector") from exc
+            raise RuntimeError("Dex (универсал): таймаут запуска лаунчера (INJECTOR_PATH)") from exc
         if returncode not in (0, None):
             out_text = stdout.decode("utf-8", errors="replace").strip()
             err_text = stderr.decode("utf-8", errors="replace").strip()
@@ -1415,12 +1448,12 @@ class WindowsGameAdapter(GameAdapter):
             data = {"ok": True, "log": "dex: no stdout response"}
         if not data.get("ok", False):
             raise RuntimeError(str(data.get("error") or "universal_dex failed"))
-        # Защита от ложного "ok": stocker injector может вернуть успех только факта DLL-инжекта,
+        # Защита от ложного "ok": лаунчер мог вернуть успех только факта инжекта DLL,
         # без выполнения universal_sonaria_bot.lua (и тогда Dex в игре не появляется).
         message = str(data.get("message") or "")
         if message.strip().lower() == "dll injected successfully.":
             raise RuntimeError(
-                "Dex не был выполнен: injector сообщил только DLL injected successfully. "
+                "Dex не был выполнен: лаунчер сообщил только DLL injected successfully. "
                 "Нужен ответ SONARIA_RESPONSE от universal_sonaria_bot.lua."
             )
         log_text = str(data.get("log") or "")
@@ -1527,11 +1560,13 @@ class StubGameAdapter(GameAdapter):
         worker_id: str,
         account: Account,
         death_points_target: int,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
-            message=f"[stub] universal_farm_tick account_id={account.id} dp={death_points_target}",
+            message=f"[stub] universal_farm_tick account_id={account.id} dp={death_points_target} "
+            f"payload_keys={list((payload or {}).keys())}",
         )
         await asyncio.sleep(1)
 

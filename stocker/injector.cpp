@@ -204,6 +204,38 @@ DWORD ParseDwordSetting(const std::string& raw, DWORD fallback) {
     return static_cast<DWORD>(parsed);
 }
 
+// -1 = inherit global stdcall_mode; 0 = cdecl; 1 = stdcall; 2 = infer from export name (_prefix)
+int ParseCallconvOverride(const std::string& raw) {
+    if (raw.empty()) {
+        return -1;
+    }
+    std::string s = Trim(raw);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (s == "cdecl") {
+        return 0;
+    }
+    if (s == "stdcall") {
+        return 1;
+    }
+    if (s == "auto" || s == "from_export" || s == "from_name") {
+        return 2;
+    }
+    return -1;
+}
+
+bool EffectiveStdcall(int override_mode, bool global_stdcall, const std::string& export_name) {
+    if (override_mode == 0) {
+        return false;
+    }
+    if (override_mode == 1) {
+        return true;
+    }
+    if (override_mode == 2) {
+        return !export_name.empty() && export_name.front() == '_';
+    }
+    return global_stdcall;
+}
+
 bool WaitForFile(const fs::path& path, DWORD timeout_ms) {
     const auto start = std::chrono::steady_clock::now();
     while (true) {
@@ -490,11 +522,14 @@ bool InjectDllByPath(DWORD pid, const std::string& dll_path, std::string& error)
 }
 
 using LaunchExploitFn = void(__cdecl*)();
-using IsInjectedFn = bool(__cdecl*)();
 using SendLuaScriptFn = void(__cdecl*)(const char*);
+using AddScriptFn = void(__cdecl*)(const char*);
+using ExecuteNoArgFn = void(__cdecl*)();
 using LaunchExploitStdFn = void(__stdcall*)();
 using IsInjectedStdFn = int(__stdcall*)();
 using SendLuaScriptStdFn = void(__stdcall*)(const char*);
+using AddScriptStdFn = void(__stdcall*)(const char*);
+using ExecuteNoArgStdFn = void(__stdcall*)();
 
 FARPROC GetProcAddressAny(HMODULE mod, const std::vector<const char*>& names, std::string& found) {
     found.clear();
@@ -511,6 +546,63 @@ FARPROC GetProcAddressAny(HMODULE mod, const std::vector<const char*>& names, st
     return nullptr;
 }
 
+// SEH must live in functions without C++ unwinding (MSVC C2712).
+DWORD UnsafeCallInitializeRaw(FARPROC p, int stdcall_flag) {
+    DWORD code = 0;
+    __try {
+        if (stdcall_flag) {
+            reinterpret_cast<LaunchExploitStdFn>(p)();
+        } else {
+            reinterpret_cast<LaunchExploitFn>(p)();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        code = GetExceptionCode();
+    }
+    return code;
+}
+
+DWORD UnsafeCallIsAttachedRaw(FARPROC p, int stdcall_flag, int* out_nonzero) {
+    DWORD code = 0;
+    int v = 0;
+    __try {
+        if (stdcall_flag) {
+            v = reinterpret_cast<IsInjectedStdFn>(p)();
+        } else {
+            v = reinterpret_cast<int(__cdecl*)()>(p)();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        code = GetExceptionCode();
+    }
+    if (code == 0 && out_nonzero) {
+        *out_nonzero = v;
+    }
+    return code;
+}
+
+bool SafeCallInitialize(FARPROC p, bool stdcall, std::string& error) {
+    const DWORD seh = UnsafeCallInitializeRaw(p, stdcall ? 1 : 0);
+    if (seh != 0) {
+        std::ostringstream msg;
+        msg << "initialize() raised SEH 0x" << std::hex << seh;
+        error = msg.str();
+        return false;
+    }
+    return true;
+}
+
+bool SafeCallIsAttached(FARPROC p, bool stdcall, bool& out_bool, std::string& error) {
+    int v = 0;
+    const DWORD seh = UnsafeCallIsAttachedRaw(p, stdcall ? 1 : 0, &v);
+    if (seh != 0) {
+        std::ostringstream msg;
+        msg << "isAttached() raised SEH 0x" << std::hex << seh;
+        error = msg.str();
+        return false;
+    }
+    out_bool = (v != 0);
+    return true;
+}
+
 bool ExecuteLuaViaExecutorApi(
     DWORD pid,
     const fs::path& api_dll_path,
@@ -518,6 +610,18 @@ bool ExecuteLuaViaExecutorApi(
     std::string json_args,
     DWORD response_timeout_ms,
     DWORD attach_timeout_ms,
+    bool skip_initialize,
+    bool skip_is_attached,
+    bool allow_unattached_execute,
+    bool safe_mode,
+    bool execute_only_mode,
+    bool force_stdcall,
+    bool force_cdecl,
+    bool trace_steps,
+    const std::string& initialize_export_override,
+    const std::string& isattached_export_override,
+    int initialize_callconv_override,
+    int isattached_callconv_override,
     std::string& response_json,
     std::string& error
 ) {
@@ -544,36 +648,66 @@ bool ExecuteLuaViaExecutorApi(
         error = "LoadLibrary failed for executor API DLL: " + std::to_string(GetLastError());
         return false;
     }
+    if (trace_steps) {
+        std::cout << "[injector] executor_api: dll loaded: " << api_dll_path.string() << std::endl;
+    }
 
     std::string launch_name;
     std::string injected_name;
     std::string send_name;
-    FARPROC launch_p = GetProcAddressAny(
-        h_api,
-        {
-            "initialize",
-            "Initialize",
-            "_initialize@0",
-            "LaunchExploit",
-            "_LaunchExploit@0",
-            "launchExploit",
-            "LAUNCH_EXPLOIT",
-        },
-        launch_name
-    );
-    FARPROC injected_p = GetProcAddressAny(
-        h_api,
-        {
-            "isAttached",
-            "IsAttached",
-            "_isAttached@0",
-            "IsInjected",
-            "_IsInjected@0",
-            "isInjected",
-            "IS_INJECTED",
-        },
-        injected_name
-    );
+    FARPROC launch_p = nullptr;
+    if (!initialize_export_override.empty()) {
+        launch_p = GetProcAddress(h_api, initialize_export_override.c_str());
+        launch_name = initialize_export_override;
+        if (!launch_p) {
+            error = "INJECTOR_EXECUTOR_INITIALIZE_EXPORT not found in DLL: \"" + JsonEscape(initialize_export_override) + "\"";
+            FreeLibrary(h_api);
+            return false;
+        }
+    } else {
+        launch_p = GetProcAddressAny(
+            h_api,
+            {
+                "initialize",
+                "Initialize",
+                "_initialize@0",
+                "LaunchExploit",
+                "_LaunchExploit@0",
+                "launchExploit",
+                "LAUNCH_EXPLOIT",
+                "Init",
+                "init",
+                "StartExploit",
+            },
+            launch_name
+        );
+    }
+    FARPROC injected_p = nullptr;
+    if (!isattached_export_override.empty()) {
+        injected_p = GetProcAddress(h_api, isattached_export_override.c_str());
+        injected_name = isattached_export_override;
+        if (!injected_p) {
+            error = "INJECTOR_EXECUTOR_ISATTACHED_EXPORT not found in DLL: \"" + JsonEscape(isattached_export_override) + "\"";
+            FreeLibrary(h_api);
+            return false;
+        }
+    } else {
+        injected_p = GetProcAddressAny(
+            h_api,
+            {
+                "isAttached",
+                "IsAttached",
+                "_isAttached@0",
+                "IsInjected",
+                "_IsInjected@0",
+                "isInjected",
+                "IS_INJECTED",
+                "IsReady",
+                "attached",
+            },
+            injected_name
+        );
+    }
     FARPROC send_p = GetProcAddressAny(
         h_api,
         {
@@ -588,6 +722,29 @@ bool ExecuteLuaViaExecutorApi(
             "_ExecuteScript@4",
         },
         send_name
+    );
+    std::string add_name;
+    FARPROC add_p = GetProcAddressAny(
+        h_api,
+        {
+            "add",
+            "Add",
+            "_add@4",
+            "AddScript",
+            "_AddScript@4",
+        },
+        add_name
+    );
+    std::string execute_noarg_name;
+    FARPROC execute_noarg_p = GetProcAddressAny(
+        h_api,
+        {
+            "execute",
+            "Execute",
+            "_execute@0",
+            "_Execute@0",
+        },
+        execute_noarg_name
     );
 
     if (!launch_p || !injected_p || !send_p) {
@@ -615,52 +772,164 @@ bool ExecuteLuaViaExecutorApi(
         return false;
     }
 
-    const bool stdcall_mode = (!launch_name.empty() && launch_name.front() == '_')
-                              || (!injected_name.empty() && injected_name.front() == '_')
-                              || (!send_name.empty() && send_name.front() == '_');
+    bool stdcall_mode = (!launch_name.empty() && launch_name.front() == '_')
+                        || (!injected_name.empty() && injected_name.front() == '_')
+                        || (!send_name.empty() && send_name.front() == '_');
+    if (force_stdcall) {
+        stdcall_mode = true;
+    }
+    if (force_cdecl) {
+        stdcall_mode = false;
+    }
+    const bool init_stdcall = EffectiveStdcall(initialize_callconv_override, stdcall_mode, launch_name);
+    const bool attach_stdcall = EffectiveStdcall(isattached_callconv_override, stdcall_mode, injected_name);
+    if (trace_steps) {
+        std::cout << "[injector] executor_api: resolved launch=" << launch_name
+                  << " isAttached=" << injected_name
+                  << " execute=" << send_name
+                  << " add=" << (add_name.empty() ? "-" : add_name)
+                  << " execute0=" << (execute_noarg_name.empty() ? "-" : execute_noarg_name)
+                  << " stdcall_mode=" << (stdcall_mode ? "1" : "0")
+                  << " init_stdcall=" << (init_stdcall ? "1" : "0")
+                  << " attach_stdcall=" << (attach_stdcall ? "1" : "0")
+                  << std::endl;
+    }
+    const bool wrd_ambiguous_signature =
+        (send_name == "execute" && add_name == "add" && execute_noarg_name == "execute");
 
-    auto launch_cdecl = reinterpret_cast<LaunchExploitFn>(launch_p);
-    auto injected_cdecl = reinterpret_cast<IsInjectedFn>(injected_p);
     auto send_cdecl = reinterpret_cast<SendLuaScriptFn>(send_p);
-
-    auto launch_std = reinterpret_cast<LaunchExploitStdFn>(launch_p);
-    auto injected_std = reinterpret_cast<IsInjectedStdFn>(injected_p);
     auto send_std = reinterpret_cast<SendLuaScriptStdFn>(send_p);
+    auto add_cdecl = reinterpret_cast<AddScriptFn>(add_p);
+    auto add_std = reinterpret_cast<AddScriptStdFn>(add_p);
+    auto exec0_cdecl = reinterpret_cast<ExecuteNoArgFn>(execute_noarg_p);
+    auto exec0_std = reinterpret_cast<ExecuteNoArgStdFn>(execute_noarg_p);
 
-    if (stdcall_mode) {
-        launch_std();
-    } else {
-        launch_cdecl();
+    bool skip_initialize_effective = skip_initialize || execute_only_mode;
+    if (!skip_initialize_effective && safe_mode && wrd_ambiguous_signature) {
+        skip_initialize_effective = true;
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: safe_mode enabled, skipping initialize() for ambiguous WRD signature" << std::endl;
+        }
+    }
+
+    if (!skip_initialize_effective) {
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: calling initialize" << std::endl;
+        }
+        if (!SafeCallInitialize(launch_p, init_stdcall, error)) {
+            FreeLibrary(h_api);
+            return false;
+        }
+    } else if (trace_steps) {
+        if (skip_initialize) {
+            std::cout << "[injector] executor_api: skip initialize by config" << std::endl;
+        }
+    }
+    bool attached = false;
+    bool skip_is_attached_effective = skip_is_attached || execute_only_mode;
+    if (execute_only_mode && trace_steps) {
+        std::cout << "[injector] executor_api: execute_only mode, skipping initialize()/isAttached()" << std::endl;
+    }
+    if (!skip_is_attached_effective && safe_mode && wrd_ambiguous_signature) {
+        skip_is_attached_effective = true;
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: safe_mode enabled, skipping isAttached() for ambiguous WRD signature" << std::endl;
+        }
     }
     const auto attach_start = std::chrono::steady_clock::now();
-    bool attached = false;
-    while (true) {
-        const bool injected = stdcall_mode ? (injected_std() != 0) : injected_cdecl();
-        if (injected) {
-            attached = true;
-            break;
+    if (!skip_is_attached_effective) {
+        while (true) {
+            bool injected = false;
+            if (!SafeCallIsAttached(injected_p, attach_stdcall, injected, error)) {
+                FreeLibrary(h_api);
+                return false;
+            }
+            if (injected) {
+                attached = true;
+                break;
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - attach_start
+            );
+            if (elapsed.count() >= static_cast<long long>(attach_timeout_ms)) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - attach_start
-        );
-        if (elapsed.count() >= static_cast<long long>(attach_timeout_ms)) {
-            break;
+    } else if (trace_steps) {
+        if (skip_is_attached) {
+            std::cout << "[injector] executor_api: skip isAttached polling by config" << std::endl;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
-    if (!attached) {
-        error = "Executor did not attach to Roblox in time.";
-        FreeLibrary(h_api);
-        return false;
+    if (skip_is_attached_effective && safe_mode && !skip_is_attached && wrd_ambiguous_signature && !skip_initialize_effective) {
+        // WRD wrappers with ambiguous execute exports may crash on isAttached().
+        // In safe mode treat initialize() as attach trigger and proceed.
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        attached = true;
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: assuming attached after initialize (safe_mode fallback)" << std::endl;
+        }
+    }
+    if (trace_steps) {
+        std::cout << "[injector] executor_api: isAttached=" << (attached ? "true" : "false") << std::endl;
     }
 
-    if (stdcall_mode) {
-        send_std(lua_payload.c_str());
+    const bool allow_unattached_execute_effective = allow_unattached_execute || execute_only_mode;
+    if (!attached) {
+        if (safe_mode && wrd_ambiguous_signature && skip_initialize_effective && !allow_unattached_execute) {
+            error = "Safe mode blocked initialize/isAttached for ambiguous WRD wrapper; attach state is unknown. "
+                    "Set INJECTOR_EXECUTOR_ALLOW_UNATTACHED_EXECUTE=1 to try execute anyway (unsafe).";
+            FreeLibrary(h_api);
+            return false;
+        }
+        if (!allow_unattached_execute_effective) {
+            error = "Executor not attached (isAttached=false). "
+                    "Set INJECTOR_EXECUTOR_ALLOW_UNATTACHED_EXECUTE=1 to override (unsafe).";
+            FreeLibrary(h_api);
+            return false;
+        }
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: proceeding with execute despite not attached (unsafe override)" << std::endl;
+        }
+    }
+
+    if (trace_steps) {
+        std::cout << "[injector] executor_api: calling execute" << std::endl;
+    }
+    const bool execute0_is_distinct = (execute_noarg_p != nullptr && execute_noarg_p != send_p);
+    const bool execute0_explicit_noarg = (execute_noarg_name == "_execute@0" || execute_noarg_name == "_Execute@0");
+    const bool use_add_execute_flow = (add_p != nullptr && execute_noarg_p != nullptr && (execute0_is_distinct || execute0_explicit_noarg));
+    if (use_add_execute_flow) {
+        if (trace_steps) {
+            std::cout << "[injector] executor_api: using add(script)+execute() flow" << std::endl;
+        }
+        if (stdcall_mode) {
+            add_std(lua_payload.c_str());
+            exec0_std();
+        } else {
+            add_cdecl(lua_payload.c_str());
+            exec0_cdecl();
+        }
     } else {
-        send_cdecl(lua_payload.c_str());
+        if (trace_steps) {
+            if (add_p != nullptr && execute_noarg_p != nullptr && !execute0_is_distinct && !execute0_explicit_noarg) {
+                std::cout << "[injector] executor_api: execute0 export ambiguous, fallback to execute(script) flow" << std::endl;
+            } else {
+                std::cout << "[injector] executor_api: using execute(script) flow" << std::endl;
+            }
+        }
+        if (stdcall_mode) {
+            send_std(lua_payload.c_str());
+        } else {
+            send_cdecl(lua_payload.c_str());
+        }
     }
     if (!WaitForFile(response_path, response_timeout_ms)) {
-        error = "Lua response timeout (" + std::to_string(response_timeout_ms) + " ms).";
+        if (!attached) {
+            error = "Executor not attached and no Lua response in timeout (" + std::to_string(response_timeout_ms) + " ms).";
+        } else {
+            error = "Lua response timeout (" + std::to_string(response_timeout_ms) + " ms).";
+        }
         FreeLibrary(h_api);
         return false;
     }
@@ -724,6 +993,38 @@ int main(int argc, char* argv[]) {
         GetSetting("INJECTOR_ATTACH_TIMEOUT_MS", dot_env, ""),
         kDefaultAttachTimeoutMs
     );
+    const bool skip_initialize = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_SKIP_INITIALIZE", dot_env, "0"),
+        0
+    ) != 0;
+    const bool skip_is_attached = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_SKIP_ISATTACHED", dot_env, "0"),
+        0
+    ) != 0;
+    const bool allow_unattached_execute = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_ALLOW_UNATTACHED_EXECUTE", dot_env, "0"),
+        0
+    ) != 0;
+    const bool safe_mode = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_SAFE_MODE", dot_env, "1"),
+        1
+    ) != 0;
+    const bool execute_only_mode = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_EXECUTE_ONLY", dot_env, "0"),
+        0
+    ) != 0;
+    std::string callconv = GetSetting("INJECTOR_EXECUTOR_CALLCONV", dot_env, "auto");
+    std::transform(callconv.begin(), callconv.end(), callconv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool force_stdcall = (callconv == "stdcall");
+    const bool force_cdecl = (callconv == "cdecl");
+    const bool trace_steps = ParseDwordSetting(
+        GetSetting("INJECTOR_EXECUTOR_TRACE_STEPS", dot_env, "1"),
+        1
+    ) != 0;
+    const std::string initialize_export = GetSetting("INJECTOR_EXECUTOR_INITIALIZE_EXPORT", dot_env, "");
+    const std::string isattached_export = GetSetting("INJECTOR_EXECUTOR_ISATTACHED_EXPORT", dot_env, "");
+    const int initialize_callconv = ParseCallconvOverride(GetSetting("INJECTOR_EXECUTOR_INITIALIZE_CALLCONV", dot_env, ""));
+    const int isattached_callconv = ParseCallconvOverride(GetSetting("INJECTOR_EXECUTOR_ISATTACHED_CALLCONV", dot_env, ""));
 
     std::string mode = GetSetting("INJECTOR_MODE", dot_env, "executor_api");
     std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -738,6 +1039,18 @@ int main(int argc, char* argv[]) {
                 json_args,
                 response_timeout_ms,
                 attach_timeout_ms,
+                skip_initialize,
+                skip_is_attached,
+                allow_unattached_execute,
+                safe_mode,
+                execute_only_mode,
+                force_stdcall,
+                force_cdecl,
+                trace_steps,
+                initialize_export,
+                isattached_export,
+                initialize_callconv,
+                isattached_callconv,
                 response_json,
                 error
             )) {

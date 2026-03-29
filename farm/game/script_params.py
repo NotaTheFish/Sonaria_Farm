@@ -75,7 +75,23 @@ def build_universal_script_params(
     command: str,
     extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Параметры для ``external/injector_scripts/universal_sonaria_bot.lua`` (поле ``command``)."""
+    """
+    Параметры для ``external/injector_scripts/universal_sonaria_bot.lua`` (поле ``command``).
+
+    Общие ключи (часть опциональна, см. комментарии в .lua):
+
+    - role, command, account_id, account_login, account_password?, stop_flag_path
+    - target_storage_account_id, target_storage_username (логин Roblox склада для трейда)
+    - farmer_queue_index, farmer_queue_total, queue_stagger_seconds — очередь фермеров
+    - transfer_token_priority / token_kinds — порядок токенов для передачи на склад
+    - batch_size (150), trade_retry_seconds (10), trade_confirm_poll_seconds (2),
+      post_trade_cooldown_seconds (70)
+    - farm_pipeline: ``missions_dp_only`` | ``missions_dp_then_transfer`` — после цели DP
+    - default_creature_name (Kaluaka), volcano_suicide (bool)
+    - sell_idle_rotate_seconds (3600), anti_afk_interval_seconds (300)
+    - bound_farmers: [{ "id", "login" }, ...] для склада (receive / sell контекст)
+    - dex_asset_path — по умолчанию в Lua ``Dex_roblox.rbxmx`` рядом с workspace эксплойта
+    """
     base: dict[str, Any] = {
         "role": getattr(account, "role", None) or "farmer",
         "command": command,
@@ -87,3 +103,17 @@ def build_universal_script_params(
     if extra_params:
         base.update(extra_params)
     return base
+
+
+def build_universal_farm_tick_params(
+    *,
+    account: Account,
+    death_points_target: int,
+    task_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Слияние payload задачи ``universal_farm`` с целевыми DP для первого инжекта."""
+    merged: dict[str, Any] = dict(task_payload or {})
+    merged["target_dp"] = death_points_target
+    merged["death_points_target"] = death_points_target
+    merged.setdefault("tick_seq", 1)
+    return build_universal_script_params(account, "farm", extra_params=merged)

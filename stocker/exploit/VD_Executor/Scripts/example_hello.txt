@@ -1,0 +1,2 @@
+-- Пример: положи свои скрипты сюда (.txt или .lua)
+print("VD_Executor Scripts/ example")

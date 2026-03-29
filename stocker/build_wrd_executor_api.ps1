@@ -5,8 +5,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# В PowerShell 7 stderr native-команд может превращаться в ErrorRecord и падать по ErrorActionPreference=Stop.
-# Для компиляторов это нормальный поток диагностики, поэтому отключаем такое поведение локально.
 if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
     $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -17,7 +15,6 @@ try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 } catch {
-    # best-effort; keep default encoding
 }
 
 $Toolchain = if ([string]::IsNullOrWhiteSpace($Toolchain)) { "auto" } else { $Toolchain.ToLowerInvariant() }
@@ -27,10 +24,10 @@ if ($Toolchain -notin @("auto", "msvc", "mingw")) {
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $outputDir = Join-Path $root "stocker\build"
-$source = Join-Path $root "stocker\injector.cpp"
-$output = Join-Path $outputDir "injector.exe"
+$source = Join-Path $root "stocker\sonaria_wrd_executor_api.cpp"
+$output = Join-Path $outputDir "sonaria_wrd_executor_api.dll"
 $buildLog = if ([string]::IsNullOrWhiteSpace($LogPath)) {
-    Join-Path $outputDir "injector_build.log"
+    Join-Path $outputDir "wrd_executor_api_build.log"
 } else {
     $LogPath
 }
@@ -65,13 +62,9 @@ function Show-LogTail {
 }
 
 function Invoke-CmdAndCapture {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$CmdLine
-    )
+    param([Parameter(Mandatory = $true)][string]$CmdLine)
     $tmpOut = [System.IO.Path]::GetTempFileName()
     try {
-        # Весь stdout/stderr уходит в файл на стороне cmd.exe, чтобы PowerShell не превращал stderr в ErrorRecord.
         $full = "$CmdLine > `"$tmpOut`" 2>&1"
         cmd /c $full | Out-Null
         $exitCode = $LASTEXITCODE
@@ -96,31 +89,24 @@ function Stop-LockingOutputProcess {
         return
     }
     $outputFull = [System.IO.Path]::GetFullPath($output)
-    $procs = Get-CimInstance Win32_Process -Filter "Name='injector.exe'" -ErrorAction SilentlyContinue
+    $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $outputFull) }
     foreach ($p in @($procs)) {
-        if (-not $p -or -not $p.ExecutablePath) {
-            continue
-        }
-        $exePath = [System.IO.Path]::GetFullPath($p.ExecutablePath)
-        if ($exePath -ieq $outputFull) {
-            Write-Host "[build] stopping running injector.exe (pid=$($p.ProcessId)) to release linker lock"
-            Write-BuildLog "[build] stopping running injector.exe pid=$($p.ProcessId) path=$exePath"
-            try {
-                Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
-            } catch {
-                Write-Warning "Failed to stop injector.exe pid=$($p.ProcessId): $($_.Exception.Message)"
-                Write-BuildLog "[build] warning: failed to stop pid=$($p.ProcessId): $($_.Exception.Message)"
-            }
+        if (-not $p) { continue }
+        Write-Host "[build] stopping process locking output (pid=$($p.ProcessId))"
+        Write-BuildLog "[build] stopping pid=$($p.ProcessId) path=$($p.ExecutablePath)"
+        try {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to stop pid=$($p.ProcessId): $($_.Exception.Message)"
         }
     }
 }
 
 function Invoke-MsvcBuildCore {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$CmdLine,
-        [Parameter(Mandatory = $true)]
-        [string]$ExitCodeLabel
+        [Parameter(Mandatory = $true)][string]$CmdLine,
+        [Parameter(Mandatory = $true)][string]$ExitCodeLabel
     )
     $res = Invoke-CmdAndCapture -CmdLine $CmdLine
     $buildOut = $res.Lines
@@ -148,14 +134,13 @@ function Invoke-MsvcBuildCore {
         }
     }
     if ($hadLockError) {
-        Write-Warning "Detected linker lock on $output. Trying to stop running injector.exe and rebuild once."
-        Write-BuildLog "[build] detected LNK1104 output lock; retrying once after process cleanup"
+        Write-Warning "Detected linker lock on $output. Retrying once after process cleanup."
+        Write-BuildLog "[build] LNK1104 retry"
         Stop-LockingOutputProcess
         Start-Sleep -Milliseconds 250
         $retry = Invoke-CmdAndCapture -CmdLine $CmdLine
-        $retryOut = $retry.Lines
-        if ($retryOut) {
-            $retryOut | ForEach-Object {
+        if ($retry.Lines) {
+            $retry.Lines | ForEach-Object {
                 Write-Host $_
                 Write-BuildLog "$_"
             }
@@ -166,7 +151,6 @@ function Invoke-MsvcBuildCore {
         }
         if ($retry.ExitCode -eq 1 -and (Test-Path $output)) {
             Write-Warning "MSVC retry returned 1 (warnings), but output exists: $output"
-            Write-BuildLog "[build] note: retry exit_code=1 treated as success because output exists"
             return $true
         }
     }
@@ -174,7 +158,6 @@ function Invoke-MsvcBuildCore {
 }
 
 function Invoke-MsvcBuild {
-    # Prefer explicit x64 toolchain via VsDevCmd to avoid x86/x64 mixed env issues.
     $vswhereDefault = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     $vswhere = if (Test-Path $vswhereDefault) { $vswhereDefault } else { $null }
     if ($vswhere) {
@@ -192,10 +175,11 @@ function Invoke-MsvcBuild {
                     "/std:c++17",
                     "/EHsc",
                     "/O2",
+                    "/LD",
                     "`"$source`"",
                     "/Fe:`"$output`"",
                     "/link",
-                    "user32.lib",
+                    "/DLL",
                     "kernel32.lib"
                 ) -join " "
                 $ok = Invoke-MsvcBuildCore -CmdLine $cmd -ExitCodeLabel "msvc_vsdevcmd_exit_code"
@@ -208,7 +192,6 @@ function Invoke-MsvcBuild {
         }
     }
 
-    # Fallback: cl.exe from current PATH (may be x86, but can still work in some setups).
     $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
     if ($cl) {
         Write-Host "[build] using MSVC (cl.exe in PATH)"
@@ -218,10 +201,11 @@ function Invoke-MsvcBuild {
             "/std:c++17",
             "/EHsc",
             "/O2",
+            "/LD",
             "`"$source`"",
             "/Fe:`"$output`"",
             "/link",
-            "user32.lib",
+            "/DLL",
             "kernel32.lib"
         ) -join " "
         $ok = Invoke-MsvcBuildCore -CmdLine $cmd -ExitCodeLabel "msvc_exit_code"
@@ -244,12 +228,12 @@ function Invoke-MingwBuild {
     $args = @(
         "-std=c++17",
         "-O2",
+        "-shared",
         "-static-libgcc",
         "-static-libstdc++",
         "-s",
-        $source,
         "-o", $output,
-        "-luser32",
+        $source,
         "-lkernel32"
     )
     if ($VerboseBuild) {
@@ -315,5 +299,4 @@ try {
     [Console]::OutputEncoding = $prevOutEnc
     [Console]::InputEncoding = $prevInEnc
 } catch {
-    # ignore
 }

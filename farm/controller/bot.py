@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
-from typing import Optional
+from typing import Any, Optional
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
@@ -271,6 +271,47 @@ SELLABLE_TOKENS = [
     "Death Gacha Token",
 ]
 
+# Порядок токенов для universal_sonaria_bot (фермер → склад и приоритеты в Lua)
+UNIVERSAL_TRANSFER_TOKEN_PRIORITY = list(SELLABLE_TOKENS)
+
+
+def _universal_farmer_runtime_payload(
+    *,
+    queue_index: int,
+    queue_total: int,
+    storage: Account | None,
+) -> dict[str, Any]:
+    """Поля payload для задач UNIVERSAL_FARM / UNIVERSAL_TRANSFER (читает Lua)."""
+    base: dict[str, Any] = {
+        "batch_size": 150,
+        "cooldown_seconds": 70,
+        "post_trade_cooldown_seconds": 70,
+        "trade_retry_seconds": 10,
+        "trade_confirm_poll_seconds": 2,
+        "storage_gives": 1,
+        "transfer_token_priority": list(UNIVERSAL_TRANSFER_TOKEN_PRIORITY),
+        "token_kinds": list(UNIVERSAL_TRANSFER_TOKEN_PRIORITY),
+        "transfer_mode": "ROUND_ROBIN_MULTI_TYPE_BATCH",
+        "farmer_queue_index": queue_index,
+        "farmer_queue_total": queue_total,
+        "queue_stagger_seconds": 5,
+        "default_creature_name": "Kaluaka",
+        "volcano_suicide": True,
+        "join_fail_ban_threshold": 10,
+        "ban_min_creature_kinds": 10,
+        "sell_idle_rotate_seconds": 3600,
+        "anti_afk_interval_seconds": 300,
+        "sell_priority_phase_switch_after": 4,
+        "dex_asset_path": "Dex_roblox.rbxmx",
+    }
+    if storage is not None:
+        base["target_storage_account_id"] = storage.id
+        base["target_storage_username"] = storage.login
+        base["farm_pipeline"] = "missions_dp_then_transfer"
+    else:
+        base["farm_pipeline"] = "missions_dp_only"
+    return base
+
 
 async def get_or_create_settings() -> ControllerSettings:
     async with AsyncSessionMaker() as session:
@@ -380,11 +421,25 @@ async def enqueue_universal_sell_for_active_storages(
                 )
             )
         ).all()
+        farmers = (
+            await session.scalars(
+                select(Account).where(
+                    Account.role == AccountRole.FARMER.value,
+                    Account.status == AccountStatus.ACTIVE.value,
+                )
+            )
+        ).all()
 
     if not storages:
         return 0, "Нет активных аккаунтов-складов."
 
-    for storage in storages:
+    ns = len(storages)
+    for si, storage in enumerate(storages):
+        bound_farmers = [
+            {"id": f.id, "login": f.login}
+            for fi, f in enumerate(farmers)
+            if fi % ns == si
+        ]
         await request_cancel_tasks(
             task_type=TaskType.UNIVERSAL_SELL.value,
             account_id=storage.id,
@@ -403,6 +458,11 @@ async def enqueue_universal_sell_for_active_storages(
                 "ranges": ranges,
                 "priority_tokens": priority_tokens,
                 "fallback_non_priority_mode": "sell_all_when_priority_empty",
+                "bound_farmers": bound_farmers,
+                "trade_session_mode": "public_sale",
+                "sell_idle_rotate_seconds": 3600,
+                "anti_afk_interval_seconds": 300,
+                "sell_priority_phase_switch_after": 4,
             },
         )
     return len(storages), None
@@ -776,18 +836,11 @@ def build_router(config: Config) -> Router:
         for i, farmer in enumerate(farmers):
             storage = storages[i % len(storages)]
             payload = {
-                "target_storage_account_id": storage.id,
-                "batch_size": 150,
-                "cooldown_seconds": 70,
-                "storage_gives": 1,  # 1 гриб за trade-батч
-                "token_kinds": [
-                    "Revive Token",
-                    "Max Growth Token",
-                    "Partial Growth Token",
-                    "Random Trial Creature Token",
-                    "Appearance Change Token",
-                    "Death Gacha Token",
-                ],
+                **_universal_farmer_runtime_payload(
+                    queue_index=i + 1,
+                    queue_total=len(farmers),
+                    storage=storage,
+                ),
                 "transfer_mode": "FULL_BATCH_UNTIL_ZERO",
             }
             await create_task(
@@ -848,19 +901,12 @@ def build_router(config: Config) -> Router:
         for i, farmer in enumerate(farmers):
             storage = storages[i % len(storages)]
             payload = {
-                "target_storage_account_id": storage.id,
-                "batch_size": 150,
-                "cooldown_seconds": 70,
-                "storage_gives": 1,
-                "token_kinds": [
-                    "Revive Token",
-                    "Max Growth Token",
-                    "Partial Growth Token",
-                    "Random Trial Creature Token",
-                    "Appearance Change Token",
-                    "Death Gacha Token",
-                ],
-                "transfer_mode": "FULL_BATCH_UNTIL_ZERO",
+                **_universal_farmer_runtime_payload(
+                    queue_index=i + 1,
+                    queue_total=len(farmers),
+                    storage=storage,
+                ),
+                "transfer_mode": "ROUND_ROBIN_MULTI_TYPE_BATCH",
             }
             await create_task(
                 task_type=TaskType.UNIVERSAL_TRANSFER.value,
@@ -1392,6 +1438,14 @@ def build_router(config: Config) -> Router:
                     )
                 )
             ).all()
+            storages = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.STORAGE.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
 
         if not farmers:
             await message.answer(
@@ -1413,12 +1467,23 @@ def build_router(config: Config) -> Router:
             )
 
         created = 0
-        for farmer in farmers:
+        n = len(farmers)
+        for i, farmer in enumerate(farmers):
+            storage = storages[i % len(storages)] if storages else None
+            farm_payload: dict[str, Any] = {
+                "death_points_target": death_points_target,
+                "loop": True,
+                **_universal_farmer_runtime_payload(
+                    queue_index=i + 1,
+                    queue_total=n,
+                    storage=storage,
+                ),
+            }
             await create_task(
                 task_type=TaskType.UNIVERSAL_FARM.value,
                 priority=1000,
                 account_id=farmer.id,
-                payload={"death_points_target": death_points_target, "loop": True},
+                payload=farm_payload,
             )
             created += 1
 

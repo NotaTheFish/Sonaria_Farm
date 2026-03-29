@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,46 @@ def injector_executable() -> Path | None:
     return p if p.is_file() else None
 
 
-def stocker_injector_executable() -> Path | None:
-    """Локальный C++ injector из репозитория (`stocker/build/injector.exe`)."""
-    p = REPO_ROOT / "stocker" / "build" / "injector.exe"
-    return p if p.is_file() else None
+def vd_executor_default_exe() -> Path | None:
+    """
+    Подсказка для INJECTOR_PATH: свежая сборка из исходников, затем запасной путь VD_Exec.
+    """
+    candidates = (
+        REPO_ROOT
+        / "stocker"
+        / "exploit"
+        / "VD_Executor"
+        / "bin"
+        / "Release"
+        / "net9.0-windows"
+        / "win-x64"
+        / "VD Executor.exe",
+        REPO_ROOT / "stocker" / "exploit" / "VD_Exec" / "VD Executor.exe",
+    )
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def is_vd_executor_path(path: Path | None) -> bool:
+    if path is None:
+        return False
+    return path.name.casefold() == "vd executor.exe"
+
+
+def injector_dex_uses_vd_executor_start_only() -> bool:
+    """
+    Dex (универсал): только стартовать VD Executor, без CLI ``pid script.lua JSON``.
+
+    Включается, если INJECTOR_DEX_START_ONLY=1, либо (по умолчанию) если INJECTOR_PATH
+    указывает на файл ``VD Executor.exe`` и не задано INJECTOR_DEX_LEGACY_CLI=1.
+    """
+    if _truthy(os.getenv("INJECTOR_DEX_LEGACY_CLI")):
+        return False
+    if _truthy(os.getenv("INJECTOR_DEX_START_ONLY")):
+        return True
+    return is_vd_executor_path(injector_executable())
 
 
 def injector_configured() -> bool:
@@ -260,3 +297,54 @@ async def launch_injector_subprocess(
     level = "warning" if cp.returncode not in (0, None) else "info"
     await append_task_log(task_id=task_id, worker_id=worker_id, level=level, message=log_line)
     return cp
+
+
+async def launch_vd_executor_detached(
+    *,
+    task_id: str,
+    worker_id: str | None,
+    trigger: str,
+) -> int:
+    """
+    Стартует INJECTOR_PATH + INJECTOR_ARGS_JSON и сразу возвращает pid (процесс не ждём).
+    Для GUI/долгоживущих лаунчеров (VD Executor).
+    """
+    from farm.task_queue import append_task_log
+
+    if not injector_enabled_flag():
+        raise RuntimeError("INJECTOR_ENABLED не включён")
+
+    argv = build_injector_argv()
+    if not argv:
+        raise RuntimeError("INJECTOR_PATH не задан или файл не найден")
+
+    await append_task_log(
+        task_id=task_id,
+        worker_id=worker_id,
+        message=f"[vd_executor] старт trigger={trigger!r} argv={argv!r}",
+    )
+
+    kwargs: dict[str, Any] = {}
+    if _truthy(os.getenv("INJECTOR_NO_WINDOW")) and sys.platform == "win32":
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            **kwargs,
+        )
+    except OSError as exc:
+        msg = f"[vd_executor] не удалось запустить: {exc}"
+        logger.exception(msg)
+        await append_task_log(task_id=task_id, worker_id=worker_id, level="error", message=msg)
+        raise RuntimeError(msg) from exc
+
+    pid = proc.pid or -1
+    log_line = f"[vd_executor] процесс запущен pid={pid}"
+    logger.info(log_line)
+    await append_task_log(task_id=task_id, worker_id=worker_id, message=log_line)
+    return pid

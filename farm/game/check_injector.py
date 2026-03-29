@@ -77,6 +77,7 @@ def collect_status() -> dict[str, Any]:
 
     legacy_ready = ib.legacy_ready()
     universal_ready = ib.universal_ready()
+    dex_vd_start = inj.injector_dex_uses_vd_executor_start_only()
 
     issues: list[str] = []
     if backend == "external_cli":
@@ -84,9 +85,9 @@ def collect_status() -> dict[str, Any]:
             issues.append("INJECTOR_ENABLED is disabled or missing.")
         if exe is None:
             issues.append("INJECTOR_PATH is missing or points to non-existing file.")
-        if require_pid_bool and pid is None:
+        if require_pid_bool and pid is None and not dex_vd_start:
             issues.append("Roblox PID not found (ROBLOX_PID missing and Roblox process not running).")
-    if backend == "external_cli" and universal_script is None:
+    if backend == "external_cli" and universal_script is None and not dex_vd_start:
         issues.append("universal_sonaria_bot.lua not found (INJECTOR_UNIVERSAL_SCRIPT_PATH).")
     if dex_script_mode == 1 and test_dex_url is None:
         issues.append(
@@ -108,6 +109,7 @@ def collect_status() -> dict[str, Any]:
         "test_dex_url": test_dex_url,
         "legacy_ready": legacy_ready,
         "universal_ready": universal_ready,
+        "dex_vd_executor_start_only": dex_vd_start,
         "require_pid": require_pid_bool,
         "issues": issues,
         "ok": len(issues) == 0,
@@ -131,6 +133,7 @@ def _print_human(status: dict[str, Any]) -> None:
     print(f"test_dex_url:       {status['test_dex_url'] or '-'}")
     print(f"legacy_ready:       {status['legacy_ready']}")
     print(f"universal_ready:    {status['universal_ready']}")
+    print(f"dex_vd_start_only:  {status['dex_vd_executor_start_only']}")
     if status["issues"]:
         print("issues:")
         for issue in status["issues"]:
