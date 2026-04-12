@@ -271,6 +271,20 @@ SELLABLE_TOKENS = [
     "Death Gacha Token",
 ]
 
+# Продажи: ровно этот набор (порядок = приоритет), без других токенов.
+SELL_PRIORITY_TOKEN_COUNT = len(SELLABLE_TOKENS)
+
+
+def sell_priority_tokens_valid(priority_tokens: object) -> bool:
+    if not isinstance(priority_tokens, list):
+        return False
+    if len(priority_tokens) != SELL_PRIORITY_TOKEN_COUNT:
+        return False
+    if len(set(priority_tokens)) != SELL_PRIORITY_TOKEN_COUNT:
+        return False
+    return set(priority_tokens) == set(SELLABLE_TOKENS)
+
+
 # Порядок токенов для universal_sonaria_bot (фермер → склад и приоритеты в Lua)
 UNIVERSAL_TRANSFER_TOKEN_PRIORITY = list(SELLABLE_TOKENS)
 
@@ -335,6 +349,9 @@ async def rebalance_active_account_roles() -> tuple[int, int, int]:
     """
     Распределяет только ACTIVE аккаунты по ролям farmer/storage согласно ratio.
     Возвращает (active_total, farmers_count, storages_count)
+
+    Число фермеров — ``round(total * ratio / 100)`` в [0, total]: при ``int()`` один
+    active-аккаунт при ratio=70 давал 0 фермеров (все уходили в storage).
     """
     settings = await get_or_create_settings()
     ratio = max(0, min(100, int(settings.farmer_ratio_percent)))
@@ -349,7 +366,7 @@ async def rebalance_active_account_roles() -> tuple[int, int, int]:
         ).all()
 
         total = len(active_accounts)
-        farmers_count = int(total * ratio / 100)
+        farmers_count = max(0, min(total, round(total * ratio / 100.0)))
         storages_count = total - farmers_count
 
         for idx, acc in enumerate(active_accounts):
@@ -365,7 +382,8 @@ async def enqueue_set_sell_price_for_active_storages(
     priority_tokens: list[str],
 ) -> tuple[int, str | None]:
     """
-    Создаёт задачи SET_SELL_PRICE для всех активных складов.
+    Создаёт задачи SET_SELL_PRICE для всех активных складов (инжектор / sell.lua).
+    Вызывать из «Запустить продажи», а не из мастера «Выставить цену» — там только сохранение в БД.
     Возвращает (число складов, текст ошибки или None).
     """
     await rebalance_active_account_roles()
@@ -458,6 +476,7 @@ async def enqueue_universal_sell_for_active_storages(
                 "ranges": ranges,
                 "priority_tokens": priority_tokens,
                 "fallback_non_priority_mode": "sell_all_when_priority_empty",
+                "sell_only_priority_tokens": True,
                 "bound_farmers": bound_farmers,
                 "trade_session_mode": "public_sale",
                 "sell_idle_rotate_seconds": 3600,
@@ -1298,12 +1317,23 @@ def build_router(config: Config) -> Router:
             await message.answer("Не удалось распарсить ни одного диапазона. Попробуй еще раз.", reply_markup=control_kb())
             return
 
+        missing = [t for t in SELLABLE_TOKENS if t not in ranges]
+        if missing:
+            await message.answer(
+                "Нужен диапазон для каждого из 6 токенов. Не задано:\n"
+                + "\n".join(f"- {t}" for t in missing),
+                reply_markup=control_kb(),
+            )
+            return
+
         await state.update_data(price_ranges=ranges)
         await state.set_state(SetPriceState.waiting_for_priorities)
         await message.answer(
-            "Теперь пришли 4 приоритетных токена через запятую.\n"
-            "Пример:\n"
-            "Revive Token, Death Gacha Token, Max Growth Token, Partial Growth Token",
+            "Теперь пришли все 6 токенов через запятую — порядок = приоритет выставления.\n"
+            "Каждый токен из списка выше должен встретиться ровно один раз.\n"
+            "Пример (порядок свой):\n"
+            "Revive Token, Death Gacha Token, Max Growth Token, Partial Growth Token, "
+            "Random Trial Creature Token, Appearance Change Token",
             reply_markup=control_kb(),
         )
 
@@ -1316,23 +1346,24 @@ def build_router(config: Config) -> Router:
             if p in SELLABLE_TOKENS and p not in unique:
                 unique.append(p)
 
-        if len(unique) != 4:
-            await message.answer("Нужно выбрать ровно 4 уникальных токена из списка.", reply_markup=control_kb())
+        if not sell_priority_tokens_valid(unique):
+            await message.answer(
+                f"Нужно перечислить ровно {SELL_PRIORITY_TOKEN_COUNT} разных токена из списка — "
+                "каждый из 6 допустимых ровно один раз.",
+                reply_markup=control_kb(),
+            )
             return
 
         data = await state.get_data()
         ranges = data.get("price_ranges", {})
 
-        count, err = await enqueue_set_sell_price_for_active_storages(ranges, unique)
-        if err:
-            await message.answer(err, reply_markup=control_kb())
-            await state.clear()
-            return
-
         await save_sell_price_snapshot(ranges, unique)
         await message.answer(
-            f"Созданы задачи `Выставить цену` для {count} складов.\n"
-            f"Приоритеты: {', '.join(unique)}",
+            "Цены и приоритеты сохранены в БД.\n"
+            "Скрипты и инжектор <b>не</b> запускаются.\n"
+            "Когда будешь готов, нажми «Запустить продажи» — тогда воркер создаст задачи "
+            "на склады и выполнит выставление лотов.\n\n"
+            f"Порядок приоритета: {', '.join(unique)}",
             reply_markup=control_kb(),
         )
         await state.clear()
@@ -1372,9 +1403,12 @@ def build_router(config: Config) -> Router:
             await message.answer(
                 "Нет аккаунтов с ролью <b>фермер</b> и статусом <b>active</b>.\n"
                 "Забаненные, checkpoint, invalid и т.п. сюда не входят.\n"
-                "Импортируй новый аккаунт или верни фермеру статус active в БД, затем снова «Запустить фарм».\n\n"
+                "Статус смотри в таблице <b>accounts</b> (колонки <code>role</code>, <code>status</code>) — "
+                "это не таблица <code>workers</code> (там привязка воркера к машине, без статуса аккаунта).\n"
+                "Поставь фермеру <code>status=active</code> (или прогоняй логин-чек), затем снова «Запустить фарм».\n\n"
                 "<i>Привязка WORKER_ACCOUNT_ID в .env только ограничивает воркер одним аккаунтом; "
-                "задачи фарма бот создаёт только для active+farmer.</i>",
+                "задачи фарма бот создаёт только для active+farmer.</i>\n\n"
+                "Убедись, что Telegram-бот и воркер смотрят в <b>одну и ту же</b> базу (одинаковый <code>DATABASE_URL</code>).",
                 reply_markup=control_kb(),
             )
             return
@@ -1585,8 +1619,9 @@ def build_router(config: Config) -> Router:
             await message.answer(
                 "Продажи включены.\n\n"
                 "Нет сохранённого набора цен: один раз пройди «Выставить цену» "
-                "(диапазоны и 4 приоритета) — тогда настройки сохранятся в БД. "
-                "После этого «Запустить продажи» снова поставит задачи `Выставить цену` на склады.",
+                f"(диапазоны для всех {SELL_PRIORITY_TOKEN_COUNT} токенов и их порядок-приоритет) — "
+                "тогда настройки сохранятся в БД. "
+                "После этого снова нажми «Запустить продажи» — появятся задачи на склады.",
                 reply_markup=control_kb(),
             )
             return
@@ -1610,7 +1645,7 @@ def build_router(config: Config) -> Router:
             )
             return
 
-        if len(priority_tokens) != 4 or any(p not in SELLABLE_TOKENS for p in priority_tokens):
+        if not sell_priority_tokens_valid(priority_tokens):
             await message.answer(
                 "Продажи включены, но сохранённые приоритеты устарели или некорректны. "
                 "Пройди «Выставить цену» заново.",
@@ -1624,7 +1659,7 @@ def build_router(config: Config) -> Router:
             return
 
         await message.answer(
-            f"Продажи включены. Созданы задачи `Выставить цену` для {count} складов.\n"
+            f"Продажи включены. Созданы задачи на склады ({count}): выставление лотов по сохранённым ценам.\n"
             f"Приоритеты: {', '.join(priority_tokens)}",
             reply_markup=control_kb(),
         )
@@ -1662,7 +1697,7 @@ def build_router(config: Config) -> Router:
             await message.answer("Неверный формат сохранённых цен.", reply_markup=control_kb())
             return
 
-        if len(priority_tokens) != 4 or any(p not in SELLABLE_TOKENS for p in priority_tokens):
+        if not sell_priority_tokens_valid(priority_tokens):
             await message.answer(
                 "Приоритеты некорректны. Пройди «Выставить цену» заново.",
                 reply_markup=control_kb(),

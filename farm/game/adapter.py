@@ -319,6 +319,11 @@ class WindowsGameAdapter(GameAdapter):
             self._universal_farm_proc_by_task[task_id] = proc
             return None
         assert script_path is not None
+        await self._hook_injector_if_configured(
+            task_id=task_id,
+            worker_id=worker_id,
+            bridge="universal_script",
+        )
         argv, pid = ib.build_argv(script_path=script_path, params=params)
         await append_task_log(
             task_id=task_id,
@@ -687,7 +692,12 @@ class WindowsGameAdapter(GameAdapter):
         worker_id: str,
         bridge: str,
     ) -> None:
-        """См. farm.game.injector_launcher и INJECTOR_LAUNCH_WHEN."""
+        """См. farm.game.injector_launcher и INJECTOR_LAUNCH_WHEN.
+
+        bridge ``universal_script`` — перед запуском universal_sonaria_bot.lua (sell/transfer/…),
+        чтобы при INJECTOR_LAUNCH_WHEN=windows_adapter_init поднять VD Executor, если ещё не
+        вызывали login_and_check / farm_tick.
+        """
         if not inj.injector_enabled_flag():
             return
         when = inj.injector_launch_when()

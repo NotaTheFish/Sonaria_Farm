@@ -71,7 +71,7 @@ Roblox обычно не даёт несколько клиентов в одн�
 - `INJECT_DLL_PATH=stocker/inject.dll`
 
 В репозитории реализован **опциональный** запуск через `subprocess` в **`farm/game/injector_launcher.py`**:  
-`INJECTOR_ENABLED=1`, `INJECTOR_LAUNCH_WHEN=windows_adapter_init` (один раз при первой операции моста в процессе воркера) или `every_farm_tick` (на каждый `farm_tick`). Аргументы CLI — `INJECTOR_ARGS_JSON` (массив строк), если твой exe их поддерживает.
+`INJECTOR_ENABLED=1`, `INJECTOR_LAUNCH_WHEN=windows_adapter_init` (один раз при первой операции моста в процессе воркера — в том числе при первом запуске `universal_sonaria_bot.lua`, bridge `universal_script`) или `every_farm_tick` (на каждый `farm_tick`). Аргументы CLI — `INJECTOR_ARGS_JSON` (массив строк), если твой exe их поддерживает.
 
 Проверку CLI (`python -m farm.game.check_injector --json`) используй как gate до запуска воркера; при запуске из корня проекта чекер читает корневой `.env`.
 

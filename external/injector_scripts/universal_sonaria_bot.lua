@@ -2,6 +2,7 @@
 -- Универсальный скрипт Creatures of Sonaria + контракт с контроллером (JSON в первом аргументе).
 -- Параметры задаёт Python (payload задач UNIVERSAL_FARM / UNIVERSAL_TRANSFER / UNIVERSAL_SELL).
 -- Dex: положи Dex_roblox.rbxmx в рабочую папку эксплойта или задай dex_asset_path.
+-- Снимки плейсов (Remotes/GUI): external/sonaria_data/*.rbxl — бинарные, смотри README там и Studio.
 
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
@@ -63,6 +64,9 @@ local TOKEN_KINDS = params.transfer_token_priority or params.token_kinds or DEFA
 local FARM_PIPELINE = params.farm_pipeline or "missions_dp_only"
 local DEFAULT_CREATURE = params.default_creature_name or "Kaluaka"
 local VOLCANO_SUICIDE = params.volcano_suicide == true or params.volcano_suicide == "1"
+local VOLCANO_X = tonumber(params.volcano_x) or 1973
+local VOLCANO_Y = tonumber(params.volcano_y) or 238
+local VOLCANO_Z = tonumber(params.volcano_z) or 1616
 
 local FARMER_QUEUE_INDEX = tonumber(params.farmer_queue_index) or 1
 local FARMER_QUEUE_TOTAL = tonumber(params.farmer_queue_total) or 1
@@ -77,9 +81,15 @@ local FALLBACK_MODE = params.fallback_mode or params.fallback_non_priority_mode 
 local SELL_IDLE_ROTATE = tonumber(params.sell_idle_rotate_seconds) or 3600
 local ANTI_AFK_INTERVAL = tonumber(params.anti_afk_interval_seconds) or 300
 local SELL_PHASE_SWITCH_AFTER = tonumber(params.sell_priority_phase_switch_after) or 4
+-- Только токены из priority_tokens (без «все остальные» при пустой фазе).
+local SELL_ONLY_PRIORITY = params.sell_only_priority_tokens ~= false
 
 local BOUND_FARMERS = params.bound_farmers or {}
 local TRADE_SESSION_MODE = params.trade_session_mode or "overload"
+
+-- Trade Realm (из CoS .rbxlx: live 14119723130, test trade 14217217395)
+local TRADE_REALM_PLACE_ID = tonumber(params.trade_realm_place_id) or 14119723130
+local TRADE_REALM_PLACE_ID_TEST = tonumber(params.trade_realm_place_id_test) or 14217217395
 
 local RESPONSE_FILE = params.response_file or nil
 local REQUEST_FILE = params.request_file or nil
@@ -450,11 +460,16 @@ local function sendTrade(targetPlayer, itemsToGive, itemsToReceive)
             return true
         end
 
-        local gui = player:WaitForChild("PlayerGui")
-        local tradeGui = gui:FindFirstChild("TradeGui") or gui:FindFirstChild("Trading")
-
-        if tradeGui then
-            return true
+        local gui = player:FindFirstChild("PlayerGui")
+        if gui then
+            local tGui = tick()
+            while tick() - tGui < 25 do
+                local tradeGui = gui:FindFirstChild("TradeGui") or gui:FindFirstChild("Trading")
+                if tradeGui and (tradeGui:FindFirstChild("ContainerFrame") or tradeGui:FindFirstChild("AcceptButton", true)) then
+                    return true
+                end
+                wait(0.5)
+            end
         end
 
         return false
@@ -468,24 +483,15 @@ local function sendTrade(targetPlayer, itemsToGive, itemsToReceive)
     return true
 end
 
--- Опрос «подтвердить» (заглушка: дополни под реальный GUI CoS).
-local function pollTradeConfirmWindow(maxSeconds)
-    local t0 = tick()
-    maxSeconds = maxSeconds or 60
-    while tick() - t0 < maxSeconds do
-        if stopFlagExists() then
-            return false
-        end
-        wait(TRADE_CONFIRM_POLL_SECONDS)
-    end
-    return true
-end
-
 local function tradeOfferOnce(targetPlayer, giveList, receiveList)
     if not sendTrade(targetPlayer, giveList, receiveList) then
         return false
     end
-    return pollTradeConfirmWindow(45)
+    local rf = select(1, getTradeRemoteForOther(targetPlayer))
+    if rf and type(giveList) == "table" and #giveList > 0 then
+        tryAddTradeItemsViaRemote(rf, giveList)
+    end
+    return pollTradeConfirmWindow(45, targetPlayer)
 end
 
 local function tradeWithRetries(targetPlayer, giveList, receiveList)
@@ -504,10 +510,11 @@ local function tradeWithRetries(targetPlayer, giveList, receiveList)
 end
 
 local function doSuicideVolcano()
-    log("Суицид в лаве (координаты — заглушка; замени под свой сервер / биом)")
+    log("Суицид в лаве: " .. tostring(VOLCANO_X) .. "," .. tostring(VOLCANO_Y) .. "," .. tostring(VOLCANO_Z))
     pcall(function()
         if character and character:FindFirstChild("HumanoidRootPart") then
-            character.HumanoidRootPart.CFrame = CFrame.new(0, 20, 0)
+            character.HumanoidRootPart.CFrame = CFrame.new(VOLCANO_X, VOLCANO_Y, VOLCANO_Z)
+            wait(1.5)
         end
         if humanoid then
             humanoid.Health = 0
@@ -586,9 +593,292 @@ local function runFarmerStorageTransfer()
     end
 end
 
+local function requireSonar()
+    local mod = ReplicatedStorage:FindFirstChild("Sonar")
+    if not mod then
+        return nil
+    end
+    local ok, fn = pcall(function()
+        return require(mod)
+    end)
+    if ok then
+        return fn
+    end
+    return nil
+end
+
+local function alreadyInTradeRealm()
+    if game.PlaceId == TRADE_REALM_PLACE_ID or game.PlaceId == TRADE_REALM_PLACE_ID_TEST then
+        return true
+    end
+    local sonar = requireSonar()
+    if sonar then
+        local ok, constants = pcall(function()
+            return sonar("Constants")
+        end)
+        if ok and constants and constants.IsTradeRealm then
+            return true
+        end
+    end
+    return false
+end
+
+-- По снимкам CoS (.rbxlx): PlaceTeleportService → TeleportToRemote("ToPlaceType","Trade",{}) или ToPlaceId.
+local function tryCoSTeleportToTradeRealm()
+    local sonar = requireSonar()
+    if not sonar then
+        return false, "no Sonar module"
+    end
+    local ru = sonar("RemoteUtils")
+    if not ru or type(ru.GetRemoteFunction) ~= "function" then
+        return false, "no RemoteUtils"
+    end
+    local rf = ru.GetRemoteFunction("TeleportToRemote")
+    if not rf or type(rf.InvokeServer) ~= "function" then
+        return false, "no TeleportToRemote"
+    end
+    local ok, a, b = pcall(function()
+        return rf:InvokeServer("ToPlaceType", "Trade", {})
+    end)
+    if not ok then
+        return false, tostring(a)
+    end
+    if a == false then
+        ok, a, b = pcall(function()
+            return rf:InvokeServer("ToPlaceId", TRADE_REALM_PLACE_ID, {})
+        end)
+        if not ok then
+            return false, tostring(a)
+        end
+        if a == false then
+            return false, tostring(b)
+        end
+    end
+    wait(3)
+    return true, nil
+end
+
+-- CoS: парный TradeRemote «Name1-Name2TradeRemote» + TradeGui (см. .rbxlx)
+local function getRemoteUtilsFromSonar()
+    local s = requireSonar()
+    if not s then
+        return nil
+    end
+    local ok, ru = pcall(function()
+        return s("RemoteUtils")
+    end)
+    if ok then
+        return ru
+    end
+    return nil
+end
+
+local function getCoSRemoteEvent(name)
+    local ru = getRemoteUtilsFromSonar()
+    if not ru or type(ru.GetRemoteEvent) ~= "function" then
+        return nil
+    end
+    local ok, re = pcall(function()
+        return ru.GetRemoteEvent(name)
+    end)
+    if ok and re and typeof(re) == "Instance" then
+        return re
+    end
+    return nil
+end
+
+local function getTradeRemoteForPairNames(localName, otherName)
+    if not localName or not otherName then
+        return nil
+    end
+    local ru = getRemoteUtilsFromSonar()
+    if not ru or type(ru.GetRemoteFunction) ~= "function" then
+        return nil
+    end
+    local variants = {
+        localName .. "-" .. otherName .. "TradeRemote",
+        otherName .. "-" .. localName .. "TradeRemote",
+    }
+    for _, nm in ipairs(variants) do
+        local ok, rf = pcall(function()
+            return ru.GetRemoteFunction(nm)
+        end)
+        if ok and rf and typeof(rf) == "Instance" then
+            return rf, nm
+        end
+    end
+    return nil
+end
+
+local function getTradeRemoteForOther(otherPlayer)
+    if not otherPlayer then
+        return nil
+    end
+    return getTradeRemoteForPairNames(player.Name, otherPlayer.Name)
+end
+
+local function tradeRemoteInvoke(rf, action)
+    if not rf then
+        return false, "no remote"
+    end
+    local ok, a = pcall(function()
+        return rf:InvokeServer(action)
+    end)
+    if not ok then
+        return false, tostring(a)
+    end
+    return true, a
+end
+
+-- CoS TradeRemote: AddTradeItem с полем Overwrite (см. PlayerGui TradeGui в Trade Realm.rbxlx).
+local function tradeAddItemPayloadFromRow(row)
+    if type(row) ~= "table" then
+        return nil
+    end
+    local token = row.token
+    local amount = tonumber(row.amount) or 1
+    if type(token) ~= "string" or token == "" then
+        return nil
+    end
+    amount = math.max(1, math.floor(amount))
+    if string.lower(token) == "mushroom" then
+        return { ItemType = "Currency", Name = "Mushroom", Amount = amount, Overwrite = true }
+    end
+    return { ItemType = "Tokens", Name = token, Amount = amount, Overwrite = true }
+end
+
+local function tryAddTradeItemsViaRemote(rf, giveRows)
+    if not rf or type(giveRows) ~= "table" then
+        return false
+    end
+    local anyOk = false
+    for _, row in ipairs(giveRows) do
+        local payload = tradeAddItemPayloadFromRow(row)
+        if payload then
+            local ok, res = pcall(function()
+                return rf:InvokeServer("AddTradeItem", payload)
+            end)
+            log(
+                "AddTradeItem "
+                    .. tostring(payload.ItemType)
+                    .. "/"
+                    .. tostring(payload.Name)
+                    .. " x"
+                    .. tostring(payload.Amount)
+                    .. " pcall_ok="
+                    .. tostring(ok)
+                    .. " res="
+                    .. tostring(res)
+            )
+            if ok and res then
+                anyOk = true
+            end
+            wait(0.35)
+        end
+    end
+    return anyOk
+end
+
+local function findTradeGuiRoot()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then
+        return nil
+    end
+    local tg = pg:FindFirstChild("TradeGui")
+    if not tg then
+        return nil
+    end
+    return tg:FindFirstChild("ContainerFrame") or tg
+end
+
+local function readOpponentUsernameFromTradeGui(root)
+    if not root then
+        return nil
+    end
+    local theirs = root:FindFirstChild("Theirs", true)
+    if not theirs then
+        return nil
+    end
+    local tf = theirs:FindFirstChild("TradeFrame", true)
+    if not tf then
+        return nil
+    end
+    local disp = tf:FindFirstChild("DisplayNameLabel", true)
+    if not disp then
+        return nil
+    end
+    local ul = disp:FindFirstChild("UserNameLabel")
+    if ul and ul:IsA("TextLabel") then
+        local t = ul.Text
+        if type(t) == "string" and #t > 0 and t:sub(1, 1) == "@" then
+            return t:sub(2)
+        end
+        return t
+    end
+    return nil
+end
+
+local function findTradeAcceptButton(root)
+    if not root then
+        return nil
+    end
+    return root:FindFirstChild("AcceptButton", true)
+end
+
+-- Подтверждение: AcceptTrade через RemoteFunction, когда кнопка видима (CoS TradeGui).
+local function pollTradeConfirmWindow(maxSeconds, otherPlayer)
+    local t0 = tick()
+    maxSeconds = maxSeconds or 60
+    local fired = false
+    while tick() - t0 < maxSeconds do
+        if stopFlagExists() then
+            return false
+        end
+        local guiRoot = findTradeGuiRoot()
+        local acceptBtn = findTradeAcceptButton(guiRoot)
+        local oppName = readOpponentUsernameFromTradeGui(guiRoot)
+        local rf = nil
+        if otherPlayer then
+            rf = select(1, getTradeRemoteForOther(otherPlayer))
+        end
+        if not rf and oppName then
+            rf = select(1, getTradeRemoteForPairNames(player.Name, oppName))
+        end
+        if rf and acceptBtn and acceptBtn.Visible and acceptBtn.Active ~= false then
+            if not fired then
+                fired = true
+                local okInv, errInv = tradeRemoteInvoke(rf, "AcceptTrade")
+                log("AcceptTrade: ok=" .. tostring(okInv) .. " " .. tostring(errInv or ""))
+                wait(0.5)
+                if okInv then
+                    return true
+                end
+                fired = false
+            end
+        else
+            fired = false
+        end
+        wait(TRADE_CONFIRM_POLL_SECONDS)
+    end
+    return false
+end
+
 local function openTradeWorld()
     log("Opening trade world...")
+
+    if alreadyInTradeRealm() then
+        log("Уже в Trade Realm (PlaceId=" .. tostring(game.PlaceId) .. ")")
+        recordAccessSuccess()
+        return true
+    end
+
     local success = pcall(function()
+        local okTeleport, errTeleport = tryCoSTeleportToTradeRealm()
+        if okTeleport then
+            return
+        end
+        log("CoS TeleportToRemote не сработал: " .. tostring(errTeleport) .. " — fallback портал/GUI")
+
         local portal = workspace:FindFirstChild("TradePortal")
             or workspace:FindFirstChild("TradingPortal")
 
@@ -614,17 +904,98 @@ local function openTradeWorld()
     return success
 end
 
+local function playerOwnsMarketStallPart()
+    local folder = workspace:FindFirstChild("MarketStalls", true)
+    if not folder then
+        return false
+    end
+    for _, inst in ipairs(folder:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local o = inst:GetAttribute("Owner")
+            if o ~= nil and o ~= "" then
+                local n = tonumber(o)
+                if n and n == player.UserId then
+                    return true
+                end
+                if tostring(o) == tostring(player.UserId) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function findUnclaimedMarketStallRoot()
+    local folder = workspace:FindFirstChild("MarketStalls", true)
+    if not folder then
+        return nil
+    end
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    local best, bestD = nil, math.huge
+    for _, inst in ipairs(folder:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            local o = inst:GetAttribute("Owner")
+            local free = o == nil or o == "" or o == 0
+            if free and inst.Name ~= "Effect" then
+                if hrp then
+                    local d = (inst.Position - hrp.Position).Magnitude
+                    if d < bestD then
+                        bestD = d
+                        best = inst
+                    end
+                else
+                    return inst
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Trade Realm: RemoteUtils GetRemoteEvent("ClaimStall") / ListStallItem (см. MarketStallGui .rbxlx).
+local function tryClaimCoSMarketStall(maxTries)
+    if playerOwnsMarketStallPart() then
+        log("Market stall: уже есть стойка")
+        return true
+    end
+    local re = getCoSRemoteEvent("ClaimStall")
+    if not re then
+        log("Market stall: нет Remote ClaimStall (не Trade Realm / нет Sonar)")
+        return false
+    end
+    for t = 1, maxTries or 12 do
+        if stopFlagExists() then
+            return false
+        end
+        local root = findUnclaimedMarketStallRoot()
+        if root then
+            local ok = pcall(function()
+                re:FireServer(root)
+            end)
+            log("ClaimStall FireServer ok=" .. tostring(ok) .. " part=" .. tostring(root))
+            wait(1.5)
+            if playerOwnsMarketStallPart() then
+                return true
+            end
+        else
+            log("Market stall: свободных стоек не найдено (попытка " .. t .. ")")
+        end
+        wait(0.6)
+    end
+    return playerOwnsMarketStallPart()
+end
+
 local function placeStand()
-    log("Placing stand...")
-    
-    local success = pcall(function()
+    log("Стойка Trade Realm (CoS ClaimStall + legacy)...")
+    if tryClaimCoSMarketStall(12) then
+        return true
+    end
+    local legacyOk = pcall(function()
         local gui = player:WaitForChild("PlayerGui")
         local tradeGui = gui:FindFirstChild("TradeGui") or gui:FindFirstChild("Trading")
-        
         if tradeGui then
-            local placeBtn = tradeGui:FindFirstChild("PlaceStand") 
-                or tradeGui:FindFirstChild("SetupStand")
-            
+            local placeBtn = tradeGui:FindFirstChild("PlaceStand") or tradeGui:FindFirstChild("SetupStand")
             if placeBtn then
                 local pos = placeBtn.AbsolutePosition + (placeBtn.AbsoluteSize / 2)
                 VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
@@ -633,51 +1004,37 @@ local function placeStand()
                 wait(2)
             end
         end
-        
-        -- Альтернатива: через Remote
         local placeEvent = ReplicatedStorage:FindFirstChild("PlaceTradingStand")
         if placeEvent then
             placeEvent:FireServer()
             wait(2)
         end
     end)
-    
-    return success
+    return legacyOk
 end
 
 local function sellItem(token, price)
     log("Selling " .. token .. " for " .. tostring(price))
-    
-    local success = pcall(function()
-        local gui = player:WaitForChild("PlayerGui")
-        local tradeGui = gui:FindFirstChild("TradeGui") or gui:FindFirstChild("Trading")
-        
-        if tradeGui then
-            -- Ищем слот для выставления
-            local slots = {}
-            for _, child in pairs(tradeGui:GetDescendants()) do
-                if child.Name:find("Slot") or child.Name:find("Item") then
-                    table.insert(slots, child)
-                end
-            end
-            
-            -- Выбираем пустой слот
-            for _, slot in pairs(slots) do
-                -- Проверяем пустой ли
-                -- ...
-            end
+    local reList = getCoSRemoteEvent("ListStallItem")
+    if reList then
+        local amt = 1
+        local ok = pcall(function()
+            reList:FireServer(token, amt, price)
+        end)
+        log("ListStallItem token=" .. tostring(token) .. " price=" .. tostring(price) .. " pcall_ok=" .. tostring(ok))
+        if ok then
+            wait(0.4)
+            return true
         end
-        
-        -- Через Remote
+    end
+    local success = pcall(function()
         local sellEvent = ReplicatedStorage:FindFirstChild("SellItem")
         if sellEvent then
             sellEvent:FireServer(token, price)
             return true
         end
-        
         return false
     end)
-    
     return success
 end
 
@@ -892,12 +1249,89 @@ handlers.receive = function()
         return { ok = false, error = "receive только для role=storage" }
     end
     log("bound_farmers: " .. HttpService:JSONEncode(BOUND_FARMERS))
-    log("TODO: входящий трейд → whitelist → принять → 1 гриб → подтвердить после фермера")
-    return {
-        ok = true,
-        log = "receive stub — допиши TradeGui под CoS",
-        bound_farmers = BOUND_FARMERS,
-    }
+    log("Приём: whitelist → AddTradeItem (гриб x" .. tostring(STORAGE_GIVES) .. ") → AcceptTrade")
+    openTradeWorld()
+
+    local allowed = boundFarmerNameSet()
+    local declined = 0
+    local accepted = 0
+    local iter = 0
+
+    while true do
+        iter = iter + 1
+        if stopFlagExists() then
+            return {
+                ok = true,
+                log = "receive stopped by flag",
+                bound_farmers = BOUND_FARMERS,
+                declined = declined,
+                accepted = accepted,
+            }
+        end
+        if iter > 100000 then
+            return {
+                ok = true,
+                log = "receive loop safety break",
+                bound_farmers = BOUND_FARMERS,
+                declined = declined,
+                accepted = accepted,
+            }
+        end
+
+        if not alreadyInTradeRealm() then
+            tryCoSTeleportToTradeRealm()
+            wait(2)
+        end
+
+        local guiRoot = findTradeGuiRoot()
+        local uname = readOpponentUsernameFromTradeGui(guiRoot)
+        if guiRoot and uname then
+            local low = string.lower(tostring(uname))
+            local rf = select(1, getTradeRemoteForPairNames(player.Name, uname))
+            if not rf then
+                wait(TRADE_CONFIRM_POLL_SECONDS)
+            elseif not allowed[low] then
+                tradeRemoteInvoke(rf, "DeclineTrade")
+                log("DeclineTrade: не whitelist @" .. tostring(uname))
+                declined = declined + 1
+                while findTradeGuiRoot() do
+                    if stopFlagExists() then
+                        return {
+                            ok = true,
+                            log = "receive stopped by flag",
+                            bound_farmers = BOUND_FARMERS,
+                            declined = declined,
+                            accepted = accepted,
+                        }
+                    end
+                    wait(0.5)
+                end
+            else
+                local opp = findPlayerByName(uname)
+                tryAddTradeItemsViaRemote(rf, { { token = "Mushroom", amount = STORAGE_GIVES } })
+                if pollTradeConfirmWindow(120, opp) then
+                    accepted = accepted + 1
+                    while findTradeGuiRoot() do
+                        if stopFlagExists() then
+                            return {
+                                ok = true,
+                                log = "receive stopped by flag",
+                                bound_farmers = BOUND_FARMERS,
+                                declined = declined,
+                                accepted = accepted,
+                            }
+                        end
+                        wait(0.5)
+                    end
+                    wait(COOLDOWN_SECONDS)
+                else
+                    wait(TRADE_CONFIRM_POLL_SECONDS)
+                end
+            end
+        else
+            wait(TRADE_CONFIRM_POLL_SECONDS)
+        end
+    end
 end
 
 -- ПРОДАЖА (склад): приоритет — первые N токенов из списка контроллера, затем остальные; таймеры idle / anti-afk
@@ -905,7 +1339,6 @@ handlers.sell = function()
     log("SELL mode trade_session=" .. tostring(TRADE_SESSION_MODE) .. " bound_farmers=" .. tostring(#BOUND_FARMERS))
 
     openTradeWorld()
-    log("Случайная стойка: выбери видимый слот в GUI (TODO: placeStand под CoS)")
     placeStand()
 
     local inventory = getInventory()
@@ -995,7 +1428,7 @@ handlers.sell = function()
             end
         end
 
-        if not anySold and FALLBACK_MODE == "sell_all_when_priority_empty" then
+        if not anySold and FALLBACK_MODE == "sell_all_when_priority_empty" and not SELL_ONLY_PRIORITY then
             for token, count in pairs(inventory) do
                 if count > 0 and not table.find(PRIORITY_TOKENS, token) then
                     if trySellToken(token) then

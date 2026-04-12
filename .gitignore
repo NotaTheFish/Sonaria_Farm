@@ -1,3 +1,9 @@
+# Roblox files
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*.rbxlx.lock
+
 # Environment variables
 .env
 .envrc

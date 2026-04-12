@@ -85,12 +85,16 @@ def build_universal_script_params(
     - farmer_queue_index, farmer_queue_total, queue_stagger_seconds — очередь фермеров
     - transfer_token_priority / token_kinds — порядок токенов для передачи на склад
     - batch_size (150), trade_retry_seconds (10), trade_confirm_poll_seconds (2),
-      post_trade_cooldown_seconds (70)
+      post_trade_cooldown_seconds (70), storage_gives (1) — сколько грибов склад кладёт в трейд
+      через ``AddTradeItem`` (CoS TradeRemote) в ``receive``
     - farm_pipeline: ``missions_dp_only`` | ``missions_dp_then_transfer`` — после цели DP
     - default_creature_name (Kaluaka), volcano_suicide (bool)
     - sell_idle_rotate_seconds (3600), anti_afk_interval_seconds (300)
     - bound_farmers: [{ "id", "login" }, ...] для склада (receive / sell контекст)
+    - sell_only_priority_tokens (по умолчанию true в payload UNIVERSAL_SELL) — не продавать
+      токены вне ``priority_tokens``
     - dex_asset_path — по умолчанию в Lua ``Dex_roblox.rbxmx`` рядом с workspace эксплойта
+    - trade_realm_place_id, trade_realm_place_id_test — PlaceId Trade Realm (live/test) для Lua
     """
     base: dict[str, Any] = {
         "role": getattr(account, "role", None) or "farmer",
