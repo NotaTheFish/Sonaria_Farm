@@ -307,36 +307,83 @@ local function getInventory()
     end
 end
 
+-- CoS: экран слотов — CreatureInventoryGui, зелёная кнопка PlayButton (см. .rbxlx).
+local function tryClickCreaturePlayButton(creatureName)
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then
+        return false
+    end
+    creatureName = type(creatureName) == "string" and string.lower(creatureName) or ""
+    local function click(btn)
+        if not btn or not btn.Visible then
+            return false
+        end
+        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+        wait(0.08)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+        log("PlayButton click: " .. btn:GetFullName())
+        return true
+    end
+    local candidates = {}
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d.Name == "PlayButton" and (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+            table.insert(candidates, d)
+        end
+    end
+    if #candidates == 1 then
+        return click(candidates[1])
+    end
+    for _, btn in ipairs(candidates) do
+        local p = btn
+        for _ = 1, 18 do
+            if not p then
+                break
+            end
+            local blob = ""
+            for _, q in ipairs(p:GetDescendants()) do
+                if q:IsA("TextLabel") or q:IsA("TextButton") then
+                    blob = blob .. " " .. tostring(q.Text)
+                end
+            end
+            blob = string.lower(blob)
+            if creatureName == "" or string.find(blob, creatureName, 1, true) then
+                return click(btn)
+            end
+            p = p.Parent
+        end
+    end
+    return false
+end
+
 local function selectCreature(creatureName)
     log("Selecting creature: " .. creatureName)
     
     local success = pcall(function()
-        -- Ищем GUI выбора существ
         local gui = player:WaitForChild("PlayerGui")
-        local creatureSelect = gui:FindFirstChild("CreatureSelect") 
+        local creatureSelect = gui:FindFirstChild("CreatureInventoryGui")
+            or gui:FindFirstChild("CreatureSelect")
             or gui:FindFirstChild("SpawnGui")
             or gui:FindFirstChild("CharacterSelect")
+            or gui:FindFirstChild("CreatureSelection")
         
         if creatureSelect then
-            -- Ищем кнопку существа
             for _, btn in pairs(creatureSelect:GetDescendants()) do
                 if btn:IsA("TextButton") or btn:IsA("ImageButton") then
-                    local btnText = btn.Text or btn.Name
-                    if btnText:lower():find(creatureName:lower()) then
-                        -- Симулируем клик
+                    local btnText = (btn.Text or "") .. btn.Name
+                    if string.find(string.lower(btnText), string.lower(creatureName), 1, true) then
                         local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
                         VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
                         wait(0.1)
                         VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-                        log("Clicked creature button: " .. btn.Name)
-                        wait(1)
+                        log("Clicked creature UI: " .. btn.Name)
+                        wait(0.5)
                         return true
                     end
                 end
             end
         end
         
-        -- Альтернативный способ: через RemoteEvent
         local spawnEvent = ReplicatedStorage:FindFirstChild("SpawnCreature")
         if spawnEvent then
             spawnEvent:FireServer(creatureName)
@@ -527,7 +574,9 @@ end
 
 local function ensureDefaultCreatureAfterRespawn()
     log("Перезапуск существа (выбор): " .. DEFAULT_CREATURE)
+    tryClickCreaturePlayButton(DEFAULT_CREATURE)
     selectCreature(DEFAULT_CREATURE)
+    tryClickCreaturePlayButton(DEFAULT_CREATURE)
     wait(2)
 end
 
@@ -1046,14 +1095,19 @@ local handlers = {}
 handlers.farm = function()
     log("FARM pipeline=" .. tostring(FARM_PIPELINE) .. " target_dp=" .. tostring(TARGET_DP))
 
+    -- Главный экран слотов: сначала «Play», затем выбор имени (если нужно).
+    tryClickCreaturePlayButton(DEFAULT_CREATURE)
+    log("Стартовое существо: " .. DEFAULT_CREATURE)
+    selectCreature(DEFAULT_CREATURE)
+    tryClickCreaturePlayButton(DEFAULT_CREATURE)
+    wait(2)
+
     if not character or not humanoid or humanoid.Health <= 0 then
         character = player.Character or player.CharacterAdded:Wait()
         humanoid = character:WaitForChild("Humanoid")
     end
 
-    log("Стартовое существо: " .. DEFAULT_CREATURE)
-    selectCreature(DEFAULT_CREATURE)
-    wait(3)
+    wait(1)
 
     local cycles = 0
     

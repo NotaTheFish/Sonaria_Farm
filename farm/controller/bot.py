@@ -649,7 +649,12 @@ def build_router(config: Config) -> Router:
             farm_running = int(
                 await session.scalar(
                     select(func.count()).select_from(Task).where(
-                        Task.task_type == TaskType.START_FARM.value,
+                        Task.task_type.in_(
+                            (
+                                TaskType.START_FARM.value,
+                                TaskType.UNIVERSAL_FARM.value,
+                            )
+                        ),
                         Task.status == TaskStatus.RUNNING.value,
                     )
                 )
@@ -683,7 +688,7 @@ def build_router(config: Config) -> Router:
             f"pending={pending}, running={running}, done={done}, failed={failed}, cancelled={cancelled}\n\n"
             "По типам:\n"
             f"login_and_check pending={login_check_pending}\n"
-            f"start_farm running={farm_running}\n"
+            f"start_farm|universal_farm running={farm_running}\n"
             f"transfer_to_storage pending={transfer_pending}\n"
             f"set_sell_price pending={sell_pending}\n\n"
             f"Воркеры: alive={workers_alive}, total={workers_total}",
@@ -1413,7 +1418,17 @@ def build_router(config: Config) -> Router:
             )
             return
 
-        # Убираем дубль-команды: отменяем уже существующие start_farm задачи
+        async with AsyncSessionMaker() as session:
+            storages = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.STORAGE.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
+
+        # Убираем дубль-команды (legacy farm.lua не жмёт «Play» на слоте — используем универсальный скрипт).
         for farmer in farmers:
             await request_cancel_tasks(
                 task_type=TaskType.START_FARM.value,
@@ -1427,17 +1442,29 @@ def build_router(config: Config) -> Router:
             )
 
         created = 0
-        for farmer in farmers:
+        n = len(farmers)
+        for i, farmer in enumerate(farmers):
+            storage = storages[i % len(storages)] if storages else None
+            farm_payload: dict[str, Any] = {
+                "death_points_target": death_points_target,
+                "loop": True,
+                **_universal_farmer_runtime_payload(
+                    queue_index=i + 1,
+                    queue_total=n,
+                    storage=storage,
+                ),
+            }
             await create_task(
-                task_type=TaskType.START_FARM.value,
+                task_type=TaskType.UNIVERSAL_FARM.value,
                 priority=1000,
                 account_id=farmer.id,
-                payload={"death_points_target": death_points_target, "loop": True},
+                payload=farm_payload,
             )
             created += 1
 
         await message.answer(
-            f"Фарм включен: создано задач `Запустить фарм` = {created}.",
+            f"Фарм включён: создано задач универсального фарма (Kimi) = {created}. "
+            f"Классические задачи <code>start_farm</code> / <code>farm.lua</code> для этих аккаунтов отменены.",
             reply_markup=control_kb(),
         )
 
