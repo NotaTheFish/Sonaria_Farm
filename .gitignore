@@ -61,3 +61,15 @@ Thumbs.db
 
 # Локальный клиент моста / бинарники (раскомментируй при необходимости)
 # external/my_injector/
+
+# BUILD / RUNTIME (ВАЖНО)
+runtime/
+*.dll
+*.exe
+
+# GENERATED FILES
+runtime/inject_universal_wrap/
+
+# .NET build
+bin/
+obj/
