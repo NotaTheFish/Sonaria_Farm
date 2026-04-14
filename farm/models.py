@@ -41,6 +41,13 @@ class Account(Base):
         nullable=True,
     )
 
+    # Накопленные токены из death-reward циклов (JSON: {"token_name": count}).
+    earned_tokens_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    earned_tokens_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

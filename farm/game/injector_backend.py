@@ -18,6 +18,53 @@ from farm.game import injector_launcher as inj
 _BACKENDS = frozenset({"external_cli", "mock"})
 
 
+def _truthy_env(name: str, default: str = "1") -> bool:
+    v = (os.getenv(name) or default).strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _lua_long_bracket_string(s: str) -> str:
+    """Lua literal [=*[ ... ]=*] so JSON need not be escaped (pick delimiter that does not appear in s)."""
+    for level in range(0, 64):
+        pad = "=" * level
+        closer = "]" + pad + "]"
+        if closer not in s:
+            return "[" + pad + "[" + s + closer
+    raise ValueError("cannot build Lua long-string literal for params JSON")
+
+
+def materialize_universal_script_bundle(
+    *,
+    task_id: str,
+    source_path: Path,
+    params: dict[str, Any],
+) -> Path:
+    """
+    Пишет временный .lua: rawset(_G, '__SONARIA_PARAMS_JSON', [[json]]) + исходный скрипт.
+
+    Многие инжекторы/мосты выполняют файл как ``execute(whole_file)`` **без** передачи
+    JSON в ``...`` — тогда ``local args = {...}`` пустой и бот сразу выходил с
+    «No arguments provided», не доходя до main() и кликов по Play.
+    """
+    if not _truthy_env("INJECTOR_UNIVERSAL_EMBED_PARAMS", "1"):
+        return source_path.resolve()
+
+    json_str = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+    prelude = (
+        '-- sonaria_farm: embedded task params (see INJECTOR_UNIVERSAL_EMBED_PARAMS)\n'
+        "rawset(_G, '__SONARIA_PARAMS_JSON', "
+        + _lua_long_bracket_string(json_str)
+        + ")\n"
+    )
+    body = source_path.read_text(encoding="utf-8")
+    out_dir = inj.REPO_ROOT / "runtime" / "inject_universal_wrap"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in task_id)[:120] or "task"
+    out_path = out_dir / f"{safe_id}.lua"
+    out_path.write_text(prelude + body, encoding="utf-8")
+    return out_path.resolve()
+
+
 def backend_name() -> str:
     raw = (os.getenv("INJECTOR_BACKEND") or "external_cli").strip().lower()
     return raw if raw in _BACKENDS else "external_cli"

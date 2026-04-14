@@ -4,28 +4,46 @@
 -- Dex: положи Dex_roblox.rbxmx в рабочую папку эксплойта или задай dex_asset_path.
 -- Снимки плейсов (Remotes/GUI): external/sonaria_data/*.rbxl — бинарные, смотри README там и Studio.
 
+-- До любых GetService: иначе при сбое загрузки сервисов не видно, что чанк вообще выполнился.
+print("[universal_sonaria] bootstrap t0 (before GetService)")
+warn("[universal_sonaria] bootstrap t0 (warn, before GetService)")
+
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local GuiService = game:GetService("GuiService")
+print("[universal_sonaria] bootstrap services ok")
 
 -- ========== ПАРСИНГ ПАРАМЕТРОВ ==========
+-- Часть инжекторов вызывает чанк как loadstring(src)() **без** JSON в ``...`` — тогда
+-- воркер встраивает JSON в начало файла через rawset(_G, "__SONARIA_PARAMS_JSON", ...).
 local args = {...}
-local params = {}
+local params_json = args[1]
+if params_json == nil or params_json == "" then
+    params_json = rawget(_G, "__SONARIA_PARAMS_JSON")
+end
 
-if #args > 0 then
+local params = {}
+if type(params_json) == "string" and params_json ~= "" then
     local success, decoded = pcall(function()
-        return HttpService:JSONDecode(args[1])
+        return HttpService:JSONDecode(params_json)
     end)
     if success then
         params = decoded
+        rawset(_G, "__SONARIA_PARAMS_JSON", nil)
     else
         print("ERROR: Failed to decode params: " .. tostring(decoded))
         return
     end
 else
+    warn(
+        "[universal_sonaria] нет JSON параметров (ни ..., ни _G.__SONARIA_PARAMS_JSON). "
+            .. "Обнови воркер: нужен materialize universal script (INJECTOR_UNIVERSAL_EMBED_PARAMS=1) "
+            .. "или инжектор с передачей JSON первым аргументом чанка."
+    )
     print("ERROR: No arguments provided")
     return
 end
@@ -63,7 +81,7 @@ local TOKEN_KINDS = params.transfer_token_priority or params.token_kinds or DEFA
 
 local FARM_PIPELINE = params.farm_pipeline or "missions_dp_only"
 local DEFAULT_CREATURE = params.default_creature_name or "Kaluaka"
-local VOLCANO_SUICIDE = params.volcano_suicide == true or params.volcano_suicide == "1"
+local VOLCANO_SUICIDE = params.volcano_suicide == true or params.volcano_suicide == "1" or params.volcano_suicide == "true"
 local VOLCANO_X = tonumber(params.volcano_x) or 1973
 local VOLCANO_Y = tonumber(params.volcano_y) or 238
 local VOLCANO_Z = tonumber(params.volcano_z) or 1616
@@ -93,6 +111,7 @@ local TRADE_REALM_PLACE_ID_TEST = tonumber(params.trade_realm_place_id_test) or 
 
 local RESPONSE_FILE = params.response_file or nil
 local REQUEST_FILE = params.request_file or nil
+local TOKEN_REPORT_FILE = params.token_report_file or nil
 
 -- Счётчики (антиспам трейд / эвристика бана)
 local joinOrTradeFailStreak = 0
@@ -131,6 +150,19 @@ local function writeResponse(data)
     -- Также выводим в stdout для инжектора
     print("SONARIA_RESPONSE:" .. response)
     return response
+end
+
+local function writeTokenReport(tokensTable)
+    if not TOKEN_REPORT_FILE then return end
+    local writer = type(writefile) == "function" and writefile
+        or (type(syn) == "table" and type(syn.writefile) == "function" and syn.writefile)
+        or nil
+    if not writer then return end
+    pcall(function()
+        local data = HttpService:JSONEncode(tokensTable)
+        writer(TOKEN_REPORT_FILE, data)
+        log("Token report written to " .. TOKEN_REPORT_FILE)
+    end)
 end
 
 local function stopFlagExists()
@@ -245,27 +277,146 @@ end
 -- ========== ИГРОВЫЕ ФУНКЦИИ ==========
 
 local player = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
-local humanoid = character:WaitForChild("Humanoid")
+if not player then
+    local t0 = tick()
+    while not player and tick() - t0 < 30 do
+        RunService.Heartbeat:Wait()
+        player = Players.LocalPlayer
+    end
+end
+if not player then
+    warn("[universal_sonaria] LocalPlayer is nil after 30s; abort")
+    return
+end
+-- Нельзя ждать Character при загрузке модуля: на экране слотов персонажа нет — скрипт зависал
+-- до handlers.farm, и клики по Play никогда не выполнялись.
+local character = player.Character
+local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
-local function getCurrentDeathPoints()
-    local gui = player:FindFirstChild("PlayerGui")
-    if not gui then return 0 end
-    
-    local gameGui = gui:FindFirstChild("GameGUI") or gui:FindFirstChild("MainGui")
-    if gameGui then
-        -- Ищем различные варианты названий
-        local dpLabel = gameGui:FindFirstChild("DeathPoints") 
-            or gameGui:FindFirstChild("DP") 
-            or gameGui:FindFirstChild("DeathPointsLabel")
-        
-        if dpLabel and dpLabel:IsA("TextLabel") then
-            local text = dpLabel.Text
-            local dp = tonumber(text:match("%d+"))
-            return dp or 0
+local function refreshCharacterRefs()
+    character = player.Character
+    humanoid = character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function isCreatureAlive()
+    refreshCharacterRefs()
+    if not character then return false end
+    -- CoS stores health as a Model attribute "Health" (not Humanoid.Health)
+    local ok, hp = pcall(function() return character:GetAttribute("Health") end)
+    if ok and type(hp) == "number" then
+        return hp > 0
+    end
+    -- Fallback: check Humanoid if available
+    if humanoid then
+        return humanoid.Health > 0
+    end
+    -- Character exists but we can't determine health — assume alive
+    return true
+end
+
+-- DeathStatPoints formula (from game data — ReplicatedStorage/Storage/DeathStatPoints)
+local DEATH_STAT_MULTIPLIERS = {
+    TimePlayed         = function(v) return math.floor(v / 210) end,
+    MissionsCompleted  = function(v) return math.floor(v * 4)   end,
+    DistanceTravelled  = function(v) return math.floor(v * 0)   end,
+    DisastersSurvived  = function(v) return math.floor(v * 6)   end,
+    BiomesVisited      = function(v) return math.floor(v * 0)   end,
+    GrowCreatureTeen   = 5,
+    GrowCreatureAdult  = 10,
+    CreatureKillsT1    = 1,
+    CreatureKillsT2    = 2,
+    CreatureKillsT3    = 3,
+    CreatureKillsT4    = 5,
+    CreatureKillsT5    = 8,
+}
+
+local function calcDeathPointsFromStats(deathStatsFolder)
+    local total = 0
+    for statName, mult in pairs(DEATH_STAT_MULTIPLIERS) do
+        local child = deathStatsFolder:FindFirstChild(statName)
+        if child then
+            local raw = child.Value
+            if type(raw) == "number" then
+                if type(mult) == "function" then
+                    total = total + mult(raw)
+                else
+                    total = total + raw * mult
+                end
+            end
         end
     end
-    return 0
+    return total
+end
+
+local function getCurrentDeathPoints()
+    -- Method 1: _replicationFolder → player slot → DeathStats (most reliable)
+    local dpFromData = 0
+    local foundData = false
+    pcall(function()
+        local repFolder = ReplicatedStorage:FindFirstChild("_replicationFolder")
+        if not repFolder then return end
+        local playerFolder = repFolder:FindFirstChild(player.Name)
+            or repFolder:FindFirstChild(tostring(player.UserId))
+        if not playerFolder then return end
+        local targetLower = DEFAULT_CREATURE:lower()
+        for _, slot in ipairs(playerFolder:GetChildren()) do
+            local dino = slot:FindFirstChild("Dino")
+            if dino and dino:IsA("StringValue") and dino.Value:lower() == targetLower then
+                local hp = slot:FindFirstChild("Health")
+                if hp and type(hp.Value) == "number" and hp.Value > 0 then
+                    local ds = slot:FindFirstChild("DeathStats")
+                    if ds then
+                        dpFromData = calcDeathPointsFromStats(ds)
+                        foundData = true
+                        return
+                    end
+                end
+            end
+        end
+        -- Fallback: try any alive slot's DeathStats
+        for _, slot in ipairs(playerFolder:GetChildren()) do
+            local hp = slot:FindFirstChild("Health")
+            if hp and type(hp.Value) == "number" and hp.Value > 0 then
+                local ds = slot:FindFirstChild("DeathStats")
+                if ds then
+                    dpFromData = calcDeathPointsFromStats(ds)
+                    foundData = true
+                    return
+                end
+            end
+        end
+    end)
+    if foundData then return dpFromData end
+
+    -- Method 2: GUI — search PlayerGui for DeathPoints TextLabel
+    local dpFromGui = 0
+    pcall(function()
+        local gui = player:FindFirstChild("PlayerGui")
+        if not gui then return end
+        for _, desc in ipairs(gui:GetDescendants()) do
+            if desc.Name == "DeathPoints" and desc:IsA("Frame") then
+                for _, child in ipairs(desc:GetChildren()) do
+                    if child:IsA("TextLabel") then
+                        local t = child.Text:gsub(",", "")
+                        local n = tonumber(t:match("%d+"))
+                        if n and n > 0 then
+                            dpFromGui = n
+                            return
+                        end
+                    end
+                end
+            end
+            if desc.Name == "DeathPoints" and desc:IsA("TextLabel") then
+                local t = desc.Text:gsub(",", "")
+                local n = tonumber(t:match("%d+"))
+                if n then
+                    dpFromGui = n
+                    return
+                end
+            end
+        end
+    end)
+    return dpFromGui
 end
 
 local function getInventory()
@@ -307,6 +458,45 @@ local function getInventory()
     end
 end
 
+-- Anti-spam для экрана слотов: меньше кликов/логов и предсказуемая нагрузка.
+local PLAY_CLICK_INTERVAL = tonumber(params.play_click_interval_seconds) or 0.7
+local PLAY_LOG_INTERVAL = math.max(tonumber(params.play_log_interval_seconds) or 3, 2)
+local PLAY_CLICK_MAX_ATTEMPTS = tonumber(params.play_click_max_attempts) or 180
+local _playUiLastLogAt = 0
+local _playUiLastMsg = ""
+local _playUiSuppressed = 0
+local _playUiSlotMissLastAt = 0
+local _playUiSlotDumpLastAt = 0
+-- nil = ещё не было успешного restart; 0 нельзя — иначе tick()<2.5 даёт ложный «кулдаун» и restart не вызывается.
+local _deadRestartLastAt = nil
+local _deadRestartLogLastAt = nil
+local _deadRestartFailLogLastAt = nil
+local _promptDumpLastAt = nil
+local _selectedCardDumpDone = false
+local _playUiVerbose = tostring(params.play_ui_verbose or "0") == "1"
+local _playUiImportantByKey = {}
+local _slotFoundLoggedOnce = false
+
+local function playUiLog(msg)
+    if not _playUiVerbose then
+        return
+    end
+    local now = tick()
+    if msg == _playUiLastMsg and now - _playUiLastLogAt < PLAY_LOG_INTERVAL then
+        _playUiSuppressed = _playUiSuppressed + 1
+        return
+    end
+    if now - _playUiLastLogAt >= PLAY_LOG_INTERVAL or msg ~= _playUiLastMsg then
+        _playUiLastLogAt = now
+        if _playUiSuppressed > 0 and _playUiLastMsg ~= "" and msg ~= _playUiLastMsg then
+            log(_playUiLastMsg .. " (x" .. tostring(_playUiSuppressed + 1) .. ")")
+            _playUiSuppressed = 0
+        end
+        _playUiLastMsg = msg
+        log(msg)
+    end
+end
+
 -- CoS: экран слотов — CreatureInventoryGui, зелёная кнопка PlayButton (см. .rbxlx).
 local function tryClickCreaturePlayButton(creatureName)
     local pg = player:FindFirstChild("PlayerGui")
@@ -314,52 +504,1090 @@ local function tryClickCreaturePlayButton(creatureName)
         return false
     end
     creatureName = type(creatureName) == "string" and string.lower(creatureName) or ""
-    local function click(btn)
-        if not btn or not btn.Visible then
-            return false
-        end
-        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-        wait(0.08)
-        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-        log("PlayButton click: " .. btn:GetFullName())
-        return true
-    end
-    local candidates = {}
-    for _, d in ipairs(pg:GetDescendants()) do
-        if d.Name == "PlayButton" and (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-            table.insert(candidates, d)
+
+    local function playUiImportant(msg)
+        local now = tick()
+        local key = msg
+        local interval = 6
+        local lastAt = _playUiImportantByKey[key] or 0
+        if now - lastAt >= interval then
+            _playUiImportantByKey[key] = now
+            log(msg)
         end
     end
-    if #candidates == 1 then
-        return click(candidates[1])
-    end
-    for _, btn in ipairs(candidates) do
-        local p = btn
-        for _ = 1, 18 do
-            if not p then
-                break
-            end
-            local blob = ""
-            for _, q in ipairs(p:GetDescendants()) do
-                if q:IsA("TextLabel") or q:IsA("TextButton") then
-                    blob = blob .. " " .. tostring(q.Text)
+
+    local function isDevConsoleOpen()
+        local open = false
+        pcall(function()
+            local core = game:GetService("CoreGui")
+            for _, n in ipairs(core:GetDescendants()) do
+                if n:IsA("GuiObject") and n.Visible then
+                    local nm = string.lower(tostring(n.Name or ""))
+                    if string.find(nm, "devconsole", 1, true) or string.find(nm, "developerconsole", 1, true) then
+                        open = true
+                        break
+                    end
                 end
             end
-            blob = string.lower(blob)
-            if creatureName == "" or string.find(blob, creatureName, 1, true) then
-                return click(btn)
+        end)
+        return open
+    end
+
+    local function guiRectsOverlap(a, b)
+        if not a or not b or not a:IsA("GuiObject") or not b:IsA("GuiObject") then
+            return false
+        end
+        local ax, ay = a.AbsolutePosition.X, a.AbsolutePosition.Y
+        local aw, ah = a.AbsoluteSize.X, a.AbsoluteSize.Y
+        local bx, by = b.AbsolutePosition.X, b.AbsolutePosition.Y
+        local bw, bh = b.AbsoluteSize.X, b.AbsoluteSize.Y
+        return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+    end
+
+    local function clickGui(gui, label)
+        if not gui or not gui:IsA("GuiObject") or not gui.Visible then
+            return false
+        end
+        -- F9 overlay: при открытой консоли Roblox клики не должны уходить в GUI, иначе дёргается вкладка Memory.
+        if isDevConsoleOpen() then
+            return false
+        end
+        local pos = gui.AbsolutePosition + (gui.AbsoluteSize / 2)
+        local inset = GuiService:GetGuiInset()
+        local x, y = pos.X, pos.Y + inset.Y
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        wait(0.08)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        playUiLog((label or "GUI click") .. ": " .. gui:GetFullName() .. " screen=(" .. tostring(x) .. "," .. tostring(y) .. ")")
+        return true
+    end
+
+    local function clickGuiHard(gui, label, ignoreDevConsole)
+        if not gui or not gui:IsA("GuiObject") or not gui.Visible then
+            return false
+        end
+        if not ignoreDevConsole and isDevConsoleOpen() then
+            return false
+        end
+        local pos = gui.AbsolutePosition + (gui.AbsoluteSize / 2)
+        local inset = GuiService:GetGuiInset()
+        local baseX, baseY = pos.X, pos.Y + inset.Y
+        local offsets = {
+            { 0, 0 },
+            { 2, 0 },
+            { -2, 0 },
+            { 0, 2 },
+        }
+        local clicked = false
+        for _, off in ipairs(offsets) do
+            local x = baseX + off[1]
+            local y = baseY + off[2]
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+            clicked = true
+            wait(0.03)
+        end
+        playUiLog((label or "GUI hard click") .. ": " .. gui:GetFullName())
+        return clicked
+    end
+
+    local function pressActionButton(btn, label)
+        if not btn or not btn:IsA("GuiButton") or not btn.Visible then
+            return false
+        end
+        -- Не блокируем по F9: иначе Restart/Play не жмутся, пока открыт DevConsole (типичный просмотр логов).
+        -- CoS часто держит Restart/Delete с Visible=true, но Active=false — без Active VIM-клики не доходят.
+        local prevBtnActive, prevBtnSelectable = nil, nil
+        pcall(function()
+            prevBtnActive = btn.Active
+            prevBtnSelectable = btn.Selectable
+            btn.Active = true
+            btn.Selectable = true
+        end)
+        -- В CoS поверх action-кнопок есть UpperLabel с ZIndex выше; они могут быть и потомками, и соседями в ButtonsFrame.
+        local disabledOverlays = {}
+        for _, q in ipairs(btn:GetDescendants()) do
+            if
+                (q:IsA("ImageButton") or q:IsA("TextButton") or q:IsA("Frame"))
+                and q ~= btn
+                and q.Visible
+                and (string.lower(tostring(q.Name or "")) == "upperlabel" or tonumber(q.ZIndex) > tonumber(btn.ZIndex))
+            then
+                local prevActive = q.Active
+                local prevSelectable = q.Selectable
+                pcall(function()
+                    q.Active = false
+                    q.Selectable = false
+                end)
+                table.insert(disabledOverlays, { obj = q, active = prevActive, selectable = prevSelectable })
+            end
+        end
+        local par = btn.Parent
+        if par then
+            for _, sib in ipairs(par:GetChildren()) do
+                if sib ~= btn and sib:IsA("GuiObject") and sib.Visible and guiRectsOverlap(btn, sib) then
+                    local nm = string.lower(tostring(sib.Name or ""))
+                    if nm == "upperlabel" or tonumber(sib.ZIndex) > tonumber(btn.ZIndex) then
+                        local prevActive = sib.Active
+                        local prevSelectable = sib.Selectable
+                        pcall(function()
+                            sib.Active = false
+                            sib.Selectable = false
+                        end)
+                        table.insert(disabledOverlays, { obj = sib, active = prevActive, selectable = prevSelectable })
+                    end
+                end
+            end
+        end
+
+        local ok = false
+        local function fireConnList(sig)
+            if not sig or type(getconnections) ~= "function" then
+                return
+            end
+            local listOk, list = pcall(function()
+                return getconnections(sig)
+            end)
+            if not listOk then
+                return
+            end
+            if not list then
+                return
+            end
+            for _, conn in pairs(list) do
+                local fn = nil
+                pcall(function()
+                    fn = conn and conn.Function
+                end)
+                if type(fn) ~= "function" and type(conn) == "table" then
+                    fn = rawget(conn, "Function")
+                end
+                if type(fn) == "function" then
+                    pcall(fn)
+                    ok = true
+                end
+            end
+        end
+        -- 1) Обход подписчиков (часто срабатывает надёжнее firesignal для GuiButton)
+        pcall(function()
+            fireConnList(btn.MouseButton1Click)
+        end)
+        pcall(function()
+            fireConnList(btn.MouseButton1Down)
+        end)
+        pcall(function()
+            fireConnList(btn.Activated)
+        end)
+        -- 2) Прямые UI-сигналы эксплойта
+        pcall(function()
+            if type(firesignal) == "function" and btn.MouseButton1Click then
+                firesignal(btn.MouseButton1Click)
+                ok = true
+            end
+        end)
+        pcall(function()
+            if type(firesignal) == "function" and btn.Activated then
+                firesignal(btn.Activated)
+                ok = true
+            end
+        end)
+        -- 3) Нативная активация GuiButton
+        pcall(function()
+            btn:Activate()
+            ok = true
+        end)
+        -- 4) VIM (VirtualInputManager) — отправляет events внутри процесса Roblox, без глобальных кликов мыши
+        if clickGuiHard(btn, label, true) then
+            ok = true
+        end
+
+        for _, rec in ipairs(disabledOverlays) do
+            pcall(function()
+                rec.obj.Active = rec.active
+                rec.obj.Selectable = rec.selectable
+            end)
+        end
+        pcall(function()
+            btn.Active = prevBtnActive
+            btn.Selectable = prevBtnSelectable
+        end)
+        return ok
+    end
+
+    -- Путь из rbxlx: чаще InnerFrame.CreatureFrame.ButtonsFrame; в живом клиенте панель иногда сидит на InnerFrame (сосед CreatureFrame).
+    local function findCreatureButtonsFrame(root)
+        if not root then
+            return nil
+        end
+        local bf = root:FindFirstChild("ButtonsFrame")
+            or root:FindFirstChild("ButtonFrame")
+            or root:FindFirstChild("Button")
+        if bf then
+            return bf
+        end
+        for _, ch in ipairs(root:GetChildren()) do
+            bf = ch:FindFirstChild("ButtonsFrame")
+                or ch:FindFirstChild("ButtonFrame")
+                or ch:FindFirstChild("Button")
+            if bf then
+                return bf
+            end
+        end
+        return nil
+    end
+
+    -- selectedCard может быть слотом «1», либо уже Instance CreatureFrame (см. findSlotCard).
+    local function resolveCreatureFrame(slotCardHint)
+        if not slotCardHint then
+            return nil
+        end
+        if slotCardHint.Name == "CreatureFrame" and slotCardHint:IsA("GuiObject") then
+            return slotCardHint
+        end
+        local inner = slotCardHint:FindFirstChild("InnerFrame")
+        if inner then
+            local cf = inner:FindFirstChild("CreatureFrame")
+            if cf and cf:IsA("GuiObject") then
+                return cf
+            end
+        end
+        return nil
+    end
+
+    local function findButtonsContainerForSlotHint(slotCardHint)
+        local creatureFrame = resolveCreatureFrame(slotCardHint)
+        local bf = findCreatureButtonsFrame(creatureFrame)
+        if bf then
+            return bf, creatureFrame
+        end
+        local par = creatureFrame and creatureFrame.Parent
+        if par and par:IsA("GuiObject") then
+            bf = findCreatureButtonsFrame(par)
+            if bf then
+                return bf, creatureFrame
+            end
+        end
+        return nil, creatureFrame
+    end
+
+    local function findSlotsFrame()
+        local best = nil
+        local bestArea = -1
+        for _, d in ipairs(pg:GetDescendants()) do
+            if
+                d:IsA("GuiObject")
+                and d.Visible
+                and (d.Name == "SlotsFrame" or d.Name == "AllSlotsFrame")
+                and d.AbsoluteSize.X > 100
+                and d.AbsoluteSize.Y > 100
+            then
+                local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+                if area > bestArea then
+                    bestArea = area
+                    best = d
+                end
+            end
+        end
+        return best
+    end
+
+    local function containsLower(hay, needle)
+        return needle ~= "" and hay ~= "" and string.find(hay, needle, 1, true) ~= nil
+    end
+
+    local function findNameNode(slotsFrame, creatureLower)
+        if creatureLower == "" then
+            return nil
+        end
+        local roots = {}
+        if slotsFrame then
+            roots[1] = slotsFrame
+        else
+            roots[1] = pg
+        end
+        for _, root in ipairs(roots) do
+            for _, node in ipairs(root:GetDescendants()) do
+                if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+                    if node.Visible and node.AbsoluteSize.X > 1 and node.AbsoluteSize.Y > 1 then
+                        local txt = string.lower(tostring(node.Text or ""))
+                        if containsLower(txt, creatureLower) then
+                            return node
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function findNameNodeNearPlayButton(creatureLower)
+        if creatureLower == "" then
+            return nil
+        end
+        for _, node in ipairs(pg:GetDescendants()) do
+            if node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox") then
+                if node.Visible and node.AbsoluteSize.X > 1 and node.AbsoluteSize.Y > 1 then
+                    local txt = string.lower(tostring(node.Text or ""))
+                    if containsLower(txt, creatureLower) then
+                        local p = node
+                        for _ = 1, 16 do
+                            if not p then
+                                break
+                            end
+                            if p:IsA("GuiObject") then
+                                for _, q in ipairs(p:GetDescendants()) do
+                                    if q:IsA("GuiButton") and q.Visible and q.Active ~= false then
+                                        local nm = string.lower(tostring(q.Name or ""))
+                                        if nm == "playbutton" or containsLower(nm, "play") then
+                                            return node
+                                        end
+                                    end
+                                end
+                            end
+                            p = p.Parent
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function findSlotCard(node, slotsFrame)
+        local p = node
+        for _ = 1, 20 do
+            if not p or p == slotsFrame or not p.Parent then
+                break
+            end
+            if p:IsA("GuiObject") and p.Parent == slotsFrame then
+                return p
+            end
+            if p:IsA("GuiObject") and (p.Name == "Default" or p.Name == "CreatureFrame") then
+                return p
             end
             p = p.Parent
         end
+        return nil
     end
+
+    local function findPlayButtons()
+        local out = {}
+        for _, d in ipairs(pg:GetDescendants()) do
+            local nm = string.lower(tostring(d.Name or ""))
+            local tx = ""
+            if d:IsA("TextButton") then
+                tx = string.lower(tostring(d.Text or ""))
+            end
+            if
+                d:IsA("GuiButton")
+                and d.Visible
+                and d.Active ~= false
+                and d.AbsoluteSize.X > 2
+                and d.AbsoluteSize.Y > 2
+                and (nm == "playbutton" or tx == "play")
+            then
+                table.insert(out, d)
+            end
+        end
+        return out
+    end
+
+    local function findButtonNearNode(node, buttons)
+        if not node then
+            return nil
+        end
+        local center = node.AbsolutePosition + (node.AbsoluteSize / 2)
+        local best = nil
+        local bestDist = math.huge
+        for _, btn in ipairs(buttons) do
+            local bcenter = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+            local dx = bcenter.X - center.X
+            local dy = bcenter.Y - center.Y
+            local dist = (dx * dx) + (dy * dy)
+            if dist < bestDist then
+                bestDist = dist
+                best = btn
+            end
+        end
+        return best
+    end
+
+    local function buttonHasToken(btn, token)
+        if not btn or not btn:IsA("GuiButton") then
+            return false
+        end
+        local nm = string.lower(tostring(btn.Name or ""))
+        local tx = ""
+        if btn:IsA("TextButton") then
+            tx = string.lower(tostring(btn.Text or ""))
+        end
+        if containsLower(nm, token) or containsLower(tx, token) then
+            return true
+        end
+        for _, q in ipairs(btn:GetDescendants()) do
+            if q:IsA("TextLabel") or q:IsA("TextButton") or q:IsA("TextBox") then
+                local t = string.lower(tostring(q.Text or ""))
+                if containsLower(t, token) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function isStrictPlayButton(btn)
+        if not btn or not btn:IsA("GuiButton") then
+            return false
+        end
+        local nm = string.lower(tostring(btn.Name or ""))
+        if nm == "playbutton" then
+            return true
+        end
+        if btn:IsA("TextButton") then
+            local tx = string.lower(tostring(btn.Text or ""))
+            if tx == "play" then
+                return true
+            end
+        end
+        for _, q in ipairs(btn:GetDescendants()) do
+            if q:IsA("TextLabel") or q:IsA("TextButton") or q:IsA("TextBox") then
+                local t = string.lower(tostring(q.Text or ""))
+                if t == "play" then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    -- Для Play оставляем Active-фильтр; Restart/Revive в CoS часто Visible=true при Active=false.
+    local function isAncestryVisible(gui)
+        local node = gui
+        while node and node:IsA("GuiObject") do
+            if not node.Visible then
+                return false
+            end
+            node = node.Parent
+        end
+        return true
+    end
+
+    local function actionButtonMatches(btn, token, allowInactive)
+        if not btn or not btn:IsA("GuiButton") or not btn.Visible then
+            return false
+        end
+        if not isAncestryVisible(btn) then
+            return false
+        end
+        if btn.AbsoluteSize.X <= 2 or btn.AbsoluteSize.Y <= 2 then
+            return false
+        end
+        if not allowInactive and btn.Active == false then
+            return false
+        end
+        if token == "play" then
+            return isStrictPlayButton(btn)
+        end
+        return buttonHasToken(btn, token)
+    end
+
+    local function findButtonsByToken(token)
+        local out = {}
+        for _, d in ipairs(pg:GetDescendants()) do
+            if
+                d:IsA("GuiButton")
+                and d.Visible
+                and isAncestryVisible(d)
+                and d.Active ~= false
+                and d.AbsoluteSize.X > 2
+                and d.AbsoluteSize.Y > 2
+                and buttonHasToken(d, token)
+            then
+                table.insert(out, d)
+            end
+        end
+        return out
+    end
+
+    local function findRestartButtonIn(root)
+        if not root or type(root.GetDescendants) ~= "function" then
+            return nil
+        end
+        for _, q in ipairs(root:GetDescendants()) do
+            if q:IsA("GuiButton") and q.Visible and q.AbsoluteSize.X > 2 and q.AbsoluteSize.Y > 2 and buttonHasToken(q, "restart") then
+                return q
+            end
+        end
+        return nil
+    end
+
+    local function tryClickRunButtonInPrompt(promptFrame, matchedName)
+        local runBtn = promptFrame:FindFirstChild("RunButton", true)
+        if not runBtn then
+            log("Restart prompt '" .. matchedName .. "' found but no RunButton inside")
+            return false
+        end
+
+        local clickTarget = nil
+        if runBtn:IsA("GuiButton") then
+            clickTarget = runBtn
+        else
+            clickTarget = runBtn:FindFirstChild("UpperLabel")
+            if not clickTarget then
+                for _, d in ipairs(runBtn:GetDescendants()) do
+                    if d:IsA("GuiButton") and d.Visible then
+                        clickTarget = d
+                        break
+                    end
+                end
+            end
+        end
+
+        if clickTarget and clickTarget:IsA("GuiButton") then
+            log("Restart prompt '" .. matchedName .. "': clicking " .. tostring(clickTarget.Name))
+            pressActionButton(clickTarget, "Restart confirm")
+            local ul = clickTarget:FindFirstChild("UpperLabel")
+            if ul and ul:IsA("GuiButton") then
+                pressActionButton(ul, "Restart confirm (UpperLabel)")
+            end
+            return true
+        end
+
+        log("Restart prompt '" .. matchedName .. "' no clickable RunButton target")
+        return false
+    end
+
+    -- CoS: после клика RestartButton открывается модалка PromptGui > PromptFrame > PromptFrames > RestartCreature(NoMutations).
+    -- Внутри: RunButton (ImageButton) → UpperLabel (ImageButton) — подтверждение рестарта.
+    local function tryConfirmRestartPrompt()
+        -- Путь 1: PromptGui > PromptFrame > PromptFrames (основной путь в CoS)
+        local promptFramesContainer = nil
+        pcall(function()
+            local promptGui = pg:FindFirstChild("PromptGui")
+            if promptGui then
+                local pf = promptGui:FindFirstChild("PromptFrame")
+                if pf then
+                    promptFramesContainer = pf:FindFirstChild("PromptFrames") or pf
+                end
+            end
+        end)
+
+        -- Путь 2: NotificationsGui > NotificationFrame (запасной)
+        local notifFrameContainer = nil
+        pcall(function()
+            local notifGui = pg:FindFirstChild("NotificationsGui")
+            if notifGui then
+                notifFrameContainer = notifGui:FindFirstChild("NotificationFrame")
+            end
+        end)
+
+        local containers = {}
+        if promptFramesContainer then table.insert(containers, { frame = promptFramesContainer, name = "PromptFrames" }) end
+        if notifFrameContainer then table.insert(containers, { frame = notifFrameContainer, name = "NotificationFrame" }) end
+
+        local promptNames = { "RestartCreature", "RestartCreatureNoMutations" }
+
+        for _, cont in ipairs(containers) do
+            local container = cont.frame
+
+            -- Поиск по точному имени
+            for _, pName in ipairs(promptNames) do
+                local f = container:FindFirstChild(pName)
+                if f and f:IsA("GuiObject") and f.Visible then
+                    return tryClickRunButtonInPrompt(f, pName)
+                end
+            end
+
+            -- Fallback: видимый фрейм с "restart" в имени
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    local nm = string.lower(tostring(child.Name or ""))
+                    if string.find(nm, "restart", 1, true) then
+                        return tryClickRunButtonInPrompt(child, child.Name)
+                    end
+                end
+            end
+
+            -- Fallback 2: видимый фрейм с RunButton
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible and child:FindFirstChild("RunButton", true) then
+                    return tryClickRunButtonInPrompt(child, child.Name .. "(hasRunBtn)")
+                end
+            end
+        end
+
+        -- Диагностика: дамп контейнеров
+        if _promptDumpLastAt == nil or (tick() - _promptDumpLastAt) >= 5 then
+            _promptDumpLastAt = tick()
+            for _, cont in ipairs(containers) do
+                local parts = {}
+                pcall(function()
+                    for _, child in ipairs(cont.frame:GetChildren()) do
+                        local vis = "?"
+                        pcall(function() vis = tostring(child.Visible) end)
+                        table.insert(parts, child.Name .. "(" .. child.ClassName .. ",vis=" .. vis .. ")")
+                    end
+                end)
+                if #parts > 0 then
+                    log(cont.name .. " children: " .. table.concat(parts, " | "))
+                end
+            end
+        end
+        return false
+    end
+
+    -- Прямой вызов RestartSlotRemote через Sonar — надёжный fallback, не зависит от GUI.
+    local function tryRestartSlotViaRemote(targetCreatureName, slotCardHint)
+        local sonar = nil
+        pcall(function()
+            sonar = require(ReplicatedStorage:FindFirstChild("Sonar"))
+        end)
+        if not sonar then
+            return false, "no Sonar"
+        end
+        local ru = nil
+        pcall(function()
+            ru = sonar("RemoteUtils")
+        end)
+        if not ru or type(ru.GetRemoteFunction) ~= "function" then
+            return false, "no RemoteUtils"
+        end
+        local rf = nil
+        pcall(function()
+            rf = ru.GetRemoteFunction("RestartSlotRemote")
+        end)
+        if not rf or type(rf.InvokeServer) ~= "function" then
+            return false, "no RestartSlotRemote"
+        end
+
+        local targetLower = string.lower(targetCreatureName or "")
+        local candidates = {}
+        local seen = {}
+
+        local function addCandidate(name, source)
+            if name and not seen[name] then
+                seen[name] = true
+                table.insert(candidates, { name = name, source = source })
+            end
+        end
+
+        -- Способ 1: сканировать _replicationFolder для мёртвого существа по Dino/Health
+        if targetLower ~= "" then
+            pcall(function()
+                local repFolder = ReplicatedStorage:FindFirstChild("_replicationFolder")
+                if repFolder then
+                    for _, desc in ipairs(repFolder:GetDescendants()) do
+                        if desc.Name == "Dino" and desc:IsA("StringValue") then
+                            local dinoLower = string.lower(tostring(desc.Value or ""))
+                            if dinoLower == targetLower or string.find(dinoLower, targetLower, 1, true) then
+                                local parent = desc.Parent
+                                if parent then
+                                    local health = parent:FindFirstChild("Health")
+                                    if health and type(health.Value) == "number" and health.Value <= 0 then
+                                        addCandidate(parent.Name, "_replicationFolder")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        -- Способ 2: данные существ в player.Data / player.PlayerData / ReplicatedStorage.{playerName}
+        if targetLower ~= "" and #candidates == 0 then
+            local searchRoots = {}
+            pcall(function()
+                local pd = player:FindFirstChild("Data") or player:FindFirstChild("PlayerData")
+                if pd then
+                    table.insert(searchRoots, pd)
+                end
+            end)
+            pcall(function()
+                local repFolder = ReplicatedStorage:FindFirstChild("_replicationFolder")
+                if repFolder then
+                    local pf = repFolder:FindFirstChild(player.Name) or repFolder:FindFirstChild(tostring(player.UserId))
+                    if pf then
+                        table.insert(searchRoots, pf)
+                    end
+                end
+            end)
+            for _, root in ipairs(searchRoots) do
+                pcall(function()
+                    for _, desc in ipairs(root:GetDescendants()) do
+                        if desc.Name == "Dino" and desc:IsA("StringValue") then
+                            local dinoLower = string.lower(tostring(desc.Value or ""))
+                            if dinoLower == targetLower or string.find(dinoLower, targetLower, 1, true) then
+                                local parent = desc.Parent
+                                if parent then
+                                    local health = parent:FindFirstChild("Health")
+                                    if health and type(health.Value) == "number" and health.Value <= 0 then
+                                        addCandidate(parent.Name, "playerData")
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+
+        -- Способ 3: извлечь номер слота из GUI — SlotsFrame.{N}.InnerFrame.CreatureFrame
+        if slotCardHint then
+            pcall(function()
+                local p = slotCardHint
+                for _ = 1, 10 do
+                    if not p or not p.Parent then
+                        break
+                    end
+                    local parName = p.Parent and p.Parent.Name or ""
+                    if parName == "SlotsFrame" or parName == "AllSlotsFrame" then
+                        addCandidate(p.Name, "GUI")
+                        break
+                    end
+                    p = p.Parent
+                end
+            end)
+        end
+
+        if #candidates == 0 then
+            return false, "dead slot not found for " .. tostring(targetCreatureName)
+        end
+
+        -- Пробуем каждый кандидат пока один не сработает.
+        for _, cand in ipairs(candidates) do
+            local ok, res = pcall(function()
+                return rf:InvokeServer(cand.name, false)
+            end)
+            log("RestartSlotRemote: slot=" .. tostring(cand.name) .. " source=" .. cand.source .. " pcall_ok=" .. tostring(ok) .. " res=" .. tostring(res))
+            if ok and res then
+                return true
+            end
+            wait(0.3)
+        end
+        return false, "InvokeServer failed for all " .. #candidates .. " candidates"
+    end
+
+    local function findActionButtonInCard(slotCardHint, token)
+        if not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
+            return nil
+        end
+        local allowInactive = token == "restart" or token == "revive"
+        local buttonFrame = select(1, findButtonsContainerForSlotHint(slotCardHint))
+        if buttonFrame then
+            local preferred = nil
+            if token == "play" then
+                preferred = buttonFrame:FindFirstChild("PlayButton")
+            elseif token == "restart" then
+                preferred = buttonFrame:FindFirstChild("RestartButton")
+            elseif token == "revive" then
+                preferred = buttonFrame:FindFirstChild("ReviveButton")
+            end
+            if preferred and preferred:IsA("GuiButton") and actionButtonMatches(preferred, token, allowInactive) then
+                return preferred
+            end
+            for _, q in ipairs(buttonFrame:GetDescendants()) do
+                if q:IsA("GuiButton") and actionButtonMatches(q, token, allowInactive) then
+                    return q
+                end
+            end
+            -- Для Play не уходим в глобальные fallback-поиски:
+            -- иначе можно схватить чужую кнопку Play из соседнего UI и пропустить restart-ветку.
+            if token == "play" then
+                return nil
+            end
+        end
+
+        local candidates = {}
+        local function considerRoot(root)
+            if not root or type(root.GetDescendants) ~= "function" then
+                return
+            end
+            for _, q in ipairs(root:GetDescendants()) do
+                if q:IsA("GuiButton") and actionButtonMatches(q, token, allowInactive) then
+                    table.insert(candidates, q)
+                end
+            end
+        end
+        considerRoot(slotCardHint)
+        if slotCardHint:IsA("GuiObject") and slotCardHint.Parent then
+            considerRoot(slotCardHint.Parent)
+        end
+        if #candidates == 0 then
+            return nil
+        end
+        if #candidates == 1 then
+            return candidates[1]
+        end
+        local center = slotCardHint.AbsolutePosition + (slotCardHint.AbsoluteSize / 2)
+        local best = candidates[1]
+        local bestDist = math.huge
+        for _, btn in ipairs(candidates) do
+            local bcenter = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+            local dx = bcenter.X - center.X
+            local dy = bcenter.Y - center.Y
+            local dist = (dx * dx) + (dy * dy)
+            if dist < bestDist then
+                bestDist = dist
+                best = btn
+            end
+        end
+        return best
+    end
+
+    local function tryCloseDevConsole()
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("DevConsoleVisible", false)
+        end)
+    end
+
+    local function tryHandleDeadCreature(slotCardHint, slotSelected)
+        if not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
+            return false
+        end
+        local now = tick()
+        if _deadRestartLastAt ~= nil and (now - _deadRestartLastAt) < 2.5 then
+            return true
+        end
+
+        log("DEAD restart: entering tryHandleDeadCreature")
+
+        -- DevConsole перехватывает VIM-клики — закрываем, если открыта.
+        if isDevConsoleOpen() then
+            log("DEAD restart: DevConsole is OPEN, closing before click attempt")
+            tryCloseDevConsole()
+            wait(0.15)
+        end
+
+        -- Шаг 1: если модалка подтверждения уже открыта — жмём RunButton в ней.
+        local promptConfirmed = tryConfirmRestartPrompt()
+        if promptConfirmed then
+            _deadRestartLastAt = now
+            log("DEAD creature: restart CONFIRMED (prompt already open)")
+            wait(1.5)
+            return true
+        end
+
+        -- Шаг 2: жмём RestartButton в карточке слота → откроется модалка подтверждения.
+        local slotRestart = findActionButtonInCard(slotCardHint, "restart")
+        if not slotRestart then
+            if _deadRestartFailLogLastAt == nil or (now - _deadRestartFailLogLastAt) >= 8 then
+                _deadRestartFailLogLastAt = now
+                log("DEAD restart: no RestartButton found in card")
+            end
+            return false
+        end
+
+        local rp = "?"
+        pcall(function()
+            rp = slotRestart:GetFullName()
+        end)
+        log(
+            "DEAD restart: clicking RestartButton "
+                .. tostring(rp)
+                .. " vis="
+                .. tostring(slotRestart.Visible)
+                .. " act="
+                .. tostring(slotRestart.Active)
+        )
+
+        -- Кликаем RestartButton и его UpperLabel (в CoS обработчик часто на UpperLabel, а не на самом RestartButton).
+        pressActionButton(slotRestart, "Dead creature restart (slot)")
+        local upperBtn = slotRestart:FindFirstChild("UpperLabel")
+        if upperBtn and upperBtn:IsA("GuiButton") then
+            log("DEAD restart: also clicking UpperLabel inside RestartButton")
+            pressActionButton(upperBtn, "Dead creature restart (UpperLabel)")
+        end
+
+        wait(0.4)
+
+        -- Шаг 3: ждём модалку подтверждения и жмём RunButton.
+        for attempt = 1, 12 do
+            local confirmed = tryConfirmRestartPrompt()
+            if confirmed then
+                _deadRestartLastAt = now
+                log("DEAD creature: restart CONFIRMED via prompt (attempt " .. attempt .. ")")
+                wait(1.5)
+                return true
+            end
+            
+            wait(0.3)
+        end
+
+        log("DEAD restart: prompt not found after click -> will retry next cycle")
+        return false
+    end
+
+    local function dumpSelectedCardOnce(slotCardHint)
+        if _selectedCardDumpDone or not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
+            return
+        end
+        _selectedCardDumpDone = true
+        local rootPath = "?"
+        pcall(function()
+            rootPath = slotCardHint:GetFullName()
+        end)
+        local bf = select(1, findButtonsContainerForSlotHint(slotCardHint))
+        local function btnState(name)
+            local b = bf and bf:FindFirstChild(name)
+            if b and b:IsA("GuiButton") then
+                return tostring(b.ClassName)
+                    .. " vis="
+                    .. tostring(b.Visible)
+                    .. " act="
+                    .. tostring(b.Active)
+                    .. " z="
+                    .. tostring(b.ZIndex)
+            end
+            return "missing"
+        end
+        if _playUiVerbose then
+            log("[slotdump] selectedCard=" .. tostring(rootPath))
+            log("[slotdump] rbx Play=" .. btnState("PlayButton") .. " Restart=" .. btnState("RestartButton"))
+            local shown = 0
+            local dumpRoots = { slotCardHint }
+            if slotCardHint:IsA("GuiObject") and slotCardHint.Parent then
+                table.insert(dumpRoots, slotCardHint.Parent)
+            end
+            for _, dr in ipairs(dumpRoots) do
+                for _, q in ipairs(dr:GetDescendants()) do
+                    if q:IsA("GuiButton") then
+                        local qPath = "?"
+                        pcall(function()
+                            qPath = q:GetFullName()
+                        end)
+                        local txt = ""
+                        if q:IsA("TextButton") then
+                            txt = tostring(q.Text or "")
+                        end
+                        log(
+                            "[slotdump] btn "
+                                .. tostring(shown + 1)
+                                .. ": class="
+                                .. q.ClassName
+                                .. " name="
+                                .. tostring(q.Name)
+                                .. " text="
+                                .. tostring(txt)
+                                .. " visible="
+                                .. tostring(q.Visible)
+                                .. " active="
+                                .. tostring(q.Active)
+                                .. " z="
+                                .. tostring(q.ZIndex)
+                                .. " path="
+                                .. tostring(qPath)
+                        )
+                        shown = shown + 1
+                        if shown >= 12 then
+                            break
+                        end
+                    end
+                end
+                if shown >= 12 then
+                    break
+                end
+            end
+            if shown == 0 then
+                log("[slotdump] no GuiButton descendants in selectedCard")
+            end
+        else
+            log(
+                "[slotdump] "
+                    .. tostring(rootPath)
+                    .. " | ButtonsFrame="
+                    .. tostring(bf and bf.Name or "nil")
+                    .. " | Play="
+                    .. btnState("PlayButton")
+                    .. " | Restart="
+                    .. btnState("RestartButton")
+                    .. " (play_ui_verbose=1 для полного дампа)"
+            )
+        end
+    end
+
+    local selectedNode = nil
+    local selectedCard = nil
+    local slotSelected = false
+    if creatureName ~= "" then
+        local slotsFrame = findSlotsFrame()
+        local nameNode = findNameNode(slotsFrame, creatureName)
+        if not nameNode then
+            nameNode = findNameNodeNearPlayButton(creatureName)
+        end
+        if nameNode then
+            selectedNode = nameNode
+            local slotCard = findSlotCard(nameNode, slotsFrame)
+            selectedCard = slotCard
+            if clickGui(nameNode, "Creature slot select (name)") then
+                slotSelected = true
+            end
+            if slotCard then
+                wait(0.05)
+                if clickGui(slotCard, "Creature slot select (card)") then
+                    slotSelected = true
+                end
+                local inner = slotCard:FindFirstChild("InnerFrame")
+                if inner and inner:IsA("GuiObject") then
+                    wait(0.05)
+                    if clickGui(inner, "Creature slot select (inner)") then
+                        slotSelected = true
+                    end
+                end
+            end
+            if not _slotFoundLoggedOnce then
+                _slotFoundLoggedOnce = true
+                log("Слот существа найден и выбран: " .. tostring(creatureName))
+            end
+        else
+            local now = tick()
+            if now - _playUiSlotMissLastAt >= 20 then
+                _playUiSlotMissLastAt = now
+                playUiImportant("PlayButton: слот «" .. tostring(creatureName) .. "» не найден")
+            end
+        end
+        wait(0.1)
+    end
+
+    for _ = 1, 4 do
+        if selectedCard then
+            dumpSelectedCardOnce(selectedCard)
+            local playInCard = findActionButtonInCard(selectedCard, "play")
+            if playInCard then
+                return clickGui(playInCard, "PlayButton click")
+            end
+            log("[v3] no play button, entering dead-creature path")
+            local deadOk, deadErr = pcall(tryHandleDeadCreature, selectedCard, slotSelected)
+            if not deadOk then
+                log("[v3] tryHandleDeadCreature ERROR: " .. tostring(deadErr))
+            elseif deadErr == true then
+                return true
+            end
+            -- Для выбранного creatureName не кликаем ничего вне выбранной карточки.
+            if creatureName ~= "" then
+                return false
+            end
+        end
+        local candidates = findPlayButtons()
+        if #candidates > 0 then
+            return clickGui(candidates[1], "PlayButton click (fallback)")
+        end
+        wait(0.08)
+    end
+
     return false
 end
 
 local function selectCreature(creatureName)
-    log("Selecting creature: " .. creatureName)
+    -- Не спамим этим в каждом тике: лог только при фактическом клике/ошибке.
     
-    local success = pcall(function()
+    local success, selected = pcall(function()
+        local spawnEvent = ReplicatedStorage:FindFirstChild("SpawnCreature")
+        if spawnEvent and spawnEvent:IsA("RemoteEvent") then
+            spawnEvent:FireServer(creatureName)
+        end
+
         local gui = player:WaitForChild("PlayerGui")
         local creatureSelect = gui:FindFirstChild("CreatureInventoryGui")
             or gui:FindFirstChild("CreatureSelect")
@@ -373,54 +1601,80 @@ local function selectCreature(creatureName)
                     local btnText = (btn.Text or "") .. btn.Name
                     if string.find(string.lower(btnText), string.lower(creatureName), 1, true) then
                         local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+                        local inset = GuiService:GetGuiInset()
+                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, true, game, 0)
                         wait(0.1)
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-                        log("Clicked creature UI: " .. btn.Name)
+                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, false, game, 0)
+                        playUiLog("Clicked creature UI: " .. btn.Name)
                         wait(0.5)
                         return true
                     end
                 end
             end
         end
-        
-        local spawnEvent = ReplicatedStorage:FindFirstChild("SpawnCreature")
-        if spawnEvent then
-            spawnEvent:FireServer(creatureName)
-            return true
-        end
-        
+
         return false
     end)
     
-    return success
+    if not success then
+        log("selectCreature pcall failed: " .. tostring(selected))
+        return false
+    end
+    return selected == true
+end
+
+-- Цикл «Play» + выбор слота, пока не появится Character (вход в мир).
+local function tryEnterWorldFromSlotUi(maxSeconds, creatureName)
+    maxSeconds = maxSeconds or 120
+    creatureName = creatureName or DEFAULT_CREATURE
+    local t0 = tick()
+    local nextAttemptAt = 0
+    local attempts = 0
+    while tick() - t0 < maxSeconds do
+        if stopFlagExists() then
+            return false
+        end
+        refreshCharacterRefs()
+        if character then
+            log("Персонаж загружен после экрана слотов")
+            return true
+        end
+        local now = tick()
+        if now >= nextAttemptAt then
+            attempts = attempts + 1
+            if attempts > PLAY_CLICK_MAX_ATTEMPTS then
+                log("Play loop: слишком много попыток (" .. tostring(attempts) .. "), выходим")
+                return false
+            end
+            tryClickCreaturePlayButton(creatureName)
+            selectCreature(creatureName)
+            tryClickCreaturePlayButton(creatureName)
+            nextAttemptAt = now + PLAY_CLICK_INTERVAL
+        end
+        RunService.Heartbeat:Wait()
+    end
+    return false
 end
 
 local function doSuicide()
     log("Performing suicide...")
     
     local success = pcall(function()
-        -- Способ 1: обнуление здоровья
+        refreshCharacterRefs()
         if humanoid then
-            humanoid.Health = 0
+            pcall(function() humanoid.Health = 0 end)
         end
-        
-        -- Способ 2: телепорт в бездну
         if character and character:FindFirstChild("HumanoidRootPart") then
             character.HumanoidRootPart.CFrame = CFrame.new(0, -1000, 0)
         end
-        
-        -- Способ 3: через RemoteEvent
         local suicideEvent = ReplicatedStorage:FindFirstChild("Suicide")
         if suicideEvent then
             suicideEvent:FireServer()
         end
     end)
     
-    wait(3) -- Ждём респавна
-    character = player.Character or player.CharacterAdded:Wait()
-    humanoid = character:WaitForChild("Humanoid")
-    
+    wait(3)
+    refreshCharacterRefs()
     return success
 end
 
@@ -556,20 +1810,238 @@ local function tradeWithRetries(targetPlayer, giveList, receiveList)
     end
 end
 
-local function doSuicideVolcano()
-    log("Суицид в лаве: " .. tostring(VOLCANO_X) .. "," .. tostring(VOLCANO_Y) .. "," .. tostring(VOLCANO_Z))
-    pcall(function()
-        if character and character:FindFirstChild("HumanoidRootPart") then
-            character.HumanoidRootPart.CFrame = CFrame.new(VOLCANO_X, VOLCANO_Y, VOLCANO_Z)
-            wait(1.5)
+local function findLavaPart()
+    -- Try CollectionService tags first
+    local ok, parts = pcall(function()
+        return game:GetService("CollectionService"):GetTagged("Lava")
+    end)
+    if ok and parts and #parts > 0 then
+        for _, p in ipairs(parts) do
+            if p:IsA("BasePart") and p.Size.Magnitude > 5 then
+                return p
+            end
         end
-        if humanoid then
-            humanoid.Health = 0
+    end
+    -- Search workspace for parts named "Lava"
+    local found = nil
+    pcall(function()
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name == "Lava" and obj.Size.Magnitude > 5 then
+                found = obj
+                return
+            end
         end
     end)
-    wait(3)
-    character = player.Character or player.CharacterAdded:Wait()
-    humanoid = character:WaitForChild("Humanoid")
+    return found
+end
+
+-- Death reward tiers (from DeathRewards module in game data)
+local DEATH_REWARD_TIERS = {
+    { points = 50,   name = "RandomStoredCreatureToken",  display = "Random Trial Creature Token" },
+    { points = 100,  name = "ChangeCreatureColorsToken",  display = "Appearance Change Token" },
+    { points = 150,  name = "PartialGrowToken",           display = "Partial Growth Token" },
+    { points = 350,  name = "FullGrowToken",              display = "Max Growth Token" },
+    { points = 750,  name = "CreatureReviveToken",        display = "Revive Token" },
+    { points = 1200, name = "DeathGachaToken",            display = "Death Gacha Token" },
+}
+
+local function calcEarnedTokens(deathPoints)
+    local tokens = {}
+    for _, tier in ipairs(DEATH_REWARD_TIERS) do
+        if deathPoints >= tier.points then
+            tokens[tier.display] = (tokens[tier.display] or 0) + 1
+        end
+    end
+    return tokens
+end
+
+local function tryClaimDeathRewards(deathPoints)
+    log("Ожидание экрана смерти (DeathGui)...")
+    local gui = player:FindFirstChild("PlayerGui")
+    if not gui then
+        log("WARN: нет PlayerGui для claim")
+        return {}
+    end
+
+    -- Wait for DeathGui to become visible
+    local deathGui = nil
+    local containerFrame = nil
+    local deadline = tick() + 15
+    while tick() < deadline do
+        deathGui = gui:FindFirstChild("DeathGui")
+        if deathGui then
+            containerFrame = deathGui:FindFirstChild("ContainerFrame")
+            if containerFrame and containerFrame.Visible then
+                log("DeathGui найден и видим")
+                break
+            end
+        end
+        wait(0.5)
+    end
+
+    if not containerFrame or not containerFrame.Visible then
+        log("WARN: DeathGui не появился за 15с, пробуем ClaimDeathRewardsRemote напрямую")
+        pcall(function()
+            local RemoteUtils = require(ReplicatedStorage:FindFirstChild("Sonar"):FindFirstChild("RemoteUtils"))
+            local claimRemote = RemoteUtils.GetRemoteFunction("ClaimDeathRewardsRemote")
+            if claimRemote then claimRemote:InvokeServer() end
+        end)
+        return calcEarnedTokens(deathPoints)
+    end
+
+    wait(1)
+
+    -- Click "Claim & retry!" button: ContainerFrame > BottomFrame > ButtonsFrame > Return
+    local claimed = false
+    pcall(function()
+        local bottomFrame = containerFrame:FindFirstChild("BottomFrame")
+        if not bottomFrame then return end
+        local buttonsFrame = bottomFrame:FindFirstChild("ButtonsFrame")
+        if not buttonsFrame then return end
+        local returnBtn = buttonsFrame:FindFirstChild("Return")
+        if returnBtn then
+            log("Нажимаем 'Claim & retry!' (Return)")
+            -- firesignal approach
+            pcall(function()
+                if firesignal and returnBtn.Activated then
+                    firesignal(returnBtn.Activated)
+                end
+            end)
+            pcall(function()
+                if firesignal and returnBtn.MouseButton1Click then
+                    firesignal(returnBtn.MouseButton1Click)
+                end
+            end)
+            pcall(function()
+                returnBtn:Activate()
+            end)
+            -- VIM click
+            pcall(function()
+                local pos = returnBtn.AbsolutePosition + (returnBtn.AbsoluteSize / 2)
+                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+                wait(0.05)
+                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+            end)
+            claimed = true
+        end
+    end)
+
+    if not claimed then
+        log("WARN: кнопка Return не найдена, пробуем ClaimDeathRewardsRemote")
+        pcall(function()
+            local RemoteUtils = require(ReplicatedStorage:FindFirstChild("Sonar"):FindFirstChild("RemoteUtils"))
+            local claimRemote = RemoteUtils.GetRemoteFunction("ClaimDeathRewardsRemote")
+            if claimRemote then claimRemote:InvokeServer() end
+        end)
+    end
+
+    wait(1)
+
+    -- Verify DeathGui closed
+    if containerFrame and containerFrame.Visible then
+        log("DeathGui всё ещё видим после клика, пробуем remote fallback")
+        pcall(function()
+            for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+                if desc.Name == "ClaimDeathRewardsRemote" and desc:IsA("RemoteFunction") then
+                    desc:InvokeServer()
+                    break
+                end
+            end
+        end)
+        wait(1)
+    end
+
+    local tokens = calcEarnedTokens(deathPoints)
+    local tokenLog = {}
+    for k, v in pairs(tokens) do
+        table.insert(tokenLog, k .. "=" .. tostring(v))
+    end
+    log("Награды за смерть (DP=" .. tostring(deathPoints) .. "): " .. (next(tokens) and table.concat(tokenLog, ", ") or "нет"))
+    return tokens
+end
+
+local function doSuicideVolcano(preSuicideDP)
+    log("Суицид в лаве — ищем лаву... (DP перед смертью=" .. tostring(preSuicideDP) .. ")")
+    refreshCharacterRefs()
+    if not character or not character:FindFirstChild("HumanoidRootPart") then
+        log("WARN: нет персонажа для суицида")
+        return {}
+    end
+    local hrp = character.HumanoidRootPart
+
+    -- Try dynamic lava search
+    local lavaPart = findLavaPart()
+    local targetCFrame
+    if lavaPart then
+        targetCFrame = lavaPart.CFrame
+        log("Лава найдена динамически: " .. lavaPart:GetFullName()
+            .. " pos=" .. tostring(math.floor(targetCFrame.X)) .. ","
+            .. tostring(math.floor(targetCFrame.Y)) .. ","
+            .. tostring(math.floor(targetCFrame.Z)))
+    else
+        targetCFrame = CFrame.new(VOLCANO_X, VOLCANO_Y, VOLCANO_Z)
+        log("Лава не найдена, используем дефолт: " .. tostring(VOLCANO_X) .. "," .. tostring(VOLCANO_Y) .. "," .. tostring(VOLCANO_Z))
+    end
+
+    -- Teleport into lava
+    pcall(function() hrp.CFrame = targetCFrame end)
+    wait(0.5)
+
+    -- Fire LavaSelfDamage remote repeatedly to guarantee death
+    local lavaDamageRemote = nil
+    pcall(function()
+        local RemoteUtils = require(ReplicatedStorage:FindFirstChild("Sonar"):FindFirstChild("RemoteUtils"))
+        lavaDamageRemote = RemoteUtils.GetRemoteEvent("LavaSelfDamage")
+    end)
+    if not lavaDamageRemote then
+        pcall(function()
+            for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+                if desc.Name == "LavaSelfDamage" and desc:IsA("RemoteEvent") then
+                    lavaDamageRemote = desc
+                    break
+                end
+            end
+        end)
+    end
+
+    local deathTimeout = tick() + 15
+    while tick() < deathTimeout do
+        if not isCreatureAlive() then
+            log("Суицид в лаве: существо мертво")
+            break
+        end
+        local currentHrp = character and character:FindFirstChild("HumanoidRootPart")
+        if currentHrp then
+            pcall(function() currentHrp.CFrame = targetCFrame end)
+        end
+        if lavaDamageRemote then
+            pcall(function() lavaDamageRemote:FireServer() end)
+        end
+        wait(0.3)
+    end
+
+    -- Fallback: force kill if still alive after timeout
+    if isCreatureAlive() then
+        log("WARN: лава не убила за 15с, форсируем")
+        pcall(function()
+            if humanoid then humanoid.Health = 0 end
+        end)
+        pcall(function()
+            if character and character:FindFirstChild("HumanoidRootPart") then
+                character.HumanoidRootPart.CFrame = CFrame.new(0, -500, 0)
+            end
+        end)
+        wait(3)
+    end
+
+    -- Claim death rewards (death screen with "Claim & retry!")
+    wait(2)
+    local earnedTokens = tryClaimDeathRewards(preSuicideDP or 0)
+
+    -- Wait for slot selection screen after claim
+    wait(2)
+    log("Суицид в лаве: rewards claimed, ожидание слота...")
+    return earnedTokens
 end
 
 local function ensureDefaultCreatureAfterRespawn()
@@ -1094,22 +2566,28 @@ local handlers = {}
 -- ФАРМ (фармер)
 handlers.farm = function()
     log("FARM pipeline=" .. tostring(FARM_PIPELINE) .. " target_dp=" .. tostring(TARGET_DP))
-
-    -- Главный экран слотов: сначала «Play», затем выбор имени (если нужно).
-    tryClickCreaturePlayButton(DEFAULT_CREATURE)
     log("Стартовое существо: " .. DEFAULT_CREATURE)
-    selectCreature(DEFAULT_CREATURE)
-    tryClickCreaturePlayButton(DEFAULT_CREATURE)
-    wait(2)
 
-    if not character or not humanoid or humanoid.Health <= 0 then
-        character = player.Character or player.CharacterAdded:Wait()
-        humanoid = character:WaitForChild("Humanoid")
+    if not tryEnterWorldFromSlotUi(120, DEFAULT_CREATURE) then
+        refreshCharacterRefs()
+        return {
+            ok = false,
+            error = "Не удалось войти в мир за 120s (нет Character). Проверь слот / кнопку Play или default_creature_name.",
+            inventory = getInventory(),
+        }
     end
+    -- CoS uses CharacterData attributes instead of standard Humanoid.Health;
+    -- Humanoid may load later or not at all — don't require it.
+    pcall(function()
+        if character and not humanoid then
+            humanoid = character:FindFirstChildOfClass("Humanoid")
+        end
+    end)
 
-    wait(1)
+    wait(0.5)
 
     local cycles = 0
+    local totalTokensEarned = {}
     
     while true do
         cycles = cycles + 1
@@ -1121,12 +2599,14 @@ handlers.farm = function()
                 ok = true,
                 log = "Farm stopped by flag after " .. cycles .. " cycles",
                 inventory = getInventory(),
+                tokens_earned = totalTokensEarned,
             }
         end
 
         local invBan = getInventory()
         local b = banHeuristicResult(invBan)
         if b then
+            b.tokens_earned = totalTokensEarned
             return b
         end
 
@@ -1134,16 +2614,26 @@ handlers.farm = function()
         log("DP: " .. currentDP .. " / " .. TARGET_DP)
 
         if currentDP >= TARGET_DP then
-            log("Цель DP достигнута")
+            log("Цель DP достигнута (DP=" .. currentDP .. ")")
+            local earnedTokens = {}
             if VOLCANO_SUICIDE then
-                doSuicideVolcano()
+                earnedTokens = doSuicideVolcano(currentDP) or {}
             else
                 doSuicide()
+                earnedTokens = tryClaimDeathRewards(currentDP)
             end
+
+            -- Accumulate tokens across cycles
+            for tokenName, count in pairs(earnedTokens) do
+                totalTokensEarned[tokenName] = (totalTokensEarned[tokenName] or 0) + count
+            end
+            writeTokenReport(totalTokensEarned)
 
             if FARM_PIPELINE == "missions_dp_then_transfer" and TARGET_STORAGE_LOGIN then
                 log("Фаза передачи токенов на склад")
-                return runFarmerStorageTransfer()
+                local result = runFarmerStorageTransfer()
+                result.tokens_earned = totalTokensEarned
+                return result
             end
 
             if params.stop_after_suicide then
@@ -1152,6 +2642,7 @@ handlers.farm = function()
                     log = "DP достигнут, суицид, стоп",
                     death_points_current = 0,
                     inventory = getInventory(),
+                    tokens_earned = totalTokensEarned,
                 }
             end
 
@@ -1161,11 +2652,23 @@ handlers.farm = function()
             wait(1)
         end
 
-        if humanoid.Health <= 0 then
-            log("Респавн — перезапуск существа")
-            character = player.Character or player.CharacterAdded:Wait()
-            humanoid = character:WaitForChild("Humanoid")
-            ensureDefaultCreatureAfterRespawn()
+        if not isCreatureAlive() then
+            log("Существо мертво (не суицид) — claim rewards + перезапуск")
+            local naturalDP = getCurrentDeathPoints()
+            local naturalTokens = tryClaimDeathRewards(naturalDP)
+            for tokenName, count in pairs(naturalTokens) do
+                totalTokensEarned[tokenName] = (totalTokensEarned[tokenName] or 0) + count
+            end
+            writeTokenReport(totalTokensEarned)
+            wait(2)
+            if not tryEnterWorldFromSlotUi(60, DEFAULT_CREATURE) then
+                return {
+                    ok = false,
+                    error = "Не удалось повторно войти в мир после смерти",
+                    inventory = getInventory(),
+                    tokens_earned = totalTokensEarned,
+                }
+            end
             wait(2)
         end
 
@@ -1524,7 +3027,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED ===")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v11-death-claim]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)

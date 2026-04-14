@@ -593,17 +593,27 @@ def build_router(config: Config) -> Router:
                 await message.answer(chunk, parse_mode=ParseMode.HTML, reply_markup=accounts_checks_kb())
             return
 
+        total_earned: dict[str, int] = {}
         lines.append(f"<b>Фермеры</b> (active, {len(farmers)})")
         if not farmers:
             lines.append("<i>нет</i>")
         for a in farmers:
             inv = parse_inventory_json(a.inventory_json)
+            earned = parse_inventory_json(getattr(a, "earned_tokens_json", None))
             lines.append("")
             lines.append(f"<code>{html.escape(a.login[:64])}</code>")
             lines.append(
                 f"<i>обновлено:</i> {html.escape(format_inventory_timestamp(a.inventory_updated_at))}"
             )
             lines.append(format_token_lines_html(inv, SELLABLE_TOKENS))
+            if earned:
+                lines.append(f"<i>заработано (death rewards):</i>")
+                lines.append(format_token_lines_html(earned, SELLABLE_TOKENS))
+                for tk, tv in earned.items():
+                    try:
+                        total_earned[tk] = total_earned.get(tk, 0) + int(tv)
+                    except (ValueError, TypeError):
+                        pass
 
         lines.append("")
         lines.append(f"<b>Склады</b> (active, {len(storages)})")
@@ -617,6 +627,11 @@ def build_router(config: Config) -> Router:
                 f"<i>обновлено:</i> {html.escape(format_inventory_timestamp(a.inventory_updated_at))}"
             )
             lines.append(format_token_lines_html(inv, SELLABLE_TOKENS))
+
+        if total_earned:
+            lines.append("")
+            lines.append("<b>Итого заработано (death rewards, все фермеры):</b>")
+            lines.append(format_token_lines_html(total_earned, SELLABLE_TOKENS))
 
         full = "\n".join(lines)
         chunks = split_telegram_chunks(full)

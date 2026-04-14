@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
@@ -255,6 +256,8 @@ class WindowsGameAdapter(GameAdapter):
         self._injector_launch_done = False
         self._injector_farm_proc_by_task: dict[str, asyncio.subprocess.Process] = {}
         self._universal_farm_proc_by_task: dict[str, asyncio.subprocess.Process] = {}
+        self._universal_farm_started_tasks: set[str] = set()
+        self._universal_farm_retry_after: dict[str, float] = {}
 
     def _injector_scripts_ready(self) -> bool:
         return ib.legacy_ready()
@@ -324,11 +327,19 @@ class WindowsGameAdapter(GameAdapter):
             worker_id=worker_id,
             bridge="universal_script",
         )
-        argv, pid = ib.build_argv(script_path=script_path, params=params)
+        inject_path = ib.materialize_universal_script_bundle(
+            task_id=task_id,
+            source_path=script_path,
+            params=params,
+        )
+        argv, pid = ib.build_argv(script_path=inject_path, params=params)
         await append_task_log(
             task_id=task_id,
             worker_id=worker_id,
-            message="[universal_sonaria] запуск (Kimi), pid=%s wait_for_exit=%s" % (pid, wait_for_exit),
+            message=(
+                "[universal_sonaria] запуск (Kimi), pid=%s wait_for_exit=%s script=%s"
+                % (pid, wait_for_exit, str(inject_path))
+            ),
         )
 
         if wait_for_exit:
@@ -356,8 +367,64 @@ class WindowsGameAdapter(GameAdapter):
                 return None
             return self._parse_sonaria_stdout(out_text)
 
+        # VD Executor CLI режим одноразовый: полезнее дождаться завершения и забрать диагностику.
+        if inj.is_vd_executor_path(inj.injector_executable()):
+            try:
+                stdout, stderr, returncode = await ib.run_wait(
+                    argv=argv,
+                    timeout_seconds=max(90, inj.injector_timeout_seconds()),
+                )
+            except TimeoutError:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message="[universal_sonaria] VD CLI timeout",
+                )
+                raise RuntimeError("vd_executor_cli_timeout")
+            out_text = stdout.decode("utf-8", errors="replace").strip()
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                level="warning" if returncode not in (0, None) else "info",
+                message=(
+                    "[universal_sonaria] VD CLI rc=%s%s%s"
+                    % (
+                        returncode,
+                        (f" stdout={out_text[:400]!r}" if out_text else ""),
+                        (f" stderr={err_text[:400]!r}" if err_text else ""),
+                    )
+                ),
+            )
+            if returncode not in (0, None):
+                raise RuntimeError(f"vd_executor_cli_failed rc={returncode}")
+            return None
+
         proc = await ib.run_detached(argv=argv)
         self._universal_farm_proc_by_task[task_id] = proc
+        await asyncio.sleep(0.7)
+        if proc.returncode is not None:
+            err_tail = ""
+            try:
+                if proc.stderr is not None:
+                    err_bytes = await proc.stderr.read()
+                    if err_bytes:
+                        err_tail = err_bytes.decode("utf-8", errors="replace").strip()
+            except Exception:
+                err_tail = ""
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                level="warning",
+                message=(
+                    "[universal_sonaria] injector exited quickly rc=%s%s"
+                    % (
+                        proc.returncode,
+                        (f" stderr={err_tail[:500]!r}" if err_tail else ""),
+                    )
+                ),
+            )
         return None
 
     async def _run_injector_script(
@@ -480,6 +547,8 @@ class WindowsGameAdapter(GameAdapter):
             raise RuntimeError(f"farm.lua exited unexpectedly rc={existing.returncode}")
 
     async def on_start_farm_cancel(self, *, task_id: str, worker_id: str, account: Account) -> None:
+        self._universal_farm_started_tasks.discard(task_id)
+        self._universal_farm_retry_after.pop(task_id, None)
         proc = self._injector_farm_proc_by_task.pop(task_id, None)
         if proc and proc.returncode is None:
             proc.terminate()
@@ -685,6 +754,35 @@ class WindowsGameAdapter(GameAdapter):
 
         await save_account_inventory_snapshot(account_id, inv)
 
+    async def _poll_token_report(self, account_id: str) -> None:
+        """
+        Проверяет файл токенов смерти, записанный Lua через writefile().
+        Файл лежит в workspace эксплойта: <injector_dir>/sonaria_death_tokens/<account_id>.json
+        """
+        exe = inj.injector_executable()
+        if not exe:
+            return
+        from farm.game.script_params import _token_report_relative_path
+
+        rel = _token_report_relative_path(account_id)
+        token_file = exe.parent / rel
+        if not token_file.is_file():
+            return
+        try:
+            raw = token_file.read_text(encoding="utf-8").strip()
+            if not raw:
+                return
+            tokens = json.loads(raw)
+            if not isinstance(tokens, dict) or not tokens:
+                return
+            from farm.account_inventory import accumulate_earned_tokens
+
+            await accumulate_earned_tokens(account_id, tokens)
+            token_file.unlink(missing_ok=True)
+            logger.info("token report consumed for account %s: %s", account_id, tokens)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.debug("token report read error for %s: %s", account_id, exc)
+
     async def _hook_injector_if_configured(
         self,
         *,
@@ -723,11 +821,20 @@ class WindowsGameAdapter(GameAdapter):
                 return
             self._injector_launch_done = True
             if inj.is_vd_executor_path(inj.injector_executable()):
-                await inj.launch_vd_executor_detached(
-                    task_id=task_id,
-                    worker_id=worker_id,
-                    trigger="windows_adapter_init",
-                )
+                # По умолчанию prelaunch включён (можно выключить INJECTOR_VD_PRELAUNCH=0).
+                prelaunch_raw = (os.getenv("INJECTOR_VD_PRELAUNCH") or "1").strip().lower()
+                if prelaunch_raw not in {"0", "false", "no", "off"}:
+                    await inj.launch_vd_executor_detached(
+                        task_id=task_id,
+                        worker_id=worker_id,
+                        trigger="windows_adapter_init",
+                    )
+                else:
+                    await append_task_log(
+                        task_id=task_id,
+                        worker_id=worker_id,
+                        message="[vd_executor] windows_adapter_init skipped by INJECTOR_VD_PRELAUNCH=0.",
+                    )
             else:
                 await inj.launch_injector_subprocess(
                     task_id=task_id,
@@ -1217,24 +1324,51 @@ class WindowsGameAdapter(GameAdapter):
                 "Универсальный скрипт Kimi недоступен. Нужны INJECTOR_ENABLED=1, INJECTOR_PATH "
                 "и файл universal_sonaria_bot.lua (см. INJECTOR_UNIVERSAL_SCRIPT_PATH)."
             )
+        now = time.monotonic()
+        retry_after = self._universal_farm_retry_after.get(task_id, 0.0)
+        if now < retry_after:
+            await asyncio.sleep(0.7)
+            return
         existing = self._universal_farm_proc_by_task.get(task_id)
-        if existing is None:
+        if task_id not in self._universal_farm_started_tasks:
             params = build_universal_farm_tick_params(
                 account=account,
                 death_points_target=death_points_target,
                 task_payload=payload,
             )
-            await self._run_universal_script(
-                task_id=task_id,
-                worker_id=worker_id,
-                params=params,
-                wait_for_exit=False,
-            )
+            try:
+                await self._run_universal_script(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    params=params,
+                    wait_for_exit=False,
+                )
+            except RuntimeError as exc:
+                await append_task_log(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    level="warning",
+                    message=f"[universal_sonaria] inject attempt failed: {exc}. retry in 8s",
+                )
+                self._universal_farm_started_tasks.discard(task_id)
+                self._universal_farm_retry_after[task_id] = time.monotonic() + 8.0
+                await asyncio.sleep(0.7)
+                return
+            self._universal_farm_started_tasks.add(task_id)
             await append_task_log(
                 task_id=task_id,
                 worker_id=worker_id,
-                message="[universal_sonaria] command=farm started (long-running).",
+                message="[universal_sonaria] command=farm started (one-shot inject).",
             )
+            await asyncio.sleep(0.7)
+            return
+        # Poll for token report file from exploit workspace
+        await self._poll_token_report(account.id)
+
+        if existing is None:
+            # Для one-shot CLI-инжекторов процесс может сразу завершиться с rc=0 —
+            # это нормально: Lua уже выполняется в клиенте Roblox.
+            await asyncio.sleep(0.7)
             return
         if existing.returncode is not None:
             self._universal_farm_proc_by_task.pop(task_id, None)
@@ -1242,11 +1376,26 @@ class WindowsGameAdapter(GameAdapter):
                 await append_task_log(
                     task_id=task_id,
                     worker_id=worker_id,
-                    level="warning",
-                    message="[universal_sonaria] процесс завершился до отмены.",
+                    level="info",
+                    message="[universal_sonaria] injector process exited rc=0 (expected for one-shot CLI).",
                 )
+                await asyncio.sleep(0.7)
                 return
-            raise RuntimeError(f"universal_sonaria farm exited unexpectedly rc={existing.returncode}")
+            await append_task_log(
+                task_id=task_id,
+                worker_id=worker_id,
+                level="warning",
+                message=(
+                    "[universal_sonaria] injector process exited rc=%s; retry in 8s"
+                    % (existing.returncode,)
+                ),
+            )
+            # Не валим задачу: attach/inject может не пройти на коротком окне.
+            self._universal_farm_started_tasks.discard(task_id)
+            self._universal_farm_retry_after[task_id] = time.monotonic() + 8.0
+            await asyncio.sleep(0.7)
+            return
+        await asyncio.sleep(0.7)
 
     async def universal_transfer(
         self,
@@ -1428,8 +1577,13 @@ class WindowsGameAdapter(GameAdapter):
                 **({"dex_url": str(dex_url)} if dex_url else {}),
             },
         )
+        inject_path = ib.materialize_universal_script_bundle(
+            task_id=task_id,
+            source_path=script_path,
+            params=params,
+        )
         argv, pid = ib.build_argv(
-            script_path=script_path,
+            script_path=inject_path,
             params=params,
             injector_executable=launcher_exe,
         )

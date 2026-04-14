@@ -109,6 +109,12 @@ def build_universal_script_params(
     return base
 
 
+def _token_report_relative_path(account_id: str) -> str:
+    """Relative path for writefile() in the exploit workspace."""
+    safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in account_id)
+    return f"sonaria_death_tokens/{safe_id}.json"
+
+
 def build_universal_farm_tick_params(
     *,
     account: Account,
@@ -119,5 +125,6 @@ def build_universal_farm_tick_params(
     merged: dict[str, Any] = dict(task_payload or {})
     merged["target_dp"] = death_points_target
     merged["death_points_target"] = death_points_target
+    merged["token_report_file"] = _token_report_relative_path(account.id)
     merged.setdefault("tick_seq", 1)
     return build_universal_script_params(account, "farm", extra_params=merged)
