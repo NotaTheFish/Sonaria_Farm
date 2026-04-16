@@ -4439,22 +4439,68 @@ handlers.test_drink = function()
                          lakeModel:FindFirstAncestorOfClass("Model"):HasTag("Buildable")) or false
                 end)
 
-                -- Determine a good stand position: inside WaterZone if present, else right on the lake pivot.
+                -- Determine a good stand position: on the SHORE just outside the WaterZone,
+                -- facing toward the water surface. The server's DrinkRemote handler and the
+                -- client's proximity prompt require a clear line from the character's front
+                -- onto the water surface (see DrinkableWater.cast in the game client).
                 local stand = target.pos
+                local faceTarget = target.pos
                 if target.waterZone and target.waterZone:IsA("BasePart") then
-                    local wzPos = target.waterZone.Position
-                    -- Stand at the center of WaterZone, just above it.
-                    stand = Vector3.new(wzPos.X, wzPos.Y + (target.waterZone.Size.Y * 0.5), wzPos.Z)
+                    local wz = target.waterZone
+                    local wzPos = wz.Position
+                    local wzSize = wz.Size
+                    faceTarget = wzPos
+
+                    -- Direction from WaterZone center back to the character (on XZ plane).
+                    -- This gives us the nearest shore direction relative to where the bot is.
+                    local myPos = pos
+                    local outDir = Vector3.new(myPos.X - wzPos.X, 0, myPos.Z - wzPos.Z)
+                    if outDir.Magnitude < 0.1 then
+                        -- Character already in water center — pick an arbitrary direction (+X).
+                        outDir = Vector3.new(1, 0, 0)
+                    else
+                        outDir = outDir.Unit
+                    end
+
+                    -- Step out just past the edge of the WaterZone's bounding box in XZ.
+                    -- half-extent along outDir (project wz half-size onto outDir):
+                    local halfX = wzSize.X * 0.5
+                    local halfZ = wzSize.Z * 0.5
+                    -- distance from center to its edge in the outDir direction (AABB approx):
+                    local edgeDist = math.abs(outDir.X) * halfX + math.abs(outDir.Z) * halfZ
+                    local shoreOffset = edgeDist + 4  -- small margin onto the shore
+
+                    local shoreX = wzPos.X + outDir.X * shoreOffset
+                    local shoreZ = wzPos.Z + outDir.Z * shoreOffset
+                    -- Start a few studs above the water surface; gravity will drop onto terrain.
+                    local shoreY = wzPos.Y + (wzSize.Y * 0.5) + 6
+                    -- Try to snap to terrain with a raycast down from well above the surface.
+                    pcall(function()
+                        local rp = RaycastParams.new()
+                        rp.FilterType = Enum.RaycastFilterType.Exclude
+                        rp.FilterDescendantsInstances = {character, wz}
+                        local origin = Vector3.new(shoreX, shoreY + 40, shoreZ)
+                        local dir = Vector3.new(0, -120, 0)
+                        local hit = workspace:Raycast(origin, dir, rp)
+                        if hit and hit.Position then
+                            -- Stand just above the hit so the character is grounded on the shore.
+                            shoreY = hit.Position.Y + 3
+                        end
+                    end)
+                    stand = Vector3.new(shoreX, shoreY, shoreZ)
                 end
-                log(string.format("[test_drink] TP to '%s' buildable=%s dist=%d pos=(%.1f,%.1f,%.1f)",
+                log(string.format("[test_drink] TP to shore of '%s' buildable=%s dist=%d shore=(%.1f,%.1f,%.1f)",
                     tostring(lakeName), tostring(isBuildable), math.floor(target.dist),
                     stand.X, stand.Y, stand.Z))
 
                 local hrp = getHRP()
                 if hrp then
-                    pcall(function() hrp.CFrame = CFrame.new(stand.X, stand.Y + 1, stand.Z) end)
+                    -- Face toward the water surface.
+                    pcall(function()
+                        hrp.CFrame = CFrame.lookAt(stand, Vector3.new(faceTarget.X, stand.Y, faceTarget.Z))
+                    end)
                 end
-                task.wait(0.4)
+                task.wait(0.5)
 
                 local re = isBuildable and drinkBuildable or drinkRemote
                 if not re then
@@ -4528,9 +4574,223 @@ handlers.test_attack = function()
     return {ok = true, log = "test_attack: stub"}
 end
 
+-- Scan ALL Mud-tagged parts and return sorted list (nearest first). The tagged instances are
+-- usually BaseParts with a child ParticleEmitter named "Mud" (server does `p35.Mud:Emit`).
+local function scanAllMud(pos, radius)
+    radius = radius or 2000
+    local list = {}
+    local seen = {}
+    pcall(function()
+        local tagged = CollectionService:GetTagged("Mud")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent and not seen[obj] then
+                seen[obj] = true
+                local p
+                if obj:IsA("BasePart") then
+                    p = obj.Position
+                elseif obj:IsA("Model") then
+                    p = obj:GetPivot().Position
+                end
+                if p then
+                    local d = (pos - p).Magnitude
+                    if d < radius then
+                        table.insert(list, {obj = obj, dist = d, pos = p})
+                    end
+                end
+            end
+        end
+    end)
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+-- Read a character ailment attribute by name. Returns the value (or 0 if absent).
+local function getAilmentValue(name)
+    local v = 0
+    pcall(function()
+        refreshCharacterRefs()
+        if not character then return end
+        local ail = character:FindFirstChild("Ailments")
+        if ail then
+            local a = ail:GetAttribute(name)
+            if type(a) == "number" then v = a end
+        end
+    end)
+    return v
+end
+
+-- Read the ConcealScent mission progress for the current region.
+local function getConcealScentProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.ConcealScent
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
+end
+
 handlers.test_mud = function()
-    log("[test_mud] STUB: not implemented yet")
-    return {ok = true, log = "test_mud: stub"}
+    log("[test_mud] === MUD TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_mud] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_mud] Already in world")
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_mud] Current region: " .. tostring(regionName))
+
+    -- The game's ConcealScent mission is Land-only; warn but still try.
+    if biome and biome.zone and biome.zone ~= "Land" then
+        log("[test_mud] WARN: current biome zone is '" .. tostring(biome.zone)
+            .. "' — mud mission is Land-only. Continuing anyway for raw test.")
+    end
+
+    local mudRemote = getRemoteEvent("Mud")
+    if not mudRemote then
+        log("[test_mud] ERROR: 'Mud' RemoteEvent not found.")
+        return {ok = false, error = "Mud RemoteEvent not found"}
+    end
+    local hideScentRemote = getRemoteEvent("HideScent")
+
+    local amount0, target0 = getConcealScentProgress()
+    log(string.format("[test_mud] Initial ConcealScent mission: %d/%d", amount0, target0))
+    log(string.format("[test_mud] Initial ailments: Muddy=%d HideScent=%d",
+        getAilmentValue("Muddy"), getAilmentValue("HideScent")))
+
+    local TARGET_ROLLS = 3
+    local MUD_ROLL_DURATION = 5  -- seconds; matches game constant
+    local successful = 0
+    local triedMud = {}
+
+    for roll = 1, 12 do
+        if stopFlagExists() then
+            log("[test_mud] STOPPED by flag")
+            break
+        end
+        if successful >= TARGET_ROLLS then
+            log("[test_mud] Done! Completed " .. successful .. " rolls")
+            break
+        end
+
+        local pos = getPosition()
+        if not pos then
+            log("[test_mud] No position — waiting")
+            task.wait(1)
+        else
+            local list = scanAllMud(pos, 2000)
+            log(string.format("[test_mud] Roll %d/%d | found %d mud patches within 2000 studs",
+                successful + 1, TARGET_ROLLS, #list))
+
+            local target = nil
+            for _, info in ipairs(list) do
+                if not triedMud[info.obj] then
+                    target = info
+                    break
+                end
+            end
+            if not target and #list > 0 then
+                log("[test_mud] All patches tried — resetting list")
+                triedMud = {}
+                target = list[1]
+            end
+
+            if not target then
+                log("[test_mud] No mud found — teleport to biome entry and retry")
+                if biome then safeTeleportVec(biome.entry) end
+                task.wait(2)
+            else
+                local mudObj = target.obj
+                -- Teleport to the mud patch: slightly above and facing the center.
+                local mudPos = target.pos
+                log(string.format("[test_mud] TP to mud at (%.1f,%.1f,%.1f) dist=%d",
+                    mudPos.X, mudPos.Y, mudPos.Z, math.floor(target.dist)))
+
+                local hrp = getHRP()
+                if hrp then
+                    pcall(function()
+                        -- Stand on top of the mud patch, center of it for Emit particles.
+                        hrp.CFrame = CFrame.new(mudPos.X, mudPos.Y + 3, mudPos.Z)
+                    end)
+                end
+                task.wait(0.4)
+
+                -- Verify grounded on mud (best-effort).
+                local pos2 = getPosition()
+                local onMud = pos2 and ((pos2 - mudPos).Magnitude < 20) or false
+
+                local amountBefore = select(1, getConcealScentProgress())
+                local muddyBefore = getAilmentValue("Muddy")
+                local hideBefore = getAilmentValue("HideScent")
+
+                -- Wait for full roll duration (game requires MUD_ROLL_DURATION before accepting).
+                log(string.format("[test_mud] Rolling for %ds (onMud=%s)...",
+                    MUD_ROLL_DURATION, tostring(onMud)))
+                local rollStart = tick()
+                while tick() - rollStart < MUD_ROLL_DURATION + 0.2 do
+                    if stopFlagExists() then break end
+                    -- Keep anchored on top while rolling (some games drift the character).
+                    local h = getHRP()
+                    if h then
+                        pcall(function()
+                            h.CFrame = CFrame.new(mudPos.X, mudPos.Y + 3, mudPos.Z)
+                        end)
+                    end
+                    task.wait(0.5)
+                end
+                if stopFlagExists() then break end
+
+                -- Fire the mud remote with the mud root (the tagged instance itself).
+                pcall(function() mudRemote:FireServer(mudObj) end)
+                log("[test_mud] Mud:FireServer sent")
+                task.wait(1.0)
+                -- Also send HideScent as the keybind path does (harmless if server ignores).
+                if hideScentRemote then
+                    pcall(function() hideScentRemote:FireServer() end)
+                    log("[test_mud] HideScent:FireServer sent")
+                end
+                task.wait(1.5)
+
+                local amountAfter = select(1, getConcealScentProgress())
+                local muddyAfter = getAilmentValue("Muddy")
+                local hideAfter = getAilmentValue("HideScent")
+                log(string.format("[test_mud] Post-roll: mission=%d (was %d)  Muddy=%d (was %d)  HideScent=%d (was %d)",
+                    amountAfter, amountBefore, muddyAfter, muddyBefore, hideAfter, hideBefore))
+
+                if amountAfter > amountBefore or muddyAfter > muddyBefore or hideAfter > hideBefore then
+                    successful = successful + 1
+                    log("[test_mud] SUCCESS roll " .. successful .. "/" .. TARGET_ROLLS)
+                    -- Small pause before next roll so ailment/particle state settles.
+                    task.wait(1.5)
+                else
+                    log("[test_mud] No effect — marking this mud patch as bad, trying another")
+                    triedMud[mudObj] = true
+                    task.wait(1)
+                end
+            end
+        end
+    end
+
+    local finalAmount, finalTarget = getConcealScentProgress()
+    log(string.format("[test_mud] === DONE === successful_rolls=%d/%d  mission=%d/%d",
+        successful, TARGET_ROLLS, finalAmount, finalTarget))
+    return {
+        ok = successful > 0,
+        log = string.format("test_mud: %d/%d rolls, mission=%d/%d",
+            successful, TARGET_ROLLS, finalAmount, finalTarget)
+    }
 end
 
 handlers.test_survive = function()
@@ -5037,7 +5297,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v36-test-eat-drink-toggle]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v37-drink-shore-mud]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)
