@@ -4564,9 +4564,122 @@ handlers.test_walk = function()
     return {ok = true, log = "test_walk: stub"}
 end
 
+-- Read Sniff mission progress for current region.
+-- In-game RegionMissions catalog: Sniff requires 5 per region (see rbxlx line ~5452153).
+local function getSniffProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.Sniff
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
+end
+
 handlers.test_sniff = function()
-    log("[test_sniff] STUB: not implemented yet")
-    return {ok = true, log = "test_sniff: stub"}
+    log("[test_sniff] === SNIFF TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_sniff] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_sniff] Already in world")
+    end
+
+    local regionName, _biome = detectCurrentRegion()
+    log("[test_sniff] Current region: " .. tostring(regionName))
+
+    -- SetMissionRemote:FireServer(1) — "1" is the index of "Sniff" in Constants.MissionTypes
+    -- (see rbxlx lines ~5901452 and ~5945059: IncrementClientMission → ConvertMissionType).
+    local setMissionRemote = getRemoteEvent("SetMissionRemote")
+    if not setMissionRemote then
+        log("[test_sniff] WARN: SetMissionRemote not found — only VIM H path will work")
+    end
+
+    local amount0, target0 = getSniffProgress()
+    log(string.format("[test_sniff] Initial Sniff mission: %d/%d", amount0, target0))
+
+    -- Game client cooldown: Constants.SniffCooldown = 15s (see rbxlx line 5901109).
+    -- SniffAbilityCooldown may override it temporarily (tutorial sets 8).
+    local SNIFF_COOLDOWN = 15
+    local MAX_ATTEMPTS = 15
+    local successful = 0
+    local lastSniffAt = 0
+
+    for attempt = 1, MAX_ATTEMPTS do
+        if stopFlagExists() then
+            log("[test_sniff] STOPPED by flag")
+            break
+        end
+
+        -- If on client cooldown, wait — but recheck stop flag every 1s.
+        local since = tick() - lastSniffAt
+        if lastSniffAt > 0 and since < SNIFF_COOLDOWN then
+            local remaining = SNIFF_COOLDOWN - since
+            log(string.format("[test_sniff] On cooldown — waiting %.1fs", remaining))
+            local waitUntil = tick() + remaining
+            while tick() < waitUntil do
+                if stopFlagExists() then break end
+                task.wait(1)
+            end
+            if stopFlagExists() then break end
+        end
+
+        local amountBefore = select(1, getSniffProgress())
+        log(string.format("[test_sniff] Attempt %d/%d  mission=%d/%d",
+            attempt, MAX_ATTEMPTS, amountBefore, target0))
+
+        -- Trigger via VirtualInputManager 'H' — goes through the full client
+        -- Controls.Sniff → Sniff module pipeline (cooldown check, VFX, mission fire).
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.H, false, game)
+            task.wait(0.15)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.H, false, game)
+        end)
+
+        -- Also fire the mission remote directly as a backup in case the H keybind
+        -- was consumed by a UI capture. This mirrors the final server call of Sniff().
+        if setMissionRemote then
+            pcall(function()
+                setMissionRemote:FireServer(1)  -- 1 == index of "Sniff" in MissionTypes
+            end)
+        end
+        lastSniffAt = tick()
+
+        -- Server needs a moment to update the region mission counter.
+        task.wait(2.5)
+
+        local amountAfter = select(1, getSniffProgress())
+        if amountAfter > amountBefore then
+            successful = successful + 1
+            log(string.format("[test_sniff] OK — mission advanced %d → %d  (sniff #%d)",
+                amountBefore, amountAfter, successful))
+            if target0 > 0 and amountAfter >= target0 then
+                log("[test_sniff] Mission fully completed!")
+                break
+            end
+        else
+            log("[test_sniff] No progress — likely cooldown is still active, will wait and retry")
+        end
+    end
+
+    local finalAmount, finalTarget = getSniffProgress()
+    log(string.format("[test_sniff] === DONE === successful_sniffs=%d  mission=%d/%d",
+        successful, finalAmount, finalTarget))
+    return {
+        ok = successful > 0,
+        log = string.format("test_sniff: %d sniffs, mission=%d/%d",
+            successful, finalAmount, finalTarget)
+    }
 end
 
 handlers.test_attack = function()
@@ -4798,9 +4911,226 @@ handlers.test_survive = function()
     return {ok = true, log = "test_survive: stub"}
 end
 
+-- Read ShoomPilesCollected mission progress for current region.
+-- Target is 3 per region per day (see rbxlx ~5452170).
+local function getShoomProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.ShoomPilesCollected
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
+end
+
+-- Scan all ShoomPile instances. Try CollectionService first (authoritative) and
+-- also sweep workspace.Interactions.ShoomPiles as a fallback. Returns list sorted by distance.
+local function scanAllShooms(fromPos, regionFilter)
+    local list = {}
+    local seen = {}
+
+    local function consume(obj)
+        if not obj or not obj.Parent or seen[obj] then return end
+        seen[obj] = true
+        local region = nil
+        local id = nil
+        pcall(function()
+            region = obj:GetAttribute("Region")
+            id = obj:GetAttribute("Id")
+        end)
+        if regionFilter and region ~= regionFilter then return end
+
+        -- Position: prefer attribute "P", then model pivot / part position.
+        local pos = nil
+        pcall(function() pos = obj:GetAttribute("P") end)
+        if typeof(pos) ~= "Vector3" then
+            if obj:IsA("Model") then
+                local ok, pivot = pcall(function() return obj:GetPivot().Position end)
+                if ok and pivot then pos = pivot end
+            elseif obj:IsA("BasePart") then
+                pos = obj.Position
+            end
+        end
+        if not pos then return end
+
+        local dist = fromPos and (fromPos - pos).Magnitude or 0
+        table.insert(list, {obj = obj, region = region, id = id, pos = pos, dist = dist})
+    end
+
+    pcall(function()
+        for _, obj in ipairs(CollectionService:GetTagged("ShoomPile")) do
+            consume(obj)
+        end
+    end)
+    pcall(function()
+        local folder = workspace:FindFirstChild("Interactions")
+        if folder then
+            local shoomFolder = folder:FindFirstChild("ShoomPiles")
+            if shoomFolder then
+                for _, obj in ipairs(shoomFolder:GetDescendants()) do
+                    if obj:IsA("Model") or obj:IsA("BasePart") then
+                        consume(obj)
+                    end
+                end
+            end
+        end
+    end)
+
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
 handlers.test_shrooms = function()
-    log("[test_shrooms] STUB: not implemented yet")
-    return {ok = true, log = "test_shrooms: stub"}
+    log("[test_shrooms] === SHROOMS TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_shrooms] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_shrooms] Already in world")
+    end
+
+    local regionName, _biome = detectCurrentRegion()
+    log("[test_shrooms] Current region: " .. tostring(regionName))
+
+    -- The pickup is a RemoteFunction (not Event): see rbxlx line ~6015191
+    -- local v_u_17 = v10.GetRemoteFunction("ShoomPileCollected")
+    -- Invoked as v_u_17:InvokeServer(region:string, id)
+    local collectRF = getRemoteFunction("ShoomPileCollected")
+    if not collectRF then
+        log("[test_shrooms] ERROR: ShoomPileCollected RemoteFunction not found")
+        return {ok = false, error = "ShoomPileCollected RemoteFunction missing"}
+    end
+
+    local amount0, target0 = getShoomProgress()
+    log(string.format("[test_shrooms] Initial mission: %d/%d", amount0, target0))
+
+    local pos = getPosition()
+    if not pos then
+        log("[test_shrooms] ERROR: no position")
+        return {ok = false, error = "no position"}
+    end
+
+    -- First look for piles only in the current region.
+    local piles = scanAllShooms(pos, regionName)
+    log(string.format("[test_shrooms] Found %d piles in region '%s'", #piles, tostring(regionName)))
+
+    if #piles == 0 then
+        -- Fallback: scan globally (in case the region attribute is missing/uppercase mismatch).
+        piles = scanAllShooms(pos, nil)
+        log(string.format("[test_shrooms] Fallback global scan: %d piles total", #piles))
+    end
+
+    if #piles == 0 then
+        log("[test_shrooms] No shoom piles visible. They may not be spawned in this region right now.")
+        return {ok = false, error = "no shoom piles found"}
+    end
+
+    -- Game's ShoomPileConstants.MaxDistanceToCollect = 100 studs (see rbxlx line ~5908309).
+    local MAX_DIST = 100
+    local collected = 0
+    local triedPiles = {}
+
+    for attempt = 1, math.max(#piles * 2, 6) do
+        if stopFlagExists() then
+            log("[test_shrooms] STOPPED by flag")
+            break
+        end
+        if collected >= 3 and target0 > 0 and collected >= target0 then
+            log("[test_shrooms] Mission target reached")
+            break
+        end
+
+        local myPos = getPosition() or pos
+        -- Refresh pile list each iteration — after server success, piles are typically
+        -- hidden/removed via replicated bool; scanning again keeps the list accurate.
+        local fresh = scanAllShooms(myPos, regionName)
+        if #fresh == 0 then fresh = scanAllShooms(myPos, nil) end
+
+        local target = nil
+        for _, info in ipairs(fresh) do
+            if not triedPiles[info.obj] and info.region and info.id then
+                target = info
+                break
+            end
+        end
+
+        if not target then
+            log("[test_shrooms] No more untried piles")
+            break
+        end
+
+        -- Teleport: face the pile, close enough to pass CanCollect's distance check.
+        local standY = target.pos.Y + 4
+        local stand = Vector3.new(target.pos.X, standY, target.pos.Z - 6)
+        -- If very far, just plunk us on top of the pile; else approach from slight -Z offset.
+        if target.dist > 300 then
+            stand = Vector3.new(target.pos.X, target.pos.Y + 4, target.pos.Z - 3)
+        end
+
+        log(string.format("[test_shrooms] Target pile region=%s id=%s pos=(%.1f,%.1f,%.1f) dist=%.1f",
+            tostring(target.region), tostring(target.id),
+            target.pos.X, target.pos.Y, target.pos.Z, target.dist))
+
+        local hrp = getHRP()
+        if hrp then
+            pcall(function()
+                hrp.CFrame = CFrame.lookAt(stand, Vector3.new(target.pos.X, stand.Y, target.pos.Z))
+            end)
+        end
+        task.wait(0.6)
+
+        -- Verify distance after teleport.
+        local nowPos = getPosition() or stand
+        local distNow = (nowPos - target.pos).Magnitude
+        if distNow > MAX_DIST - 5 then
+            log(string.format("[test_shrooms] WARN: still %.1f studs from pile (max %d)", distNow, MAX_DIST))
+        end
+
+        local amountBefore = select(1, getShoomProgress())
+
+        local ok, ret = pcall(function()
+            return collectRF:InvokeServer(target.region, target.id)
+        end)
+        if not ok then
+            log("[test_shrooms] InvokeServer errored: " .. tostring(ret))
+            triedPiles[target.obj] = true
+            task.wait(0.5)
+        else
+            log("[test_shrooms] InvokeServer returned: " .. tostring(ret))
+            -- Wait for the server to replicate the mission update and hide the pile.
+            task.wait(1.5)
+            local amountAfter = select(1, getShoomProgress())
+            if amountAfter > amountBefore or ret == true then
+                collected = collected + 1
+                log(string.format("[test_shrooms] Pile collected! #%d (mission %d → %d)",
+                    collected, amountBefore, amountAfter))
+                triedPiles[target.obj] = true
+            else
+                log("[test_shrooms] No progress — marking pile as tried")
+                triedPiles[target.obj] = true
+                task.wait(0.5)
+            end
+        end
+    end
+
+    local finalAmount, finalTarget = getShoomProgress()
+    log(string.format("[test_shrooms] === DONE === collected=%d  mission=%d/%d",
+        collected, finalAmount, finalTarget))
+    return {
+        ok = collected > 0,
+        log = string.format("test_shrooms: collected=%d  mission=%d/%d",
+            collected, finalAmount, finalTarget)
+    }
 end
 
 -- ФАРМ (фармер)
@@ -5297,7 +5627,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v37-drink-shore-mud]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v38-sniff-shrooms]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)
