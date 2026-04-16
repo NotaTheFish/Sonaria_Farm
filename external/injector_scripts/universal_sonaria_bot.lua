@@ -4559,11 +4559,202 @@ handlers.test_drink = function()
         tostring(stats.water), tostring(thirstAppetite), tostring(thirstPct))}
 end
 
-handlers.test_walk = function()
-    log("[test_walk] STUB: not implemented yet")
-    return {ok = true, log = "test_walk: stub"}
+do -- == test_walk scope ==
+-- Read DistanceTravelled mission progress for current region.
+-- Catalog target is 2500 studs (rbxlx ~5452149).
+local function getDistanceProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.DistanceTravelled
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
 end
 
+-- Read creature Stamina from CharacterData ("s" attribute is Stamina in compressed form).
+local function getStamina()
+    local stamina = 100
+    pcall(function()
+        refreshCharacterRefs()
+        if not character then return end
+        local dataInst = nil
+        for _, inst in ipairs(character:GetDescendants()) do
+            if inst:HasTag("CharacterData") then dataInst = inst; break end
+        end
+        if not dataInst then
+            dataInst = character:FindFirstChild("Data")
+        end
+        if dataInst then
+            local s = dataInst:GetAttribute("s") or dataInst:GetAttribute("Stamina")
+            if type(s) == "number" then stamina = s end
+        end
+    end)
+    return stamina
+end
+
+handlers.test_walk = function()
+    log("[test_walk] === WALK TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_walk] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_walk] Already in world")
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_walk] Current region: " .. tostring(regionName))
+
+    if not biome then
+        log("[test_walk] ERROR: unknown biome")
+        return {ok = false, error = "unknown biome"}
+    end
+
+    local amount0, target0, completed0 = getDistanceProgress()
+    log(string.format("[test_walk] Initial mission: %d/%d (completed=%s)",
+        amount0, target0, tostring(completed0)))
+
+    if completed0 then
+        log("[test_walk] Mission already completed in this region")
+        return {ok = true, log = "test_walk: already complete"}
+    end
+
+    -- Teleport to the known-safe entry point first.
+    log(string.format("[test_walk] TP to biome safe point (%d,%d,%d)",
+        biome.safe[1], biome.safe[2], biome.safe[3]))
+    safeTeleportVec(biome.safe)
+    task.wait(1.0)
+
+    -- Two anchor points: current position A and a point ~140 studs away.
+    -- We'll bounce between them using Humanoid:MoveTo, which also engages running
+    -- if we hold LeftShift (Sprint action in the game's controls).
+    local A = getPosition()
+    if not A then return {ok = false, error = "no position after tp"} end
+    -- Offset direction: use the entry-to-walk[1] vector if available, else +X.
+    local dirX, dirZ = 1, 0
+    if biome.walk and #biome.walk > 0 then
+        local wp = biome.walk[1]
+        local dx = wp[1] - A.X
+        local dz = wp[3] - A.Z
+        local mag = math.sqrt(dx*dx + dz*dz)
+        if mag > 1 then
+            dirX = dx / mag
+            dirZ = dz / mag
+        end
+    end
+    local LEG = 140
+    local B = Vector3.new(A.X + dirX * LEG, A.Y, A.Z + dirZ * LEG)
+    log(string.format("[test_walk] Anchors A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f) leg=%d",
+        A.X, A.Y, A.Z, B.X, B.Y, B.Z, LEG))
+
+    -- Start holding LeftShift (Sprint is hold-to-sprint on desktop: rbxlx ~6016856).
+    local function holdShift() pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.LeftShift, false, game)
+    end) end
+    local function releaseShift() pcall(function()
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.LeftShift, false, game)
+    end) end
+
+    holdShift()
+
+    local goTo = B  -- toggle between A and B
+    local legsWalked = 0
+    local maxSeconds = 600  -- hard ceiling: 10 min
+    local startTime = tick()
+    local lastProgressCheck = 0
+    local sprinting = true
+
+    while tick() - startTime < maxSeconds do
+        if stopFlagExists() then
+            log("[test_walk] STOPPED by flag")
+            break
+        end
+
+        -- Every 3s: progress / stamina check.
+        if tick() - lastProgressCheck > 3 then
+            lastProgressCheck = tick()
+            local amt, tgt, comp = getDistanceProgress()
+            local stamina = getStamina()
+            log(string.format("[test_walk] progress=%d/%d  stamina=%d  sprinting=%s  legs=%d",
+                amt, tgt, stamina, tostring(sprinting), legsWalked))
+            if comp then
+                log("[test_walk] Mission completed!")
+                break
+            end
+            -- Stamina management: if drained, release shift; if refilled > 40, hold again.
+            if sprinting and stamina <= 5 then
+                releaseShift()
+                sprinting = false
+                log("[test_walk] Out of stamina — switching to walk")
+            elseif (not sprinting) and stamina >= 40 then
+                holdShift()
+                sprinting = true
+                log("[test_walk] Stamina recovered — resuming sprint")
+            end
+        end
+
+        -- Issue MoveTo and wait until we arrive or timeout.
+        refreshCharacterRefs()
+        if not humanoid then break end
+        pcall(function() humanoid:MoveTo(goTo) end)
+
+        local legStart = tick()
+        local legTimeout = 12
+        local arrived = false
+        while tick() - legStart < legTimeout do
+            if stopFlagExists() then break end
+            local p = getPosition()
+            if p then
+                local dx = p.X - goTo.X
+                local dz = p.Z - goTo.Z
+                if math.sqrt(dx*dx + dz*dz) < 8 then
+                    arrived = true
+                    break
+                end
+            end
+            task.wait(0.3)
+        end
+
+        if stopFlagExists() then break end
+
+        legsWalked = legsWalked + 1
+        if not arrived then
+            -- Stuck — nudge via teleport back to safe point, recompute anchors.
+            log("[test_walk] Stuck mid-leg — re-teleporting to safe point")
+            safeTeleportVec(biome.safe)
+            task.wait(0.8)
+            A = getPosition() or A
+            B = Vector3.new(A.X + dirX * LEG, A.Y, A.Z + dirZ * LEG)
+            goTo = B
+        else
+            -- Flip direction.
+            goTo = (goTo == B) and A or B
+        end
+    end
+
+    releaseShift()
+
+    local finalAmt, finalTgt = getDistanceProgress()
+    log(string.format("[test_walk] === DONE === legs=%d  mission=%d/%d  elapsed=%ds",
+        legsWalked, finalAmt, finalTgt, math.floor(tick() - startTime)))
+    return {
+        ok = finalAmt > amount0,
+        log = string.format("test_walk: legs=%d mission=%d/%d", legsWalked, finalAmt, finalTgt)
+    }
+end
+end -- == /test_walk scope ==
+
+do -- == test_sniff scope ==
 -- Read Sniff mission progress for current region.
 -- In-game RegionMissions catalog: Sniff requires 5 per region (see rbxlx line ~5452153).
 local function getSniffProgress()
@@ -4681,12 +4872,250 @@ handlers.test_sniff = function()
             successful, finalAmount, finalTarget)
     }
 end
+end -- == /test_sniff scope ==
 
-handlers.test_attack = function()
-    log("[test_attack] STUB: not implemented yet")
-    return {ok = true, log = "test_attack: stub"}
+do -- == test_attack scope ==
+-- Read AttackOrHealCreatureOrNPC mission progress for current region.
+-- Catalog target is 5 per region (rbxlx ~5452157).
+local function getAttackProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.AttackOrHealCreatureOrNPC
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
 end
 
+-- Try to find a creature model's PrimaryPart (or some reasonable BasePart root).
+local function resolveHitRoot(model)
+    if not model or not model:IsA("Model") then return nil end
+    if model.PrimaryPart then return model.PrimaryPart end
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+    if hrp then return hrp end
+    local root = model:FindFirstChild("Root")
+    if root and root:IsA("BasePart") then return root end
+    return model:FindFirstChildWhichIsA("BasePart")
+end
+
+-- Is a model still alive? Checks Humanoid.Health or Health attribute.
+local function isModelAlive(model)
+    if not model or not model.Parent then return false end
+    local hum = model:FindFirstChildWhichIsA("Humanoid")
+    if hum then return hum.Health > 0 end
+    local h = model:GetAttribute("Health")
+    if type(h) == "number" then return h > 0 end
+    return true
+end
+
+-- Fire a bite through BOTH remotes. Sonaria classifies some entities as "Characters"
+-- (big NPCs and players) and others as "Mob" (small NPCs). The mission increment
+-- is only wired to Characters-path on the client XML (rbxlx ~5944348) but we send
+-- both to maximize chances.
+local function fireBite(targetModel, targetHitRoot)
+    pcall(function()
+        local re = getRemoteEvent("CharactersDamageRemote")
+        if re then re:FireServer({targetHitRoot or targetModel}) end
+    end)
+    pcall(function()
+        local re = getRemoteEvent("MobDamageRemote")
+        if re then re:FireServer({targetHitRoot or targetModel}) end
+    end)
+end
+
+handlers.test_attack = function()
+    log("[test_attack] === ATTACK TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_attack] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_attack] Already in world")
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_attack] Current region: " .. tostring(regionName))
+
+    if not biome then
+        log("[test_attack] ERROR: unknown biome")
+        return {ok = false, error = "unknown biome"}
+    end
+
+    local amount0, target0 = getAttackProgress()
+    log(string.format("[test_attack] Initial mission: %d/%d", amount0, target0))
+
+    -- Game uses ATTACK_COOLDOWN = 0.8s (rbxlx ~5901184), scaled by TimePlayed/BiteCooldown.
+    -- Use 1.1s between bites to be safe with server debounce.
+    local BITE_INTERVAL = 1.1
+    local MAX_DURATION = 180  -- 3 min hard ceiling
+    local startTime = tick()
+    local bites = 0
+    local triedNPC = {}
+
+    while tick() - startTime < MAX_DURATION do
+        if stopFlagExists() then
+            log("[test_attack] STOPPED by flag")
+            break
+        end
+
+        local amt, tgt, comp = getAttackProgress()
+        if comp or (tgt > 0 and amt >= tgt) then
+            log("[test_attack] Mission completed!")
+            break
+        end
+
+        -- 1) NPCs first.
+        local pos = getPosition()
+        if not pos then
+            task.wait(1)
+        else
+            local npcs = scanForNPCs(pos, 1500)
+            local targetInfo = nil
+            for _, n in ipairs(npcs) do
+                if n.model and not triedNPC[n.model] and isModelAlive(n.model) then
+                    targetInfo = n
+                    break
+                end
+            end
+
+            if targetInfo then
+                local model = targetInfo.model
+                local hitRoot = resolveHitRoot(model)
+                if not hitRoot then
+                    log("[test_attack] NPC has no usable hit root, skipping")
+                    triedNPC[model] = true
+                else
+                    log(string.format("[test_attack] NPC target: %s  dist=%d",
+                        tostring(model.Name), math.floor(targetInfo.distance)))
+
+                    -- Teleport to within bite range: game checks Size.Magnitude*8+hitbox.
+                    -- Approach to ~10 studs, facing the NPC.
+                    local approach = targetInfo.position + Vector3.new(0, 3, -8)
+                    local hrp = getHRP()
+                    if hrp then
+                        pcall(function()
+                            hrp.CFrame = CFrame.lookAt(approach, targetInfo.position)
+                        end)
+                    end
+                    task.wait(0.4)
+
+                    -- Bite loop on this NPC (until dead / mission complete / no progress).
+                    local noProgressBites = 0
+                    local amountBefore = select(1, getAttackProgress())
+                    for _ = 1, 10 do
+                        if stopFlagExists() then break end
+                        if not isModelAlive(model) then
+                            log("[test_attack] NPC died")
+                            break
+                        end
+                        -- Re-check proximity; re-teleport if drifted.
+                        local p = getPosition()
+                        if p and (p - targetInfo.position).Magnitude > 35 then
+                            pcall(function()
+                                hrp.CFrame = CFrame.lookAt(
+                                    targetInfo.position + Vector3.new(0, 3, -8),
+                                    targetInfo.position)
+                            end)
+                            task.wait(0.3)
+                        end
+
+                        fireBite(model, hitRoot)
+                        bites = bites + 1
+                        task.wait(BITE_INTERVAL)
+
+                        local amountNow = select(1, getAttackProgress())
+                        if amountNow > amountBefore then
+                            log(string.format("[test_attack] NPC bite OK  mission %d → %d (bite #%d)",
+                                amountBefore, amountNow, bites))
+                            amountBefore = amountNow
+                            noProgressBites = 0
+                            if tgt > 0 and amountNow >= tgt then break end
+                        else
+                            noProgressBites = noProgressBites + 1
+                            if noProgressBites >= 3 then
+                                log("[test_attack] No mission progress from NPC bites — this NPC/mob type may not count")
+                                break
+                            end
+                        end
+                    end
+                    triedNPC[model] = true
+                end
+            else
+                -- 2) No NPCs left → try players.
+                local players = findNearbyPlayers(pos, 1500)
+                if #players == 0 then
+                    log("[test_attack] No NPCs or players in range. Teleport to biome entry and retry.")
+                    safeTeleportVec(biome.entry)
+                    task.wait(2)
+                    -- If still nothing after teleport, break.
+                    local pos2 = getPosition()
+                    if pos2 then
+                        local again = findNearbyPlayers(pos2, 1500)
+                        if #again == 0 then
+                            local npcsAgain = scanForNPCs(pos2, 1500)
+                            local hasFresh = false
+                            for _, n in ipairs(npcsAgain) do
+                                if not triedNPC[n.model] then hasFresh = true; break end
+                            end
+                            if not hasFresh then
+                                log("[test_attack] No targets available — giving up")
+                                break
+                            end
+                        end
+                    end
+                else
+                    local pl = players[1]
+                    log(string.format("[test_attack] Player target: %s dist=%d (hit-and-run)",
+                        pl.name, math.floor(pl.distance)))
+                    local hitRoot = resolveHitRoot(pl.model) or pl.model
+                    local approach = pl.position + Vector3.new(0, 3, -6)
+                    local hrp = getHRP()
+                    if hrp then
+                        pcall(function()
+                            hrp.CFrame = CFrame.lookAt(approach, pl.position)
+                        end)
+                    end
+                    task.wait(0.25)
+
+                    local amountBefore = select(1, getAttackProgress())
+                    fireBite(pl.model, hitRoot)
+                    bites = bites + 1
+                    -- Immediately retreat to safe point.
+                    task.wait(0.15)
+                    safeTeleportVec(biome.safe)
+                    task.wait(BITE_INTERVAL + 0.3)
+
+                    local amountNow = select(1, getAttackProgress())
+                    if amountNow > amountBefore then
+                        log(string.format("[test_attack] Player bite OK  mission %d → %d", amountBefore, amountNow))
+                    else
+                        log("[test_attack] Player bite — no progress visible yet (may be cooldown/ailment)")
+                    end
+                end
+            end
+        end
+    end
+
+    local finalAmt, finalTgt, finalComp = getAttackProgress()
+    log(string.format("[test_attack] === DONE === bites=%d  mission=%d/%d  completed=%s",
+        bites, finalAmt, finalTgt, tostring(finalComp)))
+    return {
+        ok = finalAmt > amount0,
+        log = string.format("test_attack: bites=%d mission=%d/%d", bites, finalAmt, finalTgt)
+    }
+end
+end -- == /test_attack scope ==
+
+do -- == test_mud scope ==
 -- Scan ALL Mud-tagged parts and return sorted list (nearest first). The tagged instances are
 -- usually BaseParts with a child ParticleEmitter named "Mud" (server does `p35.Mud:Emit`).
 local function scanAllMud(pos, radius)
@@ -4905,12 +5334,129 @@ handlers.test_mud = function()
             successful, TARGET_ROLLS, finalAmount, finalTarget)
     }
 end
+end -- == /test_mud scope ==
 
-handlers.test_survive = function()
-    log("[test_survive] STUB: not implemented yet")
-    return {ok = true, log = "test_survive: stub"}
+do -- == test_survive scope ==
+-- Read TimePlayed mission progress for current region.
+-- Catalog target is 150 seconds (rbxlx ~5452166).
+local function getTimePlayedProgress()
+    local amount, target, completed = 0, 0, false
+    pcall(function()
+        local regionName = detectCurrentRegion()
+        if not regionName then return end
+        local missions = readRegionMissions(regionName)
+        local m = missions and missions.TimePlayed
+        if m then
+            amount = m.amount or 0
+            target = m.targetAmount or 0
+            completed = m.completed or false
+        end
+    end)
+    return amount, target, completed
 end
 
+handlers.test_survive = function()
+    log("[test_survive] === SURVIVE TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_survive] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_survive] Already in world")
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_survive] Current region: " .. tostring(regionName))
+
+    if not biome then
+        log("[test_survive] ERROR: unknown biome")
+        return {ok = false, error = "unknown biome"}
+    end
+
+    local amount0, target0, completed0 = getTimePlayedProgress()
+    log(string.format("[test_survive] Initial mission: %d/%d (completed=%s)",
+        amount0, target0, tostring(completed0)))
+
+    if completed0 then
+        log("[test_survive] Mission already completed in this region")
+        return {ok = true, log = "test_survive: already complete"}
+    end
+
+    -- Teleport to safe point.
+    log(string.format("[test_survive] TP to safe point (%d,%d,%d)",
+        biome.safe[1], biome.safe[2], biome.safe[3]))
+    safeTeleportVec(biome.safe)
+    task.wait(1.0)
+
+    -- Wait until mission is complete, with a generous ceiling (165s = 150 + 15 buffer).
+    -- We also run light survival maintenance (emergency refill) so we don't die here.
+    local targetSec = (target0 > 0) and target0 or 150
+    local buffer = 15
+    local waitTotal = targetSec + buffer
+    local startTime = tick()
+    local lastLog = 0
+    local lastSurvivalCheck = 0
+
+    while tick() - startTime < waitTotal do
+        if stopFlagExists() then
+            log("[test_survive] STOPPED by flag")
+            break
+        end
+
+        local elapsed = math.floor(tick() - startTime)
+        if tick() - lastLog > 5 then
+            lastLog = tick()
+            local amt, tgt, comp = getTimePlayedProgress()
+            local stats = getCreatureStats()
+            log(string.format("[test_survive] t=%ds/%ds  mission=%d/%d  hp=%d food=%d water=%d",
+                elapsed, waitTotal, amt, tgt, stats.hp or -1, stats.food or -1, stats.water or -1))
+            if comp then
+                log("[test_survive] Mission completed!")
+                break
+            end
+        end
+
+        -- Light survival maintenance every 10s: top up if truly critical.
+        if tick() - lastSurvivalCheck > 10 then
+            lastSurvivalCheck = tick()
+            local stats = getCreatureStats()
+            if (stats.food or 100) < SURVIVAL_FOOD_CRITICAL
+                or (stats.water or 100) < SURVIVAL_WATER_CRITICAL
+                or (stats.hp or 100) < SURVIVAL_HP_CRITICAL then
+                log("[test_survive] Survival critical — emergency top-up will not be run in test")
+                -- Just teleport back to safe in case we drifted.
+                safeTeleportVec(biome.safe)
+            else
+                -- Re-anchor every 10s in case of push from waves/wind.
+                local p = getPosition()
+                if p then
+                    local dx = p.X - biome.safe[1]
+                    local dz = p.Z - biome.safe[3]
+                    if math.sqrt(dx*dx + dz*dz) > 80 then
+                        safeTeleportVec(biome.safe)
+                    end
+                end
+            end
+        end
+
+        task.wait(1)
+    end
+
+    local finalAmt, finalTgt, finalComp = getTimePlayedProgress()
+    log(string.format("[test_survive] === DONE === mission=%d/%d completed=%s elapsed=%ds",
+        finalAmt, finalTgt, tostring(finalComp), math.floor(tick() - startTime)))
+    return {
+        ok = finalComp or finalAmt >= (target0 > 0 and target0 or 150),
+        log = string.format("test_survive: mission=%d/%d completed=%s",
+            finalAmt, finalTgt, tostring(finalComp))
+    }
+end
+end -- == /test_survive scope ==
+
+do -- == test_shrooms scope ==
 -- Read ShoomPilesCollected mission progress for current region.
 -- Target is 3 per region per day (see rbxlx ~5452170).
 local function getShoomProgress()
@@ -5132,6 +5678,7 @@ handlers.test_shrooms = function()
             collected, finalAmount, finalTarget)
     }
 end
+end -- == /test_shrooms scope ==
 
 -- ФАРМ (фармер)
 handlers.farm = function()
@@ -5627,7 +6174,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v38-sniff-shrooms]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v39-walk-survive-attack]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)
