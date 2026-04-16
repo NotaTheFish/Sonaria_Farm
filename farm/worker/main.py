@@ -464,6 +464,19 @@ async def process_task(adapter: GameAdapter, task, worker_id: str) -> None:
             await mark_task_done(task_id=task.id)
             return
 
+        if task.task_type == TaskType.UNIVERSAL_TEST.value:
+            account = await load_account_or_raise(task.id)
+            test_command = payload.get("test_command", "test_eat")
+            await adapter.universal_test(
+                task_id=task.id,
+                worker_id=worker_id,
+                account=account,
+                payload=payload,
+                test_command=test_command,
+            )
+            await mark_task_done(task_id=task.id)
+            return
+
         if task.task_type == TaskType.TRANSFER_TO_STORAGE.value:
             farmer = await load_account_or_raise(task.id)
             if farmer.status in _inactive_account_statuses():

@@ -175,6 +175,7 @@ class TaskType(str, enum.Enum):
     UNIVERSAL_SELL = "universal_sell"
     UNIVERSAL_INVENTORY = "universal_inventory"
     UNIVERSAL_DEX = "universal_dex"
+    UNIVERSAL_TEST = "universal_test"
 
 
 class Task(Base):

@@ -330,6 +330,74 @@ local DEATH_STAT_MULTIPLIERS = {
     CreatureKillsT5    = 8,
 }
 
+-- ========== BIOME ATLAS (Main mode, coordinates from rbxlx region volumes) ==========
+-- Y values set to safe ground-level estimates; runtime scan supplements static POIs.
+local CollectionService = game:GetService("CollectionService")
+
+local BIOME_ATLAS = {
+    {name = "Central Rockfaces", zone = "Land", entry = {145, 80, -87},  safe = {145, 80, -87},
+     walk = {{200,80,-50},{100,80,-150},{50,80,-50},{200,80,-150},{145,80,-87}}},
+    {name = "Desert", zone = "Land", entry = {-1455, 100, 1203}, safe = {-1455, 100, 1203},
+     walk = {{-1400,100,1250},{-1500,100,1150},{-1550,100,1300},{-1350,100,1100},{-1455,100,1203}}},
+    {name = "Flower Cove", zone = "Land", entry = {500, 60, 2028},  safe = {500, 60, 2028},
+     walk = {{550,60,2080},{450,60,1980},{400,60,2080},{550,60,1980},{500,60,2028}}},
+    {name = "Jungle", zone = "Land", entry = {2235, 80, -1187}, safe = {2235, 80, -1187},
+     walk = {{2300,80,-1130},{2170,80,-1250},{2300,80,-1250},{2170,80,-1130},{2235,80,-1187}}},
+    {name = "Mesa", zone = "Land", entry = {-2061, 120, 180},  safe = {-2061, 120, 180},
+     walk = {{-2000,120,230},{-2120,120,130},{-2000,120,130},{-2120,120,230},{-2061,120,180}}},
+    {name = "Mountains", zone = "Land", entry = {-1550, 150, -802}, safe = {-1550, 150, -802},
+     walk = {{-1490,150,-750},{-1610,150,-860},{-1490,150,-860},{-1610,150,-750},{-1550,150,-802}}},
+    {name = "Pride Rocks", zone = "Land", entry = {1625, 80, -472},  safe = {1625, 80, -472},
+     walk = {{1680,80,-420},{1570,80,-530},{1680,80,-530},{1570,80,-420},{1625,80,-472}}},
+    {name = "Redwoods", zone = "Land", entry = {-71, 80, -1446},  safe = {-71, 80, -1446},
+     walk = {{-20,80,-1400},{-120,80,-1500},{-20,80,-1500},{-120,80,-1400},{-71,80,-1446}}},
+    {name = "Swamp Hill", zone = "Land", entry = {834, 50, -2514}, safe = {834, 50, -2514},
+     walk = {{890,50,-2460},{780,50,-2570},{890,50,-2570},{780,50,-2460},{834,50,-2514}}},
+    {name = "Tundra", zone = "Land", entry = {-1006, 80, -2012}, safe = {-1006, 80, -2012},
+     walk = {{-950,80,-1960},{-1060,80,-2070},{-950,80,-2070},{-1060,80,-1960},{-1006,80,-2012}}},
+    {name = "Volcano Island", zone = "Land", entry = {2180, 100, 1430}, safe = {2180, 100, 1430},
+     walk = {{2230,100,1480},{2130,100,1380},{2230,100,1380},{2130,100,1480},{2180,100,1430}}},
+    {name = "Forgotten Shores", zone = "Land", entry = {-1126, 60, 2915}, safe = {-1126, 60, 2915},
+     walk = {{-1070,60,2960},{-1180,60,2860},{-1070,60,2860},{-1180,60,2960},{-1126,60,2915}}},
+    {name = "Algae Sandbar", zone = "Sea", entry = {1065, 10, -1437}, safe = {1065, 10, -1437},
+     walk = {{1120,10,-1390},{1010,10,-1490},{1120,10,-1490},{1010,10,-1390},{1065,10,-1437}}},
+    {name = "Coral Reef", zone = "Sea", entry = {1250, 5, 1103},  safe = {1250, 5, 1103},
+     walk = {{1300,5,1150},{1200,5,1050},{1300,5,1050},{1200,5,1150},{1250,5,1103}}},
+    {name = "Grassy Shoal", zone = "Sea", entry = {-701, 10, 2108}, safe = {-701, 10, 2108},
+     walk = {{-650,10,2160},{-750,10,2060},{-650,10,2060},{-750,10,2160},{-701,10,2108}}},
+    {name = "Rocky Drop", zone = "Sea", entry = {1065, 10, 578},   safe = {1065, 10, 578},
+     walk = {{1120,10,630},{1010,10,530},{1120,10,530},{1010,10,630},{1065,10,578}}},
+    {name = "Seaweed Depths", zone = "Sea", entry = {-110, 5, 993},  safe = {-110, 5, 993},
+     walk = {{-60,5,1040},{-160,5,940},{-60,5,940},{-160,5,1040},{-110,5,993}}},
+}
+
+-- Survival thresholds
+local SURVIVAL_FOOD_CRITICAL = 15
+local SURVIVAL_WATER_CRITICAL = 15
+local SURVIVAL_HP_CRITICAL = 25
+
+-- ========== MISSION STATE (persistent across doMissionStep calls) ==========
+local _missionState = {
+    initialized = false,
+    currentBiomeIdx = 1,
+    currentMissionType = nil,
+    lastPositions = {},
+    stuckTimer = 0,
+    missionStuckTimers = {},
+    walkLoopIdx = 1,
+    lastSniffTime = 0,
+    lastSurvivalCheck = 0,
+    lastDistancePos = nil,
+    lastDistanceCheckTime = 0,
+    distanceAccum = 0,
+    biomeEnteredTime = 0,
+    missionSwitchCooldown = 0,
+    eatDrinkToggle = "food",
+    shoomRetryCount = 0,
+    attackRetryCount = 0,
+    logThrottles = {},
+}
+
 local function calcDeathPointsFromStats(deathStatsFolder)
     local total = 0
     for statName, mult in pairs(DEATH_STAT_MULTIPLIERS) do
@@ -348,108 +416,262 @@ local function calcDeathPointsFromStats(deathStatsFolder)
     return total
 end
 
+local _dpDiagLoggedOnce = false
+
 local function getCurrentDeathPoints()
-    -- Method 1: _replicationFolder → player slot → DeathStats (most reliable)
-    local dpFromData = 0
-    local foundData = false
+    local function dpLog(msg)
+        log("[DP-diag] " .. msg)
+    end
+
+    -- === Step 1: Find the SLOT folder (Instance with DeathStats) ===
+    local currentSlot = nil
+    local slotSource = "?"
+
+    -- 1a: PlayerGui.Data — canonical data folder on client (PlayerData in wrapper code).
+    --     CoS client wrapper sets: PlayerData = PlayerGui:WaitForChild("Data")
+    --     Slot folders are: Data.Slot1, Data.Slot2, Data.Slot3, Data.Slots.Slot4+
+    --     Use Settings.Slot to identify which slot number is active.
+    local slotNumber = nil
     pcall(function()
-        local repFolder = ReplicatedStorage:FindFirstChild("_replicationFolder")
-        if not repFolder then return end
-        local playerFolder = repFolder:FindFirstChild(player.Name)
-            or repFolder:FindFirstChild(tostring(player.UserId))
-        if not playerFolder then return end
+        local settings = player:FindFirstChild("Settings")
+        if not settings then
+            if not _dpDiagLoggedOnce then dpLog("1a: no player.Settings") end
+            return
+        end
+        local slotOV = settings:FindFirstChild("Slot")
+        if not slotOV then
+            if not _dpDiagLoggedOnce then dpLog("1a: no Settings.Slot") end
+            return
+        end
+        local sv = slotOV.Value
+        if not sv then
+            if not _dpDiagLoggedOnce then dpLog("1a: Settings.Slot.Value is nil") end
+            return
+        end
+        -- sv could be: Instance (replicated slot folder) whose Name is like "Slot1"
+        local name = nil
+        pcall(function() name = sv.Name end)
+        if type(name) == "string" then
+            local n = tonumber(name:match("%d+"))
+            if n then slotNumber = n end
+        end
+        if not _dpDiagLoggedOnce then
+            dpLog("1a: Settings.Slot.Value type=" .. typeof(sv) .. " name=" .. tostring(name) .. " slotNum=" .. tostring(slotNumber))
+        end
+    end)
+
+    -- Look up the slot in PlayerGui.Data (has DeathStats, unlike replicated version)
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then
+            if not _dpDiagLoggedOnce then dpLog("1b: no PlayerGui") end
+            return
+        end
+        local dataFolder = pg:FindFirstChild("Data")
+        if not dataFolder then
+            if not _dpDiagLoggedOnce then dpLog("1b: no PlayerGui.Data") end
+            return
+        end
+        if not _dpDiagLoggedOnce then
+            local slotKids = {}
+            for _, c in ipairs(dataFolder:GetChildren()) do
+                local hasDino = c:FindFirstChild("Dino") and true or false
+                local hasDS = c:FindFirstChild("DeathStats") and true or false
+                if hasDino or hasDS then
+                    table.insert(slotKids, c.Name .. "(dino=" .. tostring(hasDino) .. ",ds=" .. tostring(hasDS) .. ")")
+                end
+            end
+            dpLog("1b: PlayerGui.Data slot-like children: " .. table.concat(slotKids, ", "))
+        end
+
+        -- Try by slot number first
+        if slotNumber then
+            local slotName = "Slot" .. slotNumber
+            local candidate = dataFolder:FindFirstChild(slotName)
+            if not candidate then
+                local slotsSubfolder = dataFolder:FindFirstChild("Slots")
+                if slotsSubfolder then
+                    candidate = slotsSubfolder:FindFirstChild(slotName)
+                end
+            end
+            if candidate and candidate:FindFirstChild("DeathStats") then
+                currentSlot = candidate
+                slotSource = "PlayerGui.Data[" .. slotName .. "]"
+                return
+            end
+        end
+
+        -- Fallback: find by creature name
         local targetLower = DEFAULT_CREATURE:lower()
-        for _, slot in ipairs(playerFolder:GetChildren()) do
+        for _, slot in ipairs(dataFolder:GetChildren()) do
             local dino = slot:FindFirstChild("Dino")
             if dino and dino:IsA("StringValue") and dino.Value:lower() == targetLower then
-                local hp = slot:FindFirstChild("Health")
-                if hp and type(hp.Value) == "number" and hp.Value > 0 then
-                    local ds = slot:FindFirstChild("DeathStats")
-                    if ds then
-                        dpFromData = calcDeathPointsFromStats(ds)
-                        foundData = true
+                if slot:FindFirstChild("DeathStats") then
+                    currentSlot = slot
+                    slotSource = "PlayerGui.Data[name=" .. slot.Name .. "]"
+                    return
+                end
+            end
+        end
+        -- Also check Slots subfolder
+        local slotsSubfolder = dataFolder:FindFirstChild("Slots")
+        if slotsSubfolder then
+            for _, slot in ipairs(slotsSubfolder:GetChildren()) do
+                local dino = slot:FindFirstChild("Dino")
+                if dino and dino:IsA("StringValue") and dino.Value:lower() == targetLower then
+                    if slot:FindFirstChild("DeathStats") then
+                        currentSlot = slot
+                        slotSource = "PlayerGui.Data.Slots[name=" .. slot.Name .. "]"
                         return
                     end
                 end
             end
         end
-        -- Fallback: try any alive slot's DeathStats
-        for _, slot in ipairs(playerFolder:GetChildren()) do
-            local hp = slot:FindFirstChild("Health")
-            if hp and type(hp.Value) == "number" and hp.Value > 0 then
-                local ds = slot:FindFirstChild("DeathStats")
-                if ds then
-                    dpFromData = calcDeathPointsFromStats(ds)
-                    foundData = true
+    end)
+
+    -- 1c: player.Data (alternative location for some CoS versions / Trade Realm)
+    if not currentSlot then
+        pcall(function()
+            local dataFolder = player:FindFirstChild("Data")
+            if not dataFolder then return end
+            if not _dpDiagLoggedOnce then dpLog("1c: trying player.Data") end
+            if slotNumber then
+                local slotName = "Slot" .. slotNumber
+                local candidate = dataFolder:FindFirstChild(slotName)
+                if not candidate then
+                    local sf = dataFolder:FindFirstChild("Slots")
+                    if sf then candidate = sf:FindFirstChild(slotName) end
+                end
+                if candidate and candidate:FindFirstChild("DeathStats") then
+                    currentSlot = candidate
+                    slotSource = "player.Data[" .. slotName .. "]"
                     return
                 end
             end
-        end
-    end)
-    if foundData then return dpFromData end
-
-    -- Method 2: GUI — search PlayerGui for DeathPoints TextLabel
-    local dpFromGui = 0
-    pcall(function()
-        local gui = player:FindFirstChild("PlayerGui")
-        if not gui then return end
-        for _, desc in ipairs(gui:GetDescendants()) do
-            if desc.Name == "DeathPoints" and desc:IsA("Frame") then
-                for _, child in ipairs(desc:GetChildren()) do
-                    if child:IsA("TextLabel") then
-                        local t = child.Text:gsub(",", "")
-                        local n = tonumber(t:match("%d+"))
-                        if n and n > 0 then
-                            dpFromGui = n
-                            return
-                        end
+            local targetLower = DEFAULT_CREATURE:lower()
+            for _, slot in ipairs(dataFolder:GetChildren()) do
+                local dino = slot:FindFirstChild("Dino")
+                if dino and dino:IsA("StringValue") and dino.Value:lower() == targetLower then
+                    if slot:FindFirstChild("DeathStats") then
+                        currentSlot = slot
+                        slotSource = "player.Data[" .. slot.Name .. "]"
+                        return
                     end
                 end
             end
-            if desc.Name == "DeathPoints" and desc:IsA("TextLabel") then
-                local t = desc.Text:gsub(",", "")
-                local n = tonumber(t:match("%d+"))
-                if n then
-                    dpFromGui = n
-                    return
-                end
+        end)
+    end
+
+    -- 1d: Settings.Slot.Value directly (replicated slot — might have DeathStats)
+    if not currentSlot then
+        pcall(function()
+            local settings = player:FindFirstChild("Settings")
+            if not settings then return end
+            local slotOV = settings:FindFirstChild("Slot")
+            if not slotOV then return end
+            local sv = slotOV.Value
+            if sv and typeof(sv) == "Instance" and sv:FindFirstChild("DeathStats") then
+                currentSlot = sv
+                slotSource = "Settings.Slot.Value(direct)"
             end
+        end)
+    end
+
+    if not currentSlot then
+        if not _dpDiagLoggedOnce then
+            _dpDiagLoggedOnce = true
+            dpLog("ALL slot methods failed — returning 0")
+        end
+        return 0
+    end
+
+    -- === Step 2: Compute DP from DeathStats (NO require/Sonar — require() can yield/hang forever) ===
+    local dp = nil
+    local dpCalcSource = nil
+
+    pcall(function()
+        local ds = currentSlot:FindFirstChild("DeathStats")
+        if ds then
+            dp = calcDeathPointsFromStats(ds)
+            dpCalcSource = "manual"
+            if not _dpDiagLoggedOnce then
+                local items = {}
+                for _, c in ipairs(ds:GetChildren()) do
+                    table.insert(items, c.Name .. "=" .. tostring(c.Value))
+                end
+                dpLog("DeathStats contents: " .. table.concat(items, ", "))
+            end
+        elseif not _dpDiagLoggedOnce then
+            dpLog("no DeathStats folder in slot " .. tostring(currentSlot))
         end
     end)
-    return dpFromGui
+
+    if not dp then
+        dp = 0
+        dpCalcSource = "none"
+    end
+
+    if not _dpDiagLoggedOnce then
+        _dpDiagLoggedOnce = true
+        local slotPath = ""
+        pcall(function() slotPath = currentSlot:GetFullName() end)
+        dpLog("RESULT: slot=" .. slotSource .. " calc=" .. dpCalcSource .. " dp=" .. tostring(dp) .. " path=" .. slotPath)
+    end
+
+    return dp
 end
+
+local GET_INVENTORY_RF_TIMEOUT = tonumber(params.get_inventory_remote_timeout_seconds) or 3
 
 local function getInventory()
     local inventory = {}
-    
-    -- Пробуем различные способы получения инвентаря
+
     local success, result = pcall(function()
-        -- Вариант 1: через ReplicatedStorage
-        local itemsFolder = ReplicatedStorage:FindFirstChild("Items") 
+        -- Вариант 1: через ReplicatedStorage / локальные папки (быстро, без сервера)
+        local itemsFolder = ReplicatedStorage:FindFirstChild("Items")
             or ReplicatedStorage:FindFirstChild("Inventory")
             or player:FindFirstChild("Inventory")
-        
+
         if itemsFolder then
             for _, item in pairs(itemsFolder:GetChildren()) do
                 local name = item.Name
                 inventory[name] = (inventory[name] or 0) + 1
             end
         end
-        
-        -- Вариант 2: через RemoteFunction
+
+        -- Вариант 2: RemoteFunction — на перегруженном клиенте может зависнуть навсегда; ограничиваем ожидание.
         local getInventoryFunc = ReplicatedStorage:FindFirstChild("GetInventory")
         if getInventoryFunc and getInventoryFunc:IsA("RemoteFunction") then
-            local serverInventory = getInventoryFunc:InvokeServer()
-            if type(serverInventory) == "table" then
-                for name, count in pairs(serverInventory) do
+            local rf = getInventoryFunc
+            local pack = nil
+            local done = false
+            task.spawn(function()
+                local ok, res = pcall(function()
+                    return rf:InvokeServer()
+                end)
+                pack = { ok = ok, res = res }
+                done = true
+            end)
+            local deadline = tick() + GET_INVENTORY_RF_TIMEOUT
+            while not done and tick() < deadline do
+                task.wait(0.05)
+            end
+            if not done then
+                log(
+                    "WARN: GetInventory InvokeServer не ответил за "
+                        .. tostring(GET_INVENTORY_RF_TIMEOUT)
+                        .. "s — продолжаем с локальными данными"
+                )
+            elseif pack and pack.ok and type(pack.res) == "table" then
+                for name, count in pairs(pack.res) do
                     inventory[name] = count
                 end
             end
         end
-        
+
         return inventory
     end)
-    
+
     if success then
         return result
     else
@@ -459,7 +681,7 @@ local function getInventory()
 end
 
 -- Anti-spam для экрана слотов: меньше кликов/логов и предсказуемая нагрузка.
-local PLAY_CLICK_INTERVAL = tonumber(params.play_click_interval_seconds) or 0.7
+local PLAY_CLICK_INTERVAL = tonumber(params.play_click_interval_seconds) or 2.5
 local PLAY_LOG_INTERVAL = math.max(tonumber(params.play_log_interval_seconds) or 3, 2)
 local PLAY_CLICK_MAX_ATTEMPTS = tonumber(params.play_click_max_attempts) or 180
 local _playUiLastLogAt = 0
@@ -476,6 +698,7 @@ local _selectedCardDumpDone = false
 local _playUiVerbose = tostring(params.play_ui_verbose or "0") == "1"
 local _playUiImportantByKey = {}
 local _slotFoundLoggedOnce = false
+local _slotNameClickLastAt = nil
 
 local function playUiLog(msg)
     if not _playUiVerbose then
@@ -882,7 +1105,6 @@ local function tryClickCreaturePlayButton(creatureName)
             if
                 d:IsA("GuiButton")
                 and d.Visible
-                and d.Active ~= false
                 and d.AbsoluteSize.X > 2
                 and d.AbsoluteSize.Y > 2
                 and (nm == "playbutton" or tx == "play")
@@ -961,7 +1183,7 @@ local function tryClickCreaturePlayButton(creatureName)
         return false
     end
 
-    -- Для Play оставляем Active-фильтр; Restart/Revive в CoS часто Visible=true при Active=false.
+    -- CoS часто держит Play с Visible=true и Active=false (ещё не готово к спавну); кнопка всё равно целевая.
     local function isAncestryVisible(gui)
         local node = gui
         while node and node:IsA("GuiObject") do
@@ -1058,6 +1280,26 @@ local function tryClickCreaturePlayButton(creatureName)
         return false
     end
 
+    local function findCancelButtonInPrompt(promptChild)
+        local names = { "CancelButton", "CloseButton", "BackButton", "NoButton", "XButton", "Cancel", "Close" }
+        for _, n in ipairs(names) do
+            local btn = promptChild:FindFirstChild(n, true)
+            if btn and btn:IsA("GuiButton") then
+                return btn
+            end
+        end
+        for _, desc in ipairs(promptChild:GetDescendants()) do
+            if desc:IsA("GuiButton") and desc.Visible then
+                local dnm = string.lower(tostring(desc.Name or ""))
+                if string.find(dnm, "cancel", 1, true) or string.find(dnm, "close", 1, true)
+                    or string.find(dnm, "back", 1, true) or dnm == "x" then
+                    return desc
+                end
+            end
+        end
+        return nil
+    end
+
     -- CoS: после клика RestartButton открывается модалка PromptGui > PromptFrame > PromptFrames > RestartCreature(NoMutations).
     -- Внутри: RunButton (ImageButton) → UpperLabel (ImageButton) — подтверждение рестарта.
     local function tryConfirmRestartPrompt()
@@ -1099,21 +1341,57 @@ local function tryClickCreaturePlayButton(creatureName)
                 end
             end
 
-            -- Fallback: видимый фрейм с "restart" в имени
+            -- Fallback: видимый фрейм с "restart" в имени (исключая revive/purchase/edit/delete)
             for _, child in ipairs(container:GetChildren()) do
                 if child:IsA("GuiObject") and child.Visible then
                     local nm = string.lower(tostring(child.Name or ""))
-                    if string.find(nm, "restart", 1, true) then
+                    if string.find(nm, "restart", 1, true)
+                        and not string.find(nm, "revive", 1, true) then
                         return tryClickRunButtonInPrompt(child, child.Name)
                     end
                 end
             end
 
-            -- Fallback 2: видимый фрейм с RunButton
+            -- Fallback 2: видимый фрейм с RunButton, но ТОЛЬКО если имя НЕ содержит revive/purchase/edit/delete/gifted
             for _, child in ipairs(container:GetChildren()) do
                 if child:IsA("GuiObject") and child.Visible and child:FindFirstChild("RunButton", true) then
-                    return tryClickRunButtonInPrompt(child, child.Name .. "(hasRunBtn)")
+                    local nm = string.lower(tostring(child.Name or ""))
+                    if not string.find(nm, "revive", 1, true)
+                        and not string.find(nm, "purchase", 1, true)
+                        and not string.find(nm, "edit", 1, true)
+                        and not string.find(nm, "delete", 1, true)
+                        and not string.find(nm, "gifted", 1, true) then
+                        return tryClickRunButtonInPrompt(child, child.Name .. "(hasRunBtn)")
+                    end
                 end
+            end
+
+            -- Fallback 3: RestartCreatureNoMutations exists but invisible while ReviveCreature blocks.
+            -- Force-hide ReviveCreature, force-show RestartCreatureNoMutations, then click RunButton.
+            local reviveChild = nil
+            local restartChild = nil
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("GuiObject") then
+                    local nm = string.lower(tostring(child.Name or ""))
+                    if string.find(nm, "revive", 1, true) and child.Visible then
+                        reviveChild = child
+                    end
+                    if (child.Name == "RestartCreatureNoMutations" or child.Name == "RestartCreature") and not child.Visible then
+                        restartChild = child
+                    end
+                end
+            end
+            if reviveChild and restartChild then
+                log("Force-switching prompt: hiding " .. reviveChild.Name .. ", showing " .. restartChild.Name)
+                local cancelBtn = findCancelButtonInPrompt(reviveChild)
+                if cancelBtn then
+                    pressActionButton(cancelBtn, "Revive prompt force-cancel")
+                    wait(0.15)
+                end
+                pcall(function() reviveChild.Visible = false end)
+                pcall(function() restartChild.Visible = true end)
+                wait(0.2)
+                return tryClickRunButtonInPrompt(restartChild, restartChild.Name .. "(force-shown)")
             end
         end
 
@@ -1135,6 +1413,81 @@ local function tryClickCreaturePlayButton(creatureName)
             end
         end
         return false
+    end
+
+    local function dismissRevivePrompt()
+        local closed = false
+        pcall(function()
+            local promptGui = pg:FindFirstChild("PromptGui")
+            if not promptGui then return end
+            local pf = promptGui:FindFirstChild("PromptFrame")
+            if not pf then return end
+            local container = pf:FindFirstChild("PromptFrames") or pf
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    local nm = string.lower(tostring(child.Name or ""))
+                    if string.find(nm, "revive", 1, true) then
+                        log("Closing ReviveCreature prompt")
+                        -- Ищем CancelButton: сначала внутри типового фрейма, потом в PromptFrame.
+                        local cancelBtn = findCancelButtonInPrompt(child)
+                        if not cancelBtn then
+                            cancelBtn = findCancelButtonInPrompt(pf)
+                        end
+                        if cancelBtn then
+                            pressActionButton(cancelBtn, "Revive prompt cancel")
+                            wait(0.2)
+                        end
+                        -- Скрываем ТОЛЬКО ReviveCreature (не весь PromptFrame — иначе сломаем стейт игры).
+                        pcall(function() child.Visible = false end)
+                        closed = true
+                        return
+                    end
+                end
+            end
+        end)
+        return closed
+    end
+
+    -- Прямой вызов RestartSlotRemote без Sonar (сканируем ReplicatedStorage напрямую).
+    local function tryRestartSlotDirect(slotName)
+        local rf = nil
+        pcall(function()
+            for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+                if desc.Name == "RestartSlotRemote" and desc:IsA("RemoteFunction") then
+                    rf = desc
+                    break
+                end
+            end
+        end)
+        if not rf then
+            log("[restart-direct] RestartSlotRemote not found in ReplicatedStorage")
+            return false
+        end
+        log("[restart-direct] Invoking RestartSlotRemote for slot=" .. tostring(slotName))
+        local ok, res = pcall(function()
+            return rf:InvokeServer(slotName, false)
+        end)
+        log("[restart-direct] pcall_ok=" .. tostring(ok) .. " res=" .. tostring(res))
+        return ok and res
+    end
+
+    -- Определяет имя слота из GUI-карточки (Slot1, Slot2... или "1","2"...).
+    local function getSlotNameFromCard(slotCardHint)
+        if not slotCardHint then return nil end
+        local slotName = nil
+        pcall(function()
+            local p = slotCardHint
+            for _ = 1, 10 do
+                if not p or not p.Parent then break end
+                local parName = p.Parent and p.Parent.Name or ""
+                if parName == "SlotsFrame" or parName == "AllSlotsFrame" then
+                    slotName = p.Name
+                    break
+                end
+                p = p.Parent
+            end
+        end)
+        return slotName
     end
 
     -- Прямой вызов RestartSlotRemote через Sonar — надёжный fallback, не зависит от GUI.
@@ -1273,7 +1626,7 @@ local function tryClickCreaturePlayButton(creatureName)
         if not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
             return nil
         end
-        local allowInactive = token == "restart" or token == "revive"
+        local allowInactive = token == "restart" or token == "revive" or token == "play"
         local buttonFrame = select(1, findButtonsContainerForSlotHint(slotCardHint))
         if buttonFrame then
             local preferred = nil
@@ -1342,6 +1695,103 @@ local function tryClickCreaturePlayButton(creatureName)
         end)
     end
 
+    -- Проверяет, является ли кнопка revive-связанной (чтобы НИКОГДА её не нажимать).
+    local function isReviveRelated(btn)
+        if not btn then return false end
+        local nm = string.lower(tostring(btn.Name or ""))
+        if string.find(nm, "revive", 1, true) then return true end
+        if btn:IsA("TextButton") then
+            local tx = string.lower(tostring(btn.Text or ""))
+            if string.find(tx, "revive", 1, true) then return true end
+        end
+        local found = false
+        pcall(function()
+            for _, q in ipairs(btn:GetDescendants()) do
+                if (q:IsA("TextLabel") or q:IsA("TextButton") or q:IsA("TextBox")) then
+                    local t = string.lower(tostring(q.Text or ""))
+                    if string.find(t, "revive", 1, true) then
+                        found = true
+                        return
+                    end
+                end
+            end
+        end)
+        return found
+    end
+
+    -- Ищет кнопку Restart в карточке слота — расширенный поиск с диагностикой.
+    local function findRestartButtonInCard(slotCardHint)
+        if not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
+            return nil
+        end
+
+        -- Сначала пробуем стандартный путь через ButtonsFrame
+        local btn = findActionButtonInCard(slotCardHint, "restart")
+        if btn and not isReviveRelated(btn) then
+            return btn
+        end
+
+        -- Расширенный поиск: все GuiButton в карточке и её родителе
+        local searchRoots = { slotCardHint }
+        pcall(function()
+            if slotCardHint.Parent and slotCardHint.Parent:IsA("GuiObject") then
+                table.insert(searchRoots, slotCardHint.Parent)
+            end
+        end)
+
+        local restartCandidates = {}
+        local allButtons = {}
+        for _, root in ipairs(searchRoots) do
+            pcall(function()
+                for _, q in ipairs(root:GetDescendants()) do
+                    if q:IsA("GuiButton") and q.AbsoluteSize.X > 2 and q.AbsoluteSize.Y > 2 then
+                        local qnm = string.lower(tostring(q.Name or ""))
+                        local qtx = ""
+                        if q:IsA("TextButton") then qtx = string.lower(tostring(q.Text or "")) end
+                        local hasRestartText = false
+                        for _, d in ipairs(q:GetDescendants()) do
+                            if (d:IsA("TextLabel") or d:IsA("TextButton")) then
+                                if string.find(string.lower(tostring(d.Text or "")), "restart", 1, true) then
+                                    hasRestartText = true
+                                    break
+                                end
+                            end
+                        end
+                        local isRestart = string.find(qnm, "restart", 1, true)
+                            or string.find(qtx, "restart", 1, true)
+                            or hasRestartText
+                        if isRestart and not isReviveRelated(q) then
+                            table.insert(restartCandidates, q)
+                        end
+                        table.insert(allButtons, {
+                            name = q.Name,
+                            class = q.ClassName,
+                            vis = q.Visible,
+                            act = q.Active,
+                            text = qtx,
+                            hasRestart = isRestart,
+                        })
+                    end
+                end
+            end)
+        end
+
+        -- Диагностика: дамп всех кнопок в карточке
+        if #restartCandidates == 0 and (_deadRestartFailLogLastAt == nil or (tick() - _deadRestartFailLogLastAt) >= 5) then
+            _deadRestartFailLogLastAt = tick()
+            local parts = {}
+            for _, b in ipairs(allButtons) do
+                table.insert(parts, b.name .. "(" .. b.class .. ",vis=" .. tostring(b.vis) .. ",act=" .. tostring(b.act) .. ",text=" .. b.text .. ",restart=" .. tostring(b.hasRestart) .. ")")
+            end
+            log("DEAD restart: all buttons in card (" .. #allButtons .. "): " .. (next(parts) and table.concat(parts, " | ") or "NONE"))
+        end
+
+        if #restartCandidates > 0 then
+            return restartCandidates[1]
+        end
+        return nil
+    end
+
     local function tryHandleDeadCreature(slotCardHint, slotSelected)
         if not slotCardHint or type(slotCardHint.GetDescendants) ~= "function" then
             return false
@@ -1353,6 +1803,9 @@ local function tryClickCreaturePlayButton(creatureName)
 
         log("DEAD restart: entering tryHandleDeadCreature")
 
+        -- Закрываем промпт Revive, если он открылся случайно.
+        dismissRevivePrompt()
+
         -- DevConsole перехватывает VIM-клики — закрываем, если открыта.
         if isDevConsoleOpen() then
             log("DEAD restart: DevConsole is OPEN, closing before click attempt")
@@ -1360,7 +1813,7 @@ local function tryClickCreaturePlayButton(creatureName)
             wait(0.15)
         end
 
-        -- Шаг 1: если модалка подтверждения уже открыта — жмём RunButton в ней.
+        -- Шаг 1: если модалка подтверждения рестарта уже открыта — жмём RunButton в ней.
         local promptConfirmed = tryConfirmRestartPrompt()
         if promptConfirmed then
             _deadRestartLastAt = now
@@ -1369,50 +1822,78 @@ local function tryClickCreaturePlayButton(creatureName)
             return true
         end
 
-        -- Шаг 2: жмём RestartButton в карточке слота → откроется модалка подтверждения.
-        local slotRestart = findActionButtonInCard(slotCardHint, "restart")
+        -- Шаг 2: ищем RestartButton в карточке (расширенный поиск, с защитой от Revive).
+        local slotRestart = findRestartButtonInCard(slotCardHint)
         if not slotRestart then
-            if _deadRestartFailLogLastAt == nil or (now - _deadRestartFailLogLastAt) >= 8 then
-                _deadRestartFailLogLastAt = now
-                log("DEAD restart: no RestartButton found in card")
+            -- Fallback: попробуем прямой Remote если GUI не работает.
+            local slotName = getSlotNameFromCard(slotCardHint)
+            if slotName then
+                log("DEAD restart: no RestartButton in card, trying direct remote for slot=" .. tostring(slotName))
+                local directOk = tryRestartSlotDirect(slotName)
+                if directOk then
+                    _deadRestartLastAt = now
+                    log("DEAD creature: restart via DIRECT REMOTE ok (no GUI button)")
+                    wait(1.5)
+                    return true
+                end
             end
             return false
         end
 
-        local rp = "?"
-        pcall(function()
-            rp = slotRestart:GetFullName()
-        end)
-        log(
-            "DEAD restart: clicking RestartButton "
-                .. tostring(rp)
-                .. " vis="
-                .. tostring(slotRestart.Visible)
-                .. " act="
-                .. tostring(slotRestart.Active)
-        )
+        -- Финальная проверка: кнопка НЕ Revive
+        if isReviveRelated(slotRestart) then
+            log("DEAD restart: BLOCKED — found button is Revive-related, refusing to click")
+            return false
+        end
 
-        -- Кликаем RestartButton и его UpperLabel (в CoS обработчик часто на UpperLabel, а не на самом RestartButton).
+        local rp = "?"
+        pcall(function() rp = slotRestart:GetFullName() end)
+        log("DEAD restart: clicking RestartButton " .. tostring(rp)
+                .. " vis=" .. tostring(slotRestart.Visible)
+                .. " act=" .. tostring(slotRestart.Active))
+
         pressActionButton(slotRestart, "Dead creature restart (slot)")
         local upperBtn = slotRestart:FindFirstChild("UpperLabel")
         if upperBtn and upperBtn:IsA("GuiButton") then
-            log("DEAD restart: also clicking UpperLabel inside RestartButton")
             pressActionButton(upperBtn, "Dead creature restart (UpperLabel)")
         end
 
-        wait(0.4)
+        wait(0.8)
 
-        -- Шаг 3: ждём модалку подтверждения и жмём RunButton.
-        for attempt = 1, 12 do
+        -- Шаг 3: ждём модалку подтверждения рестарта и жмём RunButton.
+        -- Максимум 6 попыток с паузой 0.5с — без спама.
+        for attempt = 1, 6 do
+            dismissRevivePrompt()
             local confirmed = tryConfirmRestartPrompt()
             if confirmed then
                 _deadRestartLastAt = now
                 log("DEAD creature: restart CONFIRMED via prompt (attempt " .. attempt .. ")")
-                wait(1.5)
+                wait(2)
                 return true
             end
-            
-            wait(0.3)
+            -- На 3-й попытке: повторно кликнуть RestartButton (может промпт не открылся).
+            if attempt == 3 then
+                dismissRevivePrompt()
+                wait(0.3)
+                pressActionButton(slotRestart, "Dead creature restart (retry)")
+                if upperBtn and upperBtn:IsA("GuiButton") then
+                    pressActionButton(upperBtn, "Dead creature restart UpperLabel (retry)")
+                end
+            end
+            wait(0.5)
+        end
+
+        -- Шаг 4 (fallback): прямой вызов RestartSlotRemote без Sonar
+        local slotName = getSlotNameFromCard(slotCardHint)
+        if slotName then
+            log("DEAD restart: GUI prompt failed, trying direct remote for slot=" .. tostring(slotName))
+            local directOk = tryRestartSlotDirect(slotName)
+            if directOk then
+                _deadRestartLastAt = now
+                log("DEAD creature: restart via DIRECT REMOTE ok")
+                wait(2)
+                return true
+            end
         end
 
         log("DEAD restart: prompt not found after click -> will retry next cycle")
@@ -1507,112 +1988,104 @@ local function tryClickCreaturePlayButton(creatureName)
         end
     end
 
-    local selectedNode = nil
-    local selectedCard = nil
-    local slotSelected = false
-    if creatureName ~= "" then
-        local slotsFrame = findSlotsFrame()
-        local nameNode = findNameNode(slotsFrame, creatureName)
-        if not nameNode then
-            nameNode = findNameNodeNearPlayButton(creatureName)
-        end
-        if nameNode then
-            selectedNode = nameNode
-            local slotCard = findSlotCard(nameNode, slotsFrame)
-            selectedCard = slotCard
-            if clickGui(nameNode, "Creature slot select (name)") then
-                slotSelected = true
-            end
-            if slotCard then
-                wait(0.05)
-                if clickGui(slotCard, "Creature slot select (card)") then
-                    slotSelected = true
-                end
-                local inner = slotCard:FindFirstChild("InnerFrame")
-                if inner and inner:IsA("GuiObject") then
-                    wait(0.05)
-                    if clickGui(inner, "Creature slot select (inner)") then
-                        slotSelected = true
-                    end
-                end
-            end
-            if not _slotFoundLoggedOnce then
-                _slotFoundLoggedOnce = true
-                log("Слот существа найден и выбран: " .. tostring(creatureName))
-            end
-        else
-            local now = tick()
-            if now - _playUiSlotMissLastAt >= 20 then
-                _playUiSlotMissLastAt = now
-                playUiImportant("PlayButton: слот «" .. tostring(creatureName) .. "» не найден")
-            end
-        end
-        wait(0.1)
+    -- ========== ЧИСТЫЙ ПОТОК: найти карточку → Play или Restart → ничего лишнего ==========
+
+    -- Шаг 0: Если экран слотов не виден — ничего не делаем, ждём.
+    local slotsFrame = findSlotsFrame()
+    if not slotsFrame then
+        return false
     end
 
-    for _ = 1, 4 do
-        if selectedCard then
-            dumpSelectedCardOnce(selectedCard)
-            local playInCard = findActionButtonInCard(selectedCard, "play")
-            if playInCard then
-                return clickGui(playInCard, "PlayButton click")
-            end
-            log("[v3] no play button, entering dead-creature path")
-            local deadOk, deadErr = pcall(tryHandleDeadCreature, selectedCard, slotSelected)
-            if not deadOk then
-                log("[v3] tryHandleDeadCreature ERROR: " .. tostring(deadErr))
-            elseif deadErr == true then
-                return true
-            end
-            -- Для выбранного creatureName не кликаем ничего вне выбранной карточки.
-            if creatureName ~= "" then
-                return false
-            end
-        end
+    -- Шаг 1: Найти карточку с нужным существом.
+    if creatureName == "" then
+        -- Без имени — fallback: ищем любую Play кнопку (только для общего случая без конкретного существа).
         local candidates = findPlayButtons()
         if #candidates > 0 then
-            return clickGui(candidates[1], "PlayButton click (fallback)")
+            return pressActionButton(candidates[1], "PlayButton click (fallback)") == true
         end
-        wait(0.08)
+        return false
     end
 
+    local nameNode = findNameNode(slotsFrame, creatureName)
+    if not nameNode then
+        nameNode = findNameNodeNearPlayButton(creatureName)
+    end
+    if not nameNode then
+        local now = tick()
+        if now - _playUiSlotMissLastAt >= 20 then
+            _playUiSlotMissLastAt = now
+            log("Слот «" .. tostring(creatureName) .. "» не найден на экране")
+        end
+        return false
+    end
+
+    local slotCard = findSlotCard(nameNode, slotsFrame)
+    if not slotCard then
+        return false
+    end
+
+    -- Проверяем, что карточка содержит имя существа (не пустой слот).
+    local hasCreature = false
+    pcall(function()
+        for _, desc in ipairs(slotCard:GetDescendants()) do
+            if desc:IsA("TextLabel") or desc:IsA("TextButton") or desc:IsA("TextBox") then
+                if containsLower(string.lower(tostring(desc.Text or "")), creatureName) then
+                    hasCreature = true
+                    return
+                end
+            end
+        end
+    end)
+    if not hasCreature then
+        log("Карточка не содержит «" .. tostring(creatureName) .. "» — пустой слот, пропускаем")
+        return false
+    end
+
+    if not _slotFoundLoggedOnce then
+        _slotFoundLoggedOnce = true
+        log("Слот существа найден: " .. tostring(creatureName))
+    end
+
+    -- Шаг 2: Кликнуть по имени чтобы ВЫБРАТЬ карточку — максимум раз в 2с.
+    -- Без этого клика кнопки Play/Restart неактивны (Active=false) и игра их игнорирует.
+    local now = tick()
+    if (_slotNameClickLastAt == nil) or (now - _slotNameClickLastAt) >= 2 then
+        _slotNameClickLastAt = now
+        clickGui(nameNode, "Creature slot select (name)")
+        wait(0.4)
+    end
+
+    -- Если после клика по карточке появился промпт Revive — закрываем его.
+    dismissRevivePrompt()
+
+    dumpSelectedCardOnce(slotCard)
+
+    -- Шаг 3: Если Play виден → кликнуть Play (существо живо).
+    local playBtn = findActionButtonInCard(slotCard, "play")
+    if playBtn then
+        pressActionButton(playBtn, "PlayButton click")
+        return true
+    end
+
+    -- Шаг 4: Нет Play → существо мертво → Restart.
+    local deadOk, deadResult = pcall(tryHandleDeadCreature, slotCard, true)
+    if not deadOk then
+        log("tryHandleDeadCreature ERROR: " .. tostring(deadResult))
+    elseif deadResult == true then
+        return true
+    end
     return false
 end
 
 local function selectCreature(creatureName)
-    -- Не спамим этим в каждом тике: лог только при фактическом клике/ошибке.
-    
     local success, selected = pcall(function()
+        -- ТОЛЬКО SpawnCreature remote — НЕ кликаем по GUI.
+        -- Клики по GUI кнопкам могут попасть на Revive/Create в SaveSelectionGui.
         local spawnEvent = ReplicatedStorage:FindFirstChild("SpawnCreature")
         if spawnEvent and spawnEvent:IsA("RemoteEvent") then
             spawnEvent:FireServer(creatureName)
+            return true
         end
-
-        local gui = player:WaitForChild("PlayerGui")
-        local creatureSelect = gui:FindFirstChild("CreatureInventoryGui")
-            or gui:FindFirstChild("CreatureSelect")
-            or gui:FindFirstChild("SpawnGui")
-            or gui:FindFirstChild("CharacterSelect")
-            or gui:FindFirstChild("CreatureSelection")
-        
-        if creatureSelect then
-            for _, btn in pairs(creatureSelect:GetDescendants()) do
-                if btn:IsA("TextButton") or btn:IsA("ImageButton") then
-                    local btnText = (btn.Text or "") .. btn.Name
-                    if string.find(string.lower(btnText), string.lower(creatureName), 1, true) then
-                        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
-                        local inset = GuiService:GetGuiInset()
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, true, game, 0)
-                        wait(0.1)
-                        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, false, game, 0)
-                        playUiLog("Clicked creature UI: " .. btn.Name)
-                        wait(0.5)
-                        return true
-                    end
-                end
-            end
-        end
-
         return false
     end)
     
@@ -1621,6 +2094,59 @@ local function selectCreature(creatureName)
         return false
     end
     return selected == true
+end
+
+-- Перезапуск существа через серверный remote — без GUI, без Revive промптов.
+-- Вызывается из handlers.farm после Claim & retry! чтобы существо стало живым перед Play.
+local function restartCreatureDirectRemote(creatureName)
+    local slotName = nil
+
+    -- Способ 1: слот из player.Settings.Slot
+    pcall(function()
+        local settings = player:FindFirstChild("Settings")
+        if settings then
+            local slotOV = settings:FindFirstChild("Slot")
+            if slotOV and slotOV.Value then
+                slotName = slotOV.Value.Name
+            end
+        end
+    end)
+
+    -- Найти RestartSlotRemote в ReplicatedStorage
+    local rf = nil
+    pcall(function()
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc.Name == "RestartSlotRemote" and desc:IsA("RemoteFunction") then
+                rf = desc
+                break
+            end
+        end
+    end)
+    if not rf then
+        log("[remote-restart] RestartSlotRemote not found")
+        return false
+    end
+
+    if slotName then
+        log("[remote-restart] slot from Settings: " .. tostring(slotName))
+        local ok, res = pcall(function() return rf:InvokeServer(slotName, false) end)
+        if ok and res then return true end
+    end
+
+    -- Способ 2: перебрать слоты Slot1..Slot5
+    for i = 1, 5 do
+        local tryName = "Slot" .. tostring(i)
+        if tryName ~= slotName then
+            local ok, res = pcall(function() return rf:InvokeServer(tryName, false) end)
+            if ok and res then
+                log("[remote-restart] restarted slot " .. tryName)
+                return true
+            end
+        end
+    end
+
+    log("[remote-restart] WARN: не удалось перезапустить существо")
+    return false
 end
 
 -- Цикл «Play» + выбор слота, пока не появится Character (вход в мир).
@@ -1646,8 +2172,6 @@ local function tryEnterWorldFromSlotUi(maxSeconds, creatureName)
                 log("Play loop: слишком много попыток (" .. tostring(attempts) .. "), выходим")
                 return false
             end
-            tryClickCreaturePlayButton(creatureName)
-            selectCreature(creatureName)
             tryClickCreaturePlayButton(creatureName)
             nextAttemptAt = now + PLAY_CLICK_INTERVAL
         end
@@ -1678,50 +2202,900 @@ local function doSuicide()
     return success
 end
 
-local function doMissionStep()
-    log("Doing mission step...")
-    
-    local success = pcall(function()
-        local gui = player:WaitForChild("PlayerGui")
-        local gameGui = gui:FindFirstChild("GameGUI") or gui:FindFirstChild("MainGui")
-        
-        if gameGui then
-            -- Ищем кнопку миссий
-            local missionsBtn = gameGui:FindFirstChild("MissionsButton") 
-                or gameGui:FindFirstChild("MissionButton")
-                or gameGui:FindFirstChild("Quests")
-            
-            if missionsBtn then
-                -- Кликаем
-                local pos = missionsBtn.AbsolutePosition + (missionsBtn.AbsoluteSize / 2)
-                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-                wait(0.1)
-                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-                wait(1)
-                
-                -- Ищем кнопку "Начать" или "Следующая"
-                local startBtn = gameGui:FindFirstChild("StartMission") 
-                    or gameGui:FindFirstChild("NextMission")
-                    or gameGui:FindFirstChild("Claim")
-                
-                if startBtn then
-                    pos = startBtn.AbsolutePosition + (startBtn.AbsoluteSize / 2)
-                    VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-                    wait(0.1)
-                    VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-                    wait(2)
+-- ========== MISSION SYSTEM: Infrastructure ==========
+
+-- Throttled mission log: avoid spamming the same message
+local function mlog(msg, throttleKey, intervalSec)
+    intervalSec = intervalSec or 10
+    if throttleKey then
+        local now = tick()
+        if _missionState.logThrottles[throttleKey] and now - _missionState.logThrottles[throttleKey] < intervalSec then
+            return
+        end
+        _missionState.logThrottles[throttleKey] = now
+    end
+    log("[missions] " .. msg)
+end
+
+-- ========== MissionReader ==========
+local function getSlotDataFolder()
+    local slot = nil
+    pcall(function()
+        local s = player:FindFirstChild("Settings")
+        if s then
+            local sv = s:FindFirstChild("Slot")
+            if sv and sv:IsA("ObjectValue") and sv.Value then
+                slot = sv.Value
+            end
+        end
+    end)
+    if slot then return slot end
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if pg then
+            local d = pg:FindFirstChild("Data")
+            if d then
+                for _, ch in ipairs(d:GetChildren()) do
+                    if ch.Name:match("^Slot%d") then
+                        slot = ch
+                        break
+                    end
                 end
             end
         end
-        
-        -- Альтернатива: через RemoteEvent
-        local missionEvent = ReplicatedStorage:FindFirstChild("DoMission")
-        if missionEvent then
-            missionEvent:FireServer()
+    end)
+    return slot
+end
+
+local function readRegionMissions(regionName)
+    local result = {}
+    pcall(function()
+        local slot = getSlotDataFolder()
+        if not slot then return end
+        local missions = slot:FindFirstChild("RegionMissions")
+        if not missions then
+            local m2 = slot:FindFirstChild("Missions")
+            if m2 then missions = m2:FindFirstChild("RegionMissions") end
+        end
+        if not missions then return end
+        local regionFolder = missions:FindFirstChild(regionName)
+        if not regionFolder then return end
+        for _, missionChild in ipairs(regionFolder:GetChildren()) do
+            local mType = missionChild.Name
+            local amount, targetAmount, completed = 0, 0, false
+            local amountVal = missionChild:FindFirstChild("Amount")
+            local targetVal = missionChild:FindFirstChild("TargetAmount")
+            local valueVal  = missionChild:FindFirstChild("Value")
+            local claimedVal = missionChild:FindFirstChild("Claimed")
+            if amountVal then amount = amountVal.Value or 0 end
+            if targetVal then targetAmount = targetVal.Value or 0 end
+            if valueVal then
+                if typeof(valueVal.Value) == "boolean" then
+                    completed = valueVal.Value
+                end
+            end
+            if claimedVal and claimedVal.Value == true then completed = true end
+            if amount >= targetAmount and targetAmount > 0 then completed = true end
+            result[mType] = {amount = amount, targetAmount = targetAmount, completed = completed}
         end
     end)
-    
-    return success
+    return result
+end
+
+-- ========== MoveEngine ==========
+local function getHRP()
+    refreshCharacterRefs()
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getPosition()
+    local hrp = getHRP()
+    if hrp then return hrp.Position end
+    return nil
+end
+
+local function safeTeleport(x, y, z)
+    local hrp = getHRP()
+    if not hrp then return false end
+    if y < -100 then y = 50 end
+    for attempt = 1, 3 do
+        pcall(function()
+            hrp.CFrame = CFrame.new(x, y + 5, z)
+        end)
+        task.wait(0.5)
+        local pos = getPosition()
+        if pos and (Vector3.new(x, y + 5, z) - pos).Magnitude < 100 then
+            return true
+        end
+        x = x + (attempt * 5)
+        z = z + (attempt * 5)
+    end
+    return true
+end
+
+local function safeTeleportVec(vec)
+    return safeTeleport(vec[1], vec[2], vec[3])
+end
+
+local function walkToward(targetX, targetY, targetZ, maxTime)
+    maxTime = maxTime or 8
+    refreshCharacterRefs()
+    if not humanoid then return false end
+    local target = Vector3.new(targetX, targetY, targetZ)
+    pcall(function() humanoid:MoveTo(target) end)
+    local t0 = tick()
+    while tick() - t0 < maxTime do
+        local pos = getPosition()
+        if pos and (Vector3.new(targetX, pos.Y, targetZ) - Vector3.new(pos.X, pos.Y, pos.Z)).Magnitude < 10 then
+            return true
+        end
+        task.wait(0.3)
+    end
+    pcall(function() humanoid:MoveTo(humanoid.RootPart.Position) end)
+    return false
+end
+
+local function distanceBetween(pos, vec)
+    if not pos then return 9999 end
+    return (pos - Vector3.new(vec[1], vec[2], vec[3])).Magnitude
+end
+
+-- ========== RuntimeScanner ==========
+local function scanForFood(pos, radius)
+    radius = radius or 400
+    local best, bestDist = nil, radius
+    pcall(function()
+        local tagged = CollectionService:GetTagged("Food")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent and (obj:IsA("BasePart") or obj:IsA("Model")) then
+                local p = obj:IsA("Model") and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position) or obj.Position
+                local d = (pos - p).Magnitude
+                if d < bestDist then
+                    local val = nil
+                    pcall(function() val = obj:GetAttribute("Value") end)
+                    if val == nil then
+                        pcall(function()
+                            local vc = obj:FindFirstChild("Value")
+                            if vc and vc:IsA("NumberValue") then val = vc.Value end
+                        end)
+                    end
+                    if val == nil or val > 0 then
+                        best = obj
+                        bestDist = d
+                    end
+                end
+            end
+        end
+    end)
+    return best, bestDist
+end
+
+local function scanForWater(pos, radius)
+    radius = radius or 600
+    local best, bestDist = nil, radius
+    pcall(function()
+        local tagged = CollectionService:GetTagged("DrinkableWater")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent then
+                local p = obj:IsA("Model") and obj:GetPivot().Position or obj.Position
+                local d = (pos - p).Magnitude
+                if d < bestDist then
+                    best = obj
+                    bestDist = d
+                end
+            end
+        end
+    end)
+    if not best then
+        pcall(function()
+            local waterNames = {Lake = true, lake = true, Water = true, water = true, Pond = true, pond = true, Oasis = true, MagicalLake = true}
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if obj:IsA("BasePart") and obj.Size.Magnitude > 20 then
+                    if waterNames[obj.Name] or obj.Name:find("[Ll]ake") or obj.Name:find("[Ww]ater") then
+                        local d = (pos - obj.Position).Magnitude
+                        if d < bestDist then
+                            best = obj
+                            bestDist = d
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    return best, bestDist
+end
+
+local function scanForNPCs(pos, radius)
+    radius = radius or 400
+    local results = {}
+    pcall(function()
+        local npcFolder = workspace:FindFirstChild("NPCs")
+        if npcFolder then
+            for _, obj in ipairs(npcFolder:GetChildren()) do
+                if obj:IsA("Model") and obj.PrimaryPart then
+                    local d = (pos - obj.PrimaryPart.Position).Magnitude
+                    if d < radius then
+                        table.insert(results, {model = obj, distance = d, position = obj.PrimaryPart.Position})
+                    end
+                end
+            end
+        end
+        local tagged = CollectionService:GetTagged("NPC")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent then
+                local p = obj:IsA("Model") and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position) or obj.Position
+                local d = (pos - p).Magnitude
+                if d < radius then
+                    local already = false
+                    for _, r in ipairs(results) do
+                        if r.model == obj then already = true; break end
+                    end
+                    if not already then
+                        table.insert(results, {model = obj, distance = d, position = p})
+                    end
+                end
+            end
+        end
+    end)
+    table.sort(results, function(a, b) return a.distance < b.distance end)
+    return results
+end
+
+local function scanForMud(pos, radius)
+    radius = radius or 400
+    local best, bestDist = nil, radius
+    pcall(function()
+        local tagged = CollectionService:GetTagged("Mud")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent then
+                local p = obj:IsA("Model") and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position) or obj.Position
+                local d = (pos - p).Magnitude
+                if d < bestDist then
+                    best = obj
+                    bestDist = d
+                end
+            end
+        end
+    end)
+    return best, bestDist
+end
+
+local function scanForShoomPiles(regionName)
+    local results = {}
+    pcall(function()
+        local folder = workspace:FindFirstChild("Interactions")
+        if folder then
+            local shoomFolder = folder:FindFirstChild("ShoomPiles")
+            if shoomFolder then
+                for _, obj in ipairs(shoomFolder:GetDescendants()) do
+                    if obj:IsA("Model") or obj:IsA("BasePart") then
+                        local reg = nil
+                        pcall(function() reg = obj:GetAttribute("Region") end)
+                        if reg == regionName then
+                            local id = nil
+                            pcall(function() id = obj:GetAttribute("Id") end)
+                            local p = obj:IsA("Model") and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position) or obj.Position
+                            table.insert(results, {model = obj, region = reg, id = id, position = p})
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return results
+end
+
+-- ========== SurvivalGuard ==========
+local _maxFoodSeen = 0
+local _maxWaterSeen = 0
+
+local function getCreatureStats()
+    local stats = {food = 999, water = 999, hp = 100, maxFood = 100, maxWater = 100}
+    pcall(function()
+        local slot = getSlotDataFolder()
+        if slot then
+            local foodVal = slot:FindFirstChild("Food")
+            if foodVal then stats.food = foodVal.Value or 0 end
+            local waterVal = slot:FindFirstChild("Water")
+            if waterVal then stats.water = waterVal.Value or 0 end
+        end
+    end)
+    if stats.food ~= 999 and stats.food > _maxFoodSeen then _maxFoodSeen = stats.food end
+    if stats.water ~= 999 and stats.water > _maxWaterSeen then _maxWaterSeen = stats.water end
+    stats.maxFood = _maxFoodSeen > 0 and _maxFoodSeen or 100
+    stats.maxWater = _maxWaterSeen > 0 and _maxWaterSeen or 100
+    pcall(function()
+        refreshCharacterRefs()
+        if character then
+            local hp = character:GetAttribute("Health")
+            if type(hp) == "number" then stats.hp = hp end
+        end
+    end)
+    return stats
+end
+
+local function isFull(stats, kind)
+    if kind == "food" then
+        if stats.food >= 999 then return true end
+        if _maxFoodSeen > 0 and stats.food >= _maxFoodSeen * 0.95 then return true end
+        return false
+    end
+    if stats.water >= 999 then return true end
+    if _maxWaterSeen > 0 and stats.water >= _maxWaterSeen * 0.95 then return true end
+    return false
+end
+
+local function needsSurvivalAction(stats)
+    if stats.hp < SURVIVAL_HP_CRITICAL then return "flee" end
+    if stats.food < SURVIVAL_FOOD_CRITICAL and not isFull(stats, "food") then return "food" end
+    if stats.water < SURVIVAL_WATER_CRITICAL and not isFull(stats, "water") then return "water" end
+    return nil
+end
+
+local _remoteCache = {}
+local function getRemoteEvent(name)
+    if _remoteCache["e:" .. name] then return _remoteCache["e:" .. name] end
+    local re = nil
+    pcall(function()
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc.Name == name and desc:IsA("RemoteEvent") then
+                re = desc; break
+            end
+        end
+    end)
+    if re then _remoteCache["e:" .. name] = re end
+    return re
+end
+
+local function getRemoteFunction(name)
+    if _remoteCache["f:" .. name] then return _remoteCache["f:" .. name] end
+    local rf = nil
+    pcall(function()
+        for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+            if desc.Name == name and desc:IsA("RemoteFunction") then
+                rf = desc; break
+            end
+        end
+    end)
+    if rf then _remoteCache["f:" .. name] = rf end
+    return rf
+end
+
+local function doEatFood(foodObj)
+    if not foodObj or not foodObj.Parent then return false end
+    local statsBefore = getCreatureStats()
+    if isFull(statsBefore, "food") then
+        mlog("Already full (food=" .. tostring(statsBefore.food) .. "/" .. tostring(_maxFoodSeen) .. "), skip eat", "full_skip", 15)
+        return false
+    end
+    local fp = foodObj:IsA("Model")
+        and (foodObj.PrimaryPart and foodObj.PrimaryPart.Position or foodObj:GetPivot().Position)
+        or foodObj.Position
+    local hrp = getHRP()
+    if not hrp then return false end
+    pcall(function() hrp.CFrame = CFrame.new(fp.X, fp.Y + 1, fp.Z) end)
+    task.wait(0.3)
+    local re = getRemoteEvent("Food")
+    if re then
+        local prevFood = statsBefore.food
+        for i = 1, 6 do
+            pcall(function() re:FireServer(foodObj) end)
+            task.wait(1.2)
+            local s = getCreatureStats()
+            if isFull(s, "food") then
+                mlog("Ate until full (food=" .. tostring(s.food) .. ")", "eat_done", 10)
+                break
+            end
+            if i > 2 and s.food <= prevFood then
+                mlog("Food value unchanged (" .. tostring(s.food) .. "), source empty or full", "eat_no_change", 10)
+                break
+            end
+            prevFood = s.food
+        end
+        return true
+    end
+    return false
+end
+
+local function doDrinkWater(waterObj)
+    if not waterObj or not waterObj.Parent then return false end
+    local statsBefore = getCreatureStats()
+    if isFull(statsBefore, "water") then
+        mlog("Already full water (water=" .. tostring(statsBefore.water) .. "/" .. tostring(_maxWaterSeen) .. "), skip drink", "full_skip_w", 15)
+        return false
+    end
+    local wp = waterObj:IsA("Model") and waterObj:GetPivot().Position or waterObj.Position
+    local hrp = getHRP()
+    if not hrp then return false end
+    pcall(function() hrp.CFrame = CFrame.new(wp.X, wp.Y + 2, wp.Z) end)
+    task.wait(0.3)
+    local isBuildable = false
+    pcall(function() isBuildable = waterObj:HasTag("Buildable") end)
+    local reName = isBuildable and "DrinkBuildableWater" or "DrinkRemote"
+    local re = getRemoteEvent(reName)
+    if re then
+        local prevWater = statsBefore.water
+        for i = 1, 6 do
+            pcall(function() re:FireServer(waterObj) end)
+            task.wait(1.5)
+            local s = getCreatureStats()
+            if isFull(s, "water") then
+                mlog("Drank until full (water=" .. tostring(s.water) .. ")", "drink_done", 10)
+                break
+            end
+            if i > 2 and s.water <= prevWater then
+                mlog("Water value unchanged (" .. tostring(s.water) .. "), source empty or full", "drink_no_change", 10)
+                break
+            end
+            prevWater = s.water
+        end
+        return true
+    end
+    return false
+end
+
+local function doEmergencyRefill(need)
+    local pos = getPosition()
+    if not pos then return false end
+    if need == "food" then
+        local s = getCreatureStats()
+        if isFull(s, "food") then return true end
+        local food, dist = scanForFood(pos, 600)
+        if food then
+            mlog("Refill: eating food at dist=" .. math.floor(dist), "refill_food", 5)
+            doEatFood(food)
+            return true
+        end
+    elseif need == "water" then
+        local s = getCreatureStats()
+        if isFull(s, "water") then return true end
+        local water, dist = scanForWater(pos, 800)
+        if water then
+            mlog("Refill: drinking water at dist=" .. math.floor(dist), "refill_water", 5)
+            doDrinkWater(water)
+            return true
+        end
+    elseif need == "flee" then
+        local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+        if biome then
+            safeTeleportVec(biome.safe)
+            task.wait(2)
+        end
+        return true
+    end
+    return false
+end
+
+-- ========== Mission Executors ==========
+
+local function execEatFoodDrinkWater()
+    local pos = getPosition()
+    if not pos then return false end
+    local stats = getCreatureStats()
+    if isFull(stats, "food") and isFull(stats, "water") then
+        mlog("Both food and water full, skip eat/drink mission step", "eat_drink_full", 15)
+        return true
+    end
+    local doWater = stats.water < stats.food
+    if isFull(stats, "food") then doWater = true end
+    if isFull(stats, "water") then doWater = false end
+    if _missionState.eatDrinkToggle == "water" and not isFull(stats, "water") then doWater = true end
+    _missionState.eatDrinkToggle = doWater and "food" or "water"
+
+    if doWater then
+        local water, dist = scanForWater(pos, 800)
+        if water then
+            doDrinkWater(water)
+            task.wait(1)
+            return true
+        end
+    else
+        local food, dist = scanForFood(pos, 600)
+        if food then
+            doEatFood(food)
+            task.wait(1)
+            return true
+        end
+    end
+    mlog("No food/water found nearby, moving to biome center", "no_food_water", 30)
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if biome then safeTeleportVec(biome.entry) end
+    return false
+end
+
+local function findNearbyPlayers(pos, radius)
+    radius = radius or 400
+    local results = {}
+    pcall(function()
+        local myPlayer = game:GetService("Players").LocalPlayer
+        for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
+            if p ~= myPlayer and p.Character then
+                local hrpOther = p.Character:FindFirstChild("HumanoidRootPart")
+                if hrpOther then
+                    local d = (pos - hrpOther.Position).Magnitude
+                    if d < radius and d > 5 then
+                        table.insert(results, {model = p.Character, distance = d, position = hrpOther.Position, name = p.Name})
+                    end
+                end
+            end
+        end
+    end)
+    table.sort(results, function(a, b) return a.distance < b.distance end)
+    return results
+end
+
+local function execAttackOrHealNPC()
+    local pos = getPosition()
+    if not pos then return false end
+    local safePos = pos
+
+    local npcs = scanForNPCs(pos, 500)
+    if #npcs > 0 then
+        local target = npcs[1]
+        safeTeleport(target.position.X, target.position.Y + 2, target.position.Z)
+        task.wait(0.3)
+        pcall(function()
+            local dmgRemote = getRemoteEvent("MobDamageRemote")
+            if dmgRemote then dmgRemote:FireServer({target.model}) end
+        end)
+        pcall(function()
+            local charDmg = getRemoteEvent("CharactersDamageRemote")
+            if charDmg then charDmg:FireServer({target.model}) end
+        end)
+        task.wait(0.5)
+        safeTeleport(safePos.X, safePos.Y + 3, safePos.Z)
+        task.wait(0.5)
+        mlog("Attacked NPC at dist=" .. math.floor(target.distance), "atk_npc", 10)
+        return true
+    end
+
+    local players = findNearbyPlayers(pos, 500)
+    if #players > 0 then
+        local target = players[1]
+        safeTeleport(target.position.X, target.position.Y + 2, target.position.Z)
+        task.wait(0.2)
+        pcall(function()
+            local charDmg = getRemoteEvent("CharactersDamageRemote")
+            if charDmg then charDmg:FireServer({target.model}) end
+        end)
+        task.wait(0.3)
+        safeTeleport(safePos.X, safePos.Y + 3, safePos.Z)
+        task.wait(0.5)
+        mlog("Attacked player " .. target.name .. " at dist=" .. math.floor(target.distance), "atk_player", 10)
+        return true
+    end
+
+    _missionState.attackRetryCount = (_missionState.attackRetryCount or 0) + 1
+    if _missionState.attackRetryCount > 3 then
+        mlog("No NPCs or players found, marking stuck", "no_targets", 30)
+        local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":AttackOrHealCreatureOrNPC"
+        _missionState.missionStuckTimers[stuckKey] = tick()
+        _missionState.attackRetryCount = 0
+        return false
+    end
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if biome and biome.walk and #biome.walk > 0 then
+        safeTeleportVec(biome.walk[math.random(1, #biome.walk)])
+    end
+    return false
+end
+
+local function execConcealScent()
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if not biome or biome.zone ~= "Land" then return false end
+    local pos = getPosition()
+    if not pos then return false end
+    local mud, dist = scanForMud(pos, 600)
+    if not mud then
+        mlog("No mud found for ConcealScent", "no_mud", 30)
+        return false
+    end
+    local mp = mud:IsA("Model") and mud:GetPivot().Position or mud.Position
+    local hrp = getHRP()
+    if not hrp then return false end
+    pcall(function() hrp.CFrame = CFrame.new(mp.X, mp.Y + 1, mp.Z) end)
+    task.wait(0.5)
+    pcall(function()
+        local re = getRemoteEvent("Mud")
+        if re then
+            local root = mud:IsA("Model") and (mud.PrimaryPart or mud:FindFirstChildWhichIsA("BasePart")) or mud
+            re:FireServer(root)
+        end
+    end)
+    task.wait(1)
+    pcall(function()
+        local re = getRemoteEvent("HideScent")
+        if re then re:FireServer() end
+    end)
+    task.wait(2)
+    return true
+end
+
+local function execSniff()
+    local now = tick()
+    if now - _missionState.lastSniffTime < 18 then return false end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.H, false, game)
+        task.wait(0.15)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.H, false, game)
+    end)
+    _missionState.lastSniffTime = now
+    task.wait(1)
+    return true
+end
+
+local function execDistanceTravelled()
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if not biome or not biome.walk or #biome.walk == 0 then return false end
+    local idx = _missionState.walkLoopIdx
+    if idx > #biome.walk then idx = 1 end
+    local wp = biome.walk[idx]
+    local pos = getPosition()
+    if not pos then return false end
+    local dist = distanceBetween(pos, wp)
+    if dist > 100 then
+        safeTeleportVec(wp)
+        _missionState.walkLoopIdx = idx + 1
+        task.wait(0.5)
+        return true
+    end
+    local arrived = walkToward(wp[1], wp[2], wp[3], 6)
+    _missionState.walkLoopIdx = idx + 1
+    task.wait(0.3)
+    return true
+end
+
+local function execShoomPilesCollected()
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if not biome then return false end
+    local piles = scanForShoomPiles(biome.name)
+    if #piles == 0 then
+        _missionState.shoomRetryCount = (_missionState.shoomRetryCount or 0) + 1
+        if _missionState.shoomRetryCount > 5 then
+            mlog("No shoom piles in " .. biome.name .. ", skipping", "no_shoom", 60)
+            return false
+        end
+        return false
+    end
+    _missionState.shoomRetryCount = 0
+    local pile = piles[math.random(1, #piles)]
+    local pos = getPosition()
+    if pos and pile.position then
+        safeTeleport(pile.position.X, pile.position.Y + 3, pile.position.Z)
+        task.wait(0.5)
+    end
+    pcall(function()
+        local rf = getRemoteFunction("ShoomPileCollected")
+        if rf and pile.region and pile.id then
+            rf:InvokeServer(pile.region, pile.id)
+        end
+    end)
+    task.wait(1)
+    return true
+end
+
+local function execTimePlayed()
+    local stats = getCreatureStats()
+    local need = needsSurvivalAction(stats)
+    if need then
+        doEmergencyRefill(need)
+    end
+    task.wait(1)
+    return true
+end
+
+-- Mission executor dispatch
+local MISSION_EXECUTORS = {
+    EatFoodDrinkWater          = execEatFoodDrinkWater,
+    AttackOrHealCreatureOrNPC  = execAttackOrHealNPC,
+    ConcealScent               = execConcealScent,
+    Sniff                      = execSniff,
+    DistanceTravelled          = execDistanceTravelled,
+    ShoomPilesCollected        = execShoomPilesCollected,
+    TimePlayed                 = execTimePlayed,
+}
+
+-- ========== MissionPlanner + BiomeRotation + FarmLoop ==========
+
+local function isBiomeComplete(regionName)
+    local missions = readRegionMissions(regionName)
+    if not next(missions) then return true end
+    for mType, m in pairs(missions) do
+        if not m.completed then return false end
+    end
+    return true
+end
+
+local function canExecuteMission(mType, mData, zone)
+    if mData.completed then return false end
+    if mType == "ConcealScent" and zone ~= "Land" then return false end
+    if mType == "EatFoodDrinkWater" then
+        local stats = getCreatureStats()
+        if isFull(stats, "food") and isFull(stats, "water") then return false end
+    end
+    local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":" .. mType
+    local stuckTime = _missionState.missionStuckTimers[stuckKey] or 0
+    if tick() - stuckTime < 90 then return false end
+    return true
+end
+
+local MISSION_PRIORITY = {
+    AttackOrHealCreatureOrNPC = 1,
+    ConcealScent = 2,
+    Sniff = 3,
+    ShoomPilesCollected = 4,
+    EatFoodDrinkWater = 5,
+    DistanceTravelled = 6,
+    TimePlayed = 99,
+}
+
+local function pickNextMission(regionName, zone)
+    local missions = readRegionMissions(regionName)
+    local bestType, bestData, bestPrio = nil, nil, 999
+    for mType, mData in pairs(missions) do
+        if canExecuteMission(mType, mData, zone) then
+            local prio = MISSION_PRIORITY[mType] or 50
+            if prio < bestPrio then
+                bestType = mType
+                bestData = mData
+                bestPrio = prio
+            end
+        end
+    end
+    if bestType then return bestType, bestData end
+    return nil, nil
+end
+
+local function switchBiome()
+    local startIdx = _missionState.currentBiomeIdx
+    for i = 1, #BIOME_ATLAS do
+        local idx = ((startIdx - 1 + i) % #BIOME_ATLAS) + 1
+        local biome = BIOME_ATLAS[idx]
+        if not isBiomeComplete(biome.name) then
+            _missionState.currentBiomeIdx = idx
+            _missionState.walkLoopIdx = 1
+            _missionState.shoomRetryCount = 0
+            _missionState.attackRetryCount = 0
+            _missionState.biomeEnteredTime = tick()
+            _missionState.missionStuckTimers = {}
+            mlog("Switching to biome: " .. biome.name .. " (" .. biome.zone .. ")", nil)
+            safeTeleportVec(biome.entry)
+            task.wait(1)
+            return true
+        end
+    end
+    mlog("All biomes complete!", nil)
+    return false
+end
+
+-- AntiStuck detection
+local function checkAntiStuck()
+    local pos = getPosition()
+    if not pos then return false end
+    local lastPos = _missionState.lastPositions
+    local now = tick()
+    if lastPos.pos and (now - (lastPos.time or 0)) > 3 then
+        local delta = (pos - lastPos.pos).Magnitude
+        if delta < 5 then
+            _missionState.stuckTimer = (_missionState.stuckTimer or 0) + (now - (lastPos.time or now))
+        else
+            _missionState.stuckTimer = 0
+        end
+        lastPos.pos = pos
+        lastPos.time = now
+    elseif not lastPos.pos then
+        lastPos.pos = pos
+        lastPos.time = now
+    end
+    if _missionState.stuckTimer > 10 then
+        mlog("Stuck detected! Recovering...", "stuck", 15)
+        _missionState.stuckTimer = 0
+        pcall(function()
+            refreshCharacterRefs()
+            if humanoid then
+                humanoid.Jump = true
+            end
+        end)
+        task.wait(0.5)
+        local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+        if biome and biome.walk and #biome.walk > 0 then
+            local wp = biome.walk[math.random(1, #biome.walk)]
+            safeTeleportVec(wp)
+        end
+        return true
+    end
+    return false
+end
+
+-- Main doMissionStep (state machine, called each tick from handlers.farm)
+local function doMissionStep()
+    if not _missionState.initialized then
+        _missionState.initialized = true
+        _missionState.biomeEnteredTime = tick()
+        _maxFoodSeen = 0
+        _maxWaterSeen = 0
+        local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+        mlog("Mission system initialized, starting biome: " .. (biome and biome.name or "?"), nil)
+        safeTeleportVec(biome.entry)
+        task.wait(1)
+        return true
+    end
+
+    if not isCreatureAlive() then return false end
+
+    -- Step 1: Survival check
+    local stats = getCreatureStats()
+    local need = needsSurvivalAction(stats)
+    if need then
+        mlog("Survival: " .. need .. " (food=" .. tostring(stats.food) .. "/" .. tostring(_maxFoodSeen) .. " water=" .. tostring(stats.water) .. "/" .. tostring(_maxWaterSeen) .. " hp=" .. tostring(stats.hp) .. ")", "survival", 15)
+        doEmergencyRefill(need)
+        return true
+    end
+
+    -- Step 2: Anti-stuck check
+    if checkAntiStuck() then return true end
+
+    -- Step 3: Check biome
+    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
+    if not biome then
+        _missionState.currentBiomeIdx = 1
+        biome = BIOME_ATLAS[1]
+    end
+
+    -- Step 4: Pick next mission from ACTUAL game data
+    local missionType, missionData = pickNextMission(biome.name, biome.zone)
+
+    if not missionType then
+        if isBiomeComplete(biome.name) then
+            mlog("BIOME DONE " .. biome.name, nil)
+        else
+            mlog("No executable missions in " .. biome.name .. ", rotating", "no_exec", 30)
+        end
+        if not switchBiome() then
+            mlog("All biomes done or stuck, idling 10s", "all_done", 60)
+            task.wait(10)
+            return true
+        end
+        return true
+    end
+
+    if missionType ~= _missionState.currentMissionType then
+        _missionState.currentMissionType = missionType
+        mlog("mission_start=" .. missionType .. " in " .. biome.name, nil)
+    end
+
+    mlog("region=" .. biome.name .. " mission=" .. missionType .. " progress=" .. tostring(missionData.amount) .. "/" .. tostring(missionData.targetAmount), "progress:" .. biome.name .. ":" .. missionType, 30)
+
+    -- Step 5: Execute
+    local prevAmount = missionData.amount
+    local executor = MISSION_EXECUTORS[missionType]
+    if executor then
+        local execOk, execErr = pcall(function() executor() end)
+        if not execOk then
+            mlog("Mission executor error: " .. tostring(execErr), "exec_err", 10)
+        end
+    end
+
+    -- Step 6: Check progress
+    local newMissions = readRegionMissions(biome.name)
+    local newData = newMissions[missionType]
+    if newData then
+        if newData.amount > prevAmount then
+            local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":" .. missionType
+            _missionState.missionStuckTimers[stuckKey] = nil
+            mlog("PROGRESS " .. missionType .. " " .. tostring(newData.amount) .. "/" .. tostring(newData.targetAmount) .. " in " .. biome.name, nil)
+            if newData.completed then
+                mlog("MISSION COMPLETE: " .. missionType .. " in " .. biome.name, nil)
+            end
+        elseif newData.amount == prevAmount and missionType ~= "TimePlayed" and missionType ~= "DistanceTravelled" then
+            local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":" .. missionType
+            if not _missionState.missionStuckTimers[stuckKey] then
+                _missionState.missionStuckTimers[stuckKey] = tick()
+            end
+        end
+    end
+
+    return true
 end
 
 local function findPlayerByName(name)
@@ -1835,6 +3209,56 @@ local function findLavaPart()
     return found
 end
 
+-- Standalone button click helper (top-level, usable from tryClaimDeathRewards etc.)
+local function clickButtonTopLevel(btn, label)
+    if not btn or not btn:IsA("GuiButton") then return false end
+    label = label or "btn"
+    local ok = false
+
+    -- Force active
+    pcall(function() btn.Active = true; btn.Selectable = true end)
+
+    -- getconnections → fire handlers
+    pcall(function()
+        if type(getconnections) == "function" then
+            for _, sig in ipairs({btn.Activated, btn.MouseButton1Click}) do
+                local conns = getconnections(sig)
+                if conns then
+                    for _, c in pairs(conns) do
+                        local fn = nil
+                        pcall(function() fn = c and c.Function end)
+                        if type(fn) == "function" then pcall(fn); ok = true end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- firesignal
+    pcall(function()
+        if type(firesignal) == "function" then
+            if btn.Activated then firesignal(btn.Activated); ok = true end
+            if btn.MouseButton1Click then firesignal(btn.MouseButton1Click); ok = true end
+        end
+    end)
+
+    -- Activate()
+    pcall(function() btn:Activate(); ok = true end)
+
+    -- VIM click (center of button)
+    pcall(function()
+        local pos = btn.AbsolutePosition + (btn.AbsoluteSize / 2)
+        local inset = GuiService:GetGuiInset()
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, true, game, 0)
+        wait(0.05)
+        VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y + inset.Y, 0, false, game, 0)
+        ok = true
+    end)
+
+    log(label .. ": clicked " .. tostring(btn.Name) .. " ok=" .. tostring(ok))
+    return ok
+end
+
 -- Death reward tiers (from DeathRewards module in game data)
 local DEATH_REWARD_TIERS = {
     { points = 50,   name = "RandomStoredCreatureToken",  display = "Random Trial Creature Token" },
@@ -1889,57 +3313,46 @@ local function tryClaimDeathRewards(deathPoints)
         return calcEarnedTokens(deathPoints)
     end
 
-    wait(1)
+    wait(2)
 
     -- Click "Claim & retry!" button: ContainerFrame > BottomFrame > ButtonsFrame > Return
-    local claimed = false
+    -- CoS uses NewButton:RegisterClick → the handler is on UpperLabel (ImageButton) inside the button.
+    local returnBtn = nil
     pcall(function()
         local bottomFrame = containerFrame:FindFirstChild("BottomFrame")
         if not bottomFrame then return end
         local buttonsFrame = bottomFrame:FindFirstChild("ButtonsFrame")
         if not buttonsFrame then return end
-        local returnBtn = buttonsFrame:FindFirstChild("Return")
-        if returnBtn then
-            log("Нажимаем 'Claim & retry!' (Return)")
-            -- firesignal approach
-            pcall(function()
-                if firesignal and returnBtn.Activated then
-                    firesignal(returnBtn.Activated)
-                end
-            end)
-            pcall(function()
-                if firesignal and returnBtn.MouseButton1Click then
-                    firesignal(returnBtn.MouseButton1Click)
-                end
-            end)
-            pcall(function()
-                returnBtn:Activate()
-            end)
-            -- VIM click
-            pcall(function()
-                local pos = returnBtn.AbsolutePosition + (returnBtn.AbsoluteSize / 2)
-                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-                wait(0.05)
-                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-            end)
-            claimed = true
-        end
+        returnBtn = buttonsFrame:FindFirstChild("Return")
     end)
 
-    if not claimed then
-        log("WARN: кнопка Return не найдена, пробуем ClaimDeathRewardsRemote")
-        pcall(function()
-            local RemoteUtils = require(ReplicatedStorage:FindFirstChild("Sonar"):FindFirstChild("RemoteUtils"))
-            local claimRemote = RemoteUtils.GetRemoteFunction("ClaimDeathRewardsRemote")
-            if claimRemote then claimRemote:InvokeServer() end
-        end)
+    if returnBtn then
+        local upperLabel = returnBtn:FindFirstChild("UpperLabel")
+        local clickTarget = (upperLabel and upperLabel:IsA("GuiButton")) and upperLabel or returnBtn
+
+        for attempt = 1, 5 do
+            local closed = false
+            pcall(function()
+                closed = not containerFrame or not containerFrame.Visible
+            end)
+            if closed then break end
+
+            log("Нажимаем 'Claim & retry!' попытка " .. attempt)
+            clickButtonTopLevel(clickTarget, "Claim & retry")
+            wait(2)
+        end
+    else
+        log("WARN: кнопка Return не найдена в DeathGui")
     end
 
+    -- Если после 5 кликов DeathGui всё ещё видим — remote fallback
     wait(1)
-
-    -- Verify DeathGui closed
-    if containerFrame and containerFrame.Visible then
-        log("DeathGui всё ещё видим после клика, пробуем remote fallback")
+    local stillVisible = false
+    pcall(function()
+        stillVisible = containerFrame and containerFrame.Visible
+    end)
+    if stillVisible then
+        log("DeathGui всё ещё видим после кликов, пробуем ClaimDeathRewardsRemote напрямую")
         pcall(function()
             for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
                 if desc.Name == "ClaimDeathRewardsRemote" and desc:IsA("RemoteFunction") then
@@ -1948,7 +3361,7 @@ local function tryClaimDeathRewards(deathPoints)
                 end
             end
         end)
-        wait(1)
+        wait(2)
     end
 
     local tokens = calcEarnedTokens(deathPoints)
@@ -2046,8 +3459,6 @@ end
 
 local function ensureDefaultCreatureAfterRespawn()
     log("Перезапуск существа (выбор): " .. DEFAULT_CREATURE)
-    tryClickCreaturePlayButton(DEFAULT_CREATURE)
-    selectCreature(DEFAULT_CREATURE)
     tryClickCreaturePlayButton(DEFAULT_CREATURE)
     wait(2)
 end
@@ -2563,6 +3974,186 @@ end
 
 local handlers = {}
 
+-- ========== TEST HANDLERS ==========
+
+local function detectCurrentRegion()
+    local pos = getPosition()
+    if not pos then return "Unknown", nil end
+    local bestName, bestDist, bestBiome = "Unknown", 99999, nil
+    for idx, biome in ipairs(BIOME_ATLAS) do
+        local entry = Vector3.new(biome.entry[1], biome.entry[2], biome.entry[3])
+        local d = (pos - entry).Magnitude
+        if d < bestDist then
+            bestDist = d
+            bestName = biome.name
+            bestBiome = biome
+        end
+    end
+    return bestName, bestBiome
+end
+
+local function getCreatureAppetite()
+    local appetite, thirst = nil, nil
+    pcall(function()
+        local slot = getSlotDataFolder()
+        if not slot then return end
+        local dino = slot:FindFirstChild("Dino")
+        local morph = slot:FindFirstChild("Morph")
+        if dino and dino.Value then
+            local rs = game:GetService("ReplicatedStorage")
+            local charDataMod = nil
+            for _, obj in ipairs(rs:GetDescendants()) do
+                if obj.Name == "CharacterData" and obj:IsA("ModuleScript") then
+                    charDataMod = obj
+                    break
+                end
+            end
+            if charDataMod then
+                local ok, data = pcall(require, charDataMod)
+                if ok and data then
+                    local speciesName = dino.Value
+                    local morphName = morph and morph.Value or nil
+                    local key = morphName and (speciesName .. "_" .. morphName) or speciesName
+                    local specData = data[key] or data[speciesName]
+                    if specData then
+                        appetite = specData.Appetite
+                        thirst = specData.ThirstAppetite
+                    end
+                end
+            end
+        end
+    end)
+    return appetite, thirst
+end
+
+handlers.test_eat = function()
+    log("[test_eat] Starting food test")
+
+    if not tryEnterWorldFromSlotUi(120, DEFAULT_CREATURE) then
+        return {ok = false, error = "Could not enter world"}
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_eat] Current region: " .. regionName)
+
+    local appetite, thirstAppetite = getCreatureAppetite()
+    log("[test_eat] Appetite=" .. tostring(appetite) .. " ThirstAppetite=" .. tostring(thirstAppetite))
+
+    local stats = getCreatureStats()
+    local hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
+    log("[test_eat] Creature hunger: food=" .. tostring(stats.food) .. " appetite=" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
+
+    local foodRemote = getRemoteEvent("Food")
+    if not foodRemote then
+        log("[test_eat] ERROR: Food RemoteEvent not found!")
+        return {ok = false, error = "Food RemoteEvent not found"}
+    end
+    log("[test_eat] Food RemoteEvent found: " .. tostring(foodRemote))
+
+    local maxCycles = 30
+    for cycle = 1, maxCycles do
+        stats = getCreatureStats()
+        hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
+        if appetite and stats.food >= appetite then
+            log("[test_eat] FULL! food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (100%) — stopping")
+            break
+        end
+        log("[test_eat] Cycle " .. cycle .. ": food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
+
+        local pos = getPosition()
+        if not pos then
+            log("[test_eat] No position, waiting...")
+            task.wait(1)
+        else
+            local food, dist = scanForFood(pos, 800)
+            if food then
+                local foodName = "?"
+                pcall(function() foodName = food:GetAttribute("FoodDataName") or food.Name end)
+                local foodValue = -1
+                pcall(function() foodValue = food:GetAttribute("Value") or -1 end)
+                log("[test_eat] Found food: " .. foodName .. " value=" .. tostring(foodValue) .. " dist=" .. math.floor(dist))
+
+                if foodValue == 0 then
+                    log("[test_eat] Food depleted, searching for another source...")
+                    task.wait(0.5)
+                else
+                    local fp = food:IsA("Model")
+                        and (food.PrimaryPart and food.PrimaryPart.Position or food:GetPivot().Position)
+                        or food.Position
+                    local hrp = getHRP()
+                    if hrp then
+                        pcall(function() hrp.CFrame = CFrame.new(fp.X, fp.Y + 1, fp.Z) end)
+                        task.wait(0.3)
+                    end
+
+                    local prevFood = stats.food
+                    for bite = 1, 5 do
+                        pcall(function() foodRemote:FireServer(food) end)
+                        task.wait(1.5)
+                        local s = getCreatureStats()
+                        local fv = -1
+                        pcall(function() fv = food:GetAttribute("Value") or -1 end)
+                        log("[test_eat]   bite " .. bite .. ": creature_food=" .. tostring(s.food) .. " source_value=" .. tostring(fv))
+                        if appetite and s.food >= appetite then
+                            log("[test_eat] Full after bite " .. bite)
+                            break
+                        end
+                        if fv == 0 then
+                            log("[test_eat] Source depleted after bite " .. bite .. ", will find new source")
+                            break
+                        end
+                        prevFood = s.food
+                    end
+                end
+            else
+                log("[test_eat] No food found within 800 studs, teleporting to biome entry")
+                if biome then safeTeleportVec(biome.entry) end
+                task.wait(2)
+            end
+        end
+    end
+
+    stats = getCreatureStats()
+    hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
+    log("[test_eat] DONE. Final: food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
+    return {ok = true, log = "test_eat completed. food=" .. tostring(stats.food) .. " (" .. tostring(hungerPct) .. "%)"}
+end
+
+handlers.test_drink = function()
+    log("[test_drink] STUB: not implemented yet")
+    return {ok = true, log = "test_drink: stub"}
+end
+
+handlers.test_walk = function()
+    log("[test_walk] STUB: not implemented yet")
+    return {ok = true, log = "test_walk: stub"}
+end
+
+handlers.test_sniff = function()
+    log("[test_sniff] STUB: not implemented yet")
+    return {ok = true, log = "test_sniff: stub"}
+end
+
+handlers.test_attack = function()
+    log("[test_attack] STUB: not implemented yet")
+    return {ok = true, log = "test_attack: stub"}
+end
+
+handlers.test_mud = function()
+    log("[test_mud] STUB: not implemented yet")
+    return {ok = true, log = "test_mud: stub"}
+end
+
+handlers.test_survive = function()
+    log("[test_survive] STUB: not implemented yet")
+    return {ok = true, log = "test_survive: stub"}
+end
+
+handlers.test_shrooms = function()
+    log("[test_shrooms] STUB: not implemented yet")
+    return {ok = true, log = "test_shrooms: stub"}
+end
+
 -- ФАРМ (фармер)
 handlers.farm = function()
     log("FARM pipeline=" .. tostring(FARM_PIPELINE) .. " target_dp=" .. tostring(TARGET_DP))
@@ -2588,10 +4179,10 @@ handlers.farm = function()
 
     local cycles = 0
     local totalTokensEarned = {}
+    local _lastLoggedDP = -1
     
     while true do
         cycles = cycles + 1
-        log("Farm cycle #" .. cycles)
         
         -- Проверяем флаг остановки
         if stopFlagExists() then
@@ -2603,18 +4194,32 @@ handlers.farm = function()
             }
         end
 
-        local invBan = getInventory()
+        local dpOk, currentDP = pcall(getCurrentDeathPoints)
+        if not dpOk then
+            log("[DP-ERROR] getCurrentDeathPoints crashed: " .. tostring(currentDP))
+            currentDP = 0
+        end
+        currentDP = currentDP or 0
+        -- Логируем DP только при изменении или каждые 30 циклов.
+        if currentDP ~= _lastLoggedDP or cycles % 30 == 1 then
+            log("DP: " .. tostring(currentDP) .. " / " .. TARGET_DP .. "  (cycle " .. cycles .. ")")
+            _lastLoggedDP = currentDP
+        end
+
+        local invBan = {}
+        if joinOrTradeFailStreak >= JOIN_FAIL_BAN_THRESHOLD then
+            invBan = getInventory()
+        end
         local b = banHeuristicResult(invBan)
         if b then
             b.tokens_earned = totalTokensEarned
             return b
         end
 
-        local currentDP = getCurrentDeathPoints()
-        log("DP: " .. currentDP .. " / " .. TARGET_DP)
-
+        local justDidSuicide = false
         if currentDP >= TARGET_DP then
             log("Цель DP достигнута (DP=" .. currentDP .. ")")
+            justDidSuicide = true
             local earnedTokens = {}
             if VOLCANO_SUICIDE then
                 earnedTokens = doSuicideVolcano(currentDP) or {}
@@ -2646,14 +4251,28 @@ handlers.farm = function()
                 }
             end
 
+            -- Шаг №1 заново: restart существа через remote + вход в мир через Play.
+            log("Перезапуск цикла: remote restart + enter world...")
+            wait(2)
+            pcall(restartCreatureDirectRemote, DEFAULT_CREATURE)
+            wait(2)
+            if not tryEnterWorldFromSlotUi(120, DEFAULT_CREATURE) then
+                return {
+                    ok = false,
+                    error = "Не удалось повторно войти в мир после суицида",
+                    inventory = getInventory(),
+                    tokens_earned = totalTokensEarned,
+                }
+            end
             wait(2)
         else
             doMissionStep()
             wait(1)
         end
 
-        if not isCreatureAlive() then
-            log("Существо мертво (не суицид) — claim rewards + перезапуск")
+        -- Handle natural death (not suicide) — claim + шаг №1 заново
+        if not justDidSuicide and not isCreatureAlive() then
+            log("Существо мертво (не суицид) — claim rewards + перезапуск цикла")
             local naturalDP = getCurrentDeathPoints()
             local naturalTokens = tryClaimDeathRewards(naturalDP)
             for tokenName, count in pairs(naturalTokens) do
@@ -2661,7 +4280,9 @@ handlers.farm = function()
             end
             writeTokenReport(totalTokensEarned)
             wait(2)
-            if not tryEnterWorldFromSlotUi(60, DEFAULT_CREATURE) then
+            pcall(restartCreatureDirectRemote, DEFAULT_CREATURE)
+            wait(2)
+            if not tryEnterWorldFromSlotUi(120, DEFAULT_CREATURE) then
                 return {
                     ok = false,
                     error = "Не удалось повторно войти в мир после смерти",
@@ -3027,7 +4648,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v11-death-claim]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v35-test-menu-eat]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)

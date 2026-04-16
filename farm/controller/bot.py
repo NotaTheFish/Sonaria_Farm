@@ -65,6 +65,7 @@ class MainMenuButtons(str, Enum):
     SECTION_CONTROL = "Управление"
     SECTION_ACCOUNTS = "Аккаунты и проверки"
     SECTION_PARAMS = "Параметры"
+    SECTION_TEST = "Тест"
     DEATH_POINTS = "Очки смерти"
     SET_PRICE = "Выставить цену"
     START_FARM = "Запустить фарм"
@@ -77,6 +78,18 @@ class MainMenuButtons(str, Enum):
     UNIVERSAL_SELL = "Продажи (универсал)"
     UNIVERSAL_INVENTORY = "Инвентарь (универсал)"
     UNIVERSAL_DEX = "Dex (универсал)"
+
+
+class TestButtons(str, Enum):
+    EAT = "Есть"
+    DRINK = "Пить"
+    WALK = "Пройти"
+    SNIFF = "Нюхать"
+    ATTACK = "Атака"
+    MUD = "Грязь"
+    SURVIVE = "Выжить"
+    SHROOMS = "Грибы"
+    BACK = "⬅️ Главное меню"
 
 
 class SettingsButtons(str, Enum):
@@ -154,11 +167,43 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         [
             KeyboardButton(text=MainMenuButtons.SECTION_PARAMS.value),
         ],
+        [
+            KeyboardButton(text=MainMenuButtons.SECTION_TEST.value),
+        ],
     ]
     return ReplyKeyboardMarkup(
         keyboard=buttons,
         resize_keyboard=True,
         input_field_placeholder="Выберите раздел",
+    )
+
+
+def test_kb() -> ReplyKeyboardMarkup:
+    buttons = [
+        [
+            KeyboardButton(text=TestButtons.EAT.value),
+            KeyboardButton(text=TestButtons.DRINK.value),
+        ],
+        [
+            KeyboardButton(text=TestButtons.WALK.value),
+            KeyboardButton(text=TestButtons.SNIFF.value),
+        ],
+        [
+            KeyboardButton(text=TestButtons.ATTACK.value),
+            KeyboardButton(text=TestButtons.MUD.value),
+        ],
+        [
+            KeyboardButton(text=TestButtons.SURVIVE.value),
+            KeyboardButton(text=TestButtons.SHROOMS.value),
+        ],
+        [
+            KeyboardButton(text=TestButtons.BACK.value),
+        ],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите тест",
     )
 
 
@@ -550,7 +595,14 @@ def build_router(config: Config) -> Router:
     async def on_params_section(message: Message):
         await message.answer("Раздел: Параметры", reply_markup=params_kb())
 
-    @router.message(F.text == SettingsButtons.BACK.value, AdminFilter(config.admin_id))
+    @router.message(F.text == MainMenuButtons.SECTION_TEST.value, AdminFilter(config.admin_id))
+    async def on_test_section(message: Message):
+        await message.answer("Раздел: Тест функций", reply_markup=test_kb())
+
+    @router.message(
+        (F.text == SettingsButtons.BACK.value) | (F.text == TestButtons.BACK.value),
+        AdminFilter(config.admin_id),
+    )
     async def on_back_to_main(message: Message):
         await message.answer("Главное меню.", reply_markup=main_menu_kb())
 
@@ -1856,6 +1908,81 @@ def build_router(config: Config) -> Router:
             )
 
         await message.answer("Продажи выключены. Текущие задачи продаж остановлены.", reply_markup=control_kb())
+
+    # ── Test function handlers ──────────────────────────────────────────
+
+    _TEST_BUTTON_TO_COMMAND: dict[str, str] = {
+        TestButtons.EAT.value: "test_eat",
+        TestButtons.DRINK.value: "test_drink",
+        TestButtons.WALK.value: "test_walk",
+        TestButtons.SNIFF.value: "test_sniff",
+        TestButtons.ATTACK.value: "test_attack",
+        TestButtons.MUD.value: "test_mud",
+        TestButtons.SURVIVE.value: "test_survive",
+        TestButtons.SHROOMS.value: "test_shrooms",
+    }
+
+    async def _run_test_command(message: Message, test_command: str) -> None:
+        async with AsyncSessionMaker() as session:
+            farmers = (
+                await session.scalars(
+                    select(Account).where(
+                        Account.role == AccountRole.FARMER.value,
+                        Account.status == AccountStatus.ACTIVE.value,
+                    )
+                )
+            ).all()
+        if not farmers:
+            await message.answer("Нет активных фермеров.", reply_markup=test_kb())
+            return
+        farmer = farmers[0]
+        await request_cancel_tasks(
+            task_type=TaskType.UNIVERSAL_TEST.value,
+            account_id=farmer.id,
+            only_pending=False,
+        )
+        await create_task(
+            task_type=TaskType.UNIVERSAL_TEST.value,
+            priority=2000,
+            account_id=farmer.id,
+            payload={"test_command": test_command},
+        )
+        await message.answer(
+            f"Тест `{test_command}` запущен для {farmer.login}.",
+            reply_markup=test_kb(),
+        )
+
+    @router.message(F.text == TestButtons.EAT.value, AdminFilter(config.admin_id))
+    async def on_test_eat(message: Message):
+        await _run_test_command(message, "test_eat")
+
+    @router.message(F.text == TestButtons.DRINK.value, AdminFilter(config.admin_id))
+    async def on_test_drink(message: Message):
+        await _run_test_command(message, "test_drink")
+
+    @router.message(F.text == TestButtons.WALK.value, AdminFilter(config.admin_id))
+    async def on_test_walk(message: Message):
+        await _run_test_command(message, "test_walk")
+
+    @router.message(F.text == TestButtons.SNIFF.value, AdminFilter(config.admin_id))
+    async def on_test_sniff(message: Message):
+        await _run_test_command(message, "test_sniff")
+
+    @router.message(F.text == TestButtons.ATTACK.value, AdminFilter(config.admin_id))
+    async def on_test_attack(message: Message):
+        await _run_test_command(message, "test_attack")
+
+    @router.message(F.text == TestButtons.MUD.value, AdminFilter(config.admin_id))
+    async def on_test_mud(message: Message):
+        await _run_test_command(message, "test_mud")
+
+    @router.message(F.text == TestButtons.SURVIVE.value, AdminFilter(config.admin_id))
+    async def on_test_survive(message: Message):
+        await _run_test_command(message, "test_survive")
+
+    @router.message(F.text == TestButtons.SHROOMS.value, AdminFilter(config.admin_id))
+    async def on_test_shrooms(message: Message):
+        await _run_test_command(message, "test_shrooms")
 
     return router
 

@@ -167,6 +167,18 @@ class GameAdapter(ABC):
     ) -> None:
         """Инжект Dex GUI через универсальный скрипт (задача ``universal_dex``)."""
 
+    @abstractmethod
+    async def universal_test(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+        test_command: str,
+    ) -> None:
+        """Запуск одного теста (test_eat, test_drink, …) через универсальный скрипт."""
+
     async def on_start_farm_cancel(self, *, task_id: str, worker_id: str, account: Account) -> None:
         """Опциональный хук: вызывается воркером при cancel start_farm."""
         return None
@@ -1631,6 +1643,39 @@ class WindowsGameAdapter(GameAdapter):
             message=f"[universal_sonaria] dex ok. {data.get('log') or ''}",
         )
 
+    async def universal_test(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+        test_command: str,
+    ) -> None:
+        if not self._universal_sonaria_ready():
+            raise RuntimeError("universal_sonaria: не настроен скрипт.")
+        params = build_universal_script_params(
+            account,
+            test_command,
+            extra_params={"default_creature_name": "Kaluaka"},
+        )
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[universal_sonaria] test={test_command} запуск",
+        )
+        await self._run_universal_script(
+            task_id=task_id,
+            worker_id=worker_id,
+            params=params,
+            wait_for_exit=False,
+        )
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[universal_sonaria] test={test_command} инжект выполнен",
+        )
+
 
 class StubGameAdapter(GameAdapter):
     """
@@ -1791,6 +1836,22 @@ class StubGameAdapter(GameAdapter):
             task_id=task_id,
             worker_id=worker_id,
             message=f"[stub] universal_dex account={account.id} payload_keys={list(payload)}",
+        )
+        await asyncio.sleep(1)
+
+    async def universal_test(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        account: Account,
+        payload: dict[str, Any],
+        test_command: str,
+    ) -> None:
+        await append_task_log(
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"[stub] universal_test account={account.id} cmd={test_command}",
         )
         await asyncio.sleep(1)
 
