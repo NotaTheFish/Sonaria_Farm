@@ -165,11 +165,16 @@ local function writeTokenReport(tokensTable)
     end)
 end
 
+local _stopFlagLoggedAt = 0
 local function stopFlagExists()
     if STOP_FLAG_PATH and type(isfile) == "function" then
         local success, exists = pcall(isfile, STOP_FLAG_PATH)
         if success and exists then
-            log("Stop flag detected at: " .. STOP_FLAG_PATH)
+            local now = tick()
+            if now - _stopFlagLoggedAt > 10 then
+                _stopFlagLoggedAt = now
+                log("Stop flag detected at: " .. STOP_FLAG_PATH)
+            end
             return true
         end
     end
@@ -3994,6 +3999,33 @@ end
 
 local function getCreatureAppetite()
     local appetite, thirst = nil, nil
+
+    -- 1) Runtime CharacterData on the current character model.
+    -- The tag "CharacterData" is attached to a child named "Data" (or similar Configuration/Folder)
+    -- whose attributes hold stats under compressed keys: Appetite="a", ThirstAppetite="ta".
+    pcall(function()
+        refreshCharacterRefs()
+        if not character then return end
+        local dataInst = nil
+        for _, inst in ipairs(character:GetDescendants()) do
+            if inst:HasTag("CharacterData") then
+                dataInst = inst
+                break
+            end
+        end
+        if not dataInst then
+            dataInst = character:FindFirstChild("Data")
+        end
+        if dataInst then
+            local a = dataInst:GetAttribute("a") or dataInst:GetAttribute("Appetite")
+            local ta = dataInst:GetAttribute("ta") or dataInst:GetAttribute("ThirstAppetite")
+            if type(a) == "number" then appetite = a end
+            if type(ta) == "number" then thirst = ta end
+        end
+    end)
+    if appetite and thirst then return appetite, thirst end
+
+    -- 2) CharacterData module in ReplicatedStorage (by species key).
     pcall(function()
         local slot = getSlotDataFolder()
         if not slot then return end
@@ -4016,112 +4048,469 @@ local function getCreatureAppetite()
                     local key = morphName and (speciesName .. "_" .. morphName) or speciesName
                     local specData = data[key] or data[speciesName]
                     if specData then
-                        appetite = specData.Appetite
-                        thirst = specData.ThirstAppetite
+                        -- Appetite can be at top-level or under .Stats
+                        appetite = appetite or specData.Appetite
+                            or (specData.Stats and specData.Stats.Appetite)
+                        -- ThirstAppetite often defaults to Appetite (per client mapping).
+                        thirst = thirst or specData.ThirstAppetite
+                            or (specData.Stats and specData.Stats.ThirstAppetite)
+                            or appetite
                     end
                 end
             end
         end
     end)
+
+    -- 3) Last resort: infer from Slot.Food/Water values and a conservative default.
+    if not appetite or not thirst then
+        local stats = getCreatureStats()
+        if not appetite then appetite = math.max(stats.food or 0, _maxFoodSeen, 40) end
+        if not thirst then thirst = math.max(stats.water or 0, _maxWaterSeen, appetite or 40) end
+    end
     return appetite, thirst
 end
 
-handlers.test_eat = function()
-    log("[test_eat] Starting food test")
+-- ========== Test helpers ==========
 
-    if not tryEnterWorldFromSlotUi(120, DEFAULT_CREATURE) then
-        return {ok = false, error = "Could not enter world"}
+-- Scan ALL Food-tagged models and return sorted list (nearest first, only with Value > 0).
+local function scanAllFood(pos, radius)
+    radius = radius or 1200
+    local list = {}
+    pcall(function()
+        local tagged = CollectionService:GetTagged("Food")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent and (obj:IsA("BasePart") or obj:IsA("Model")) then
+                local p = obj:IsA("Model")
+                    and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position)
+                    or obj.Position
+                local d = (pos - p).Magnitude
+                if d < radius then
+                    local val = 1
+                    pcall(function()
+                        local a = obj:GetAttribute("Value")
+                        if type(a) == "number" then val = a end
+                    end)
+                    if val > 0 then
+                        table.insert(list, {obj = obj, dist = d, value = val, pos = p})
+                    end
+                end
+            end
+        end
+    end)
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+-- Scan ALL DrinkableWater-tagged lake models and return sorted list (nearest first).
+-- Prefer the parent Model if the tag is on a part.
+local function scanAllLakes(pos, radius)
+    radius = radius or 2000
+    local list = {}
+    local seen = {}
+    pcall(function()
+        local tagged = CollectionService:GetTagged("DrinkableWater")
+        for _, obj in ipairs(tagged) do
+            if obj and obj.Parent then
+                local model = obj:IsA("Model") and obj or (obj.Parent and obj.Parent:IsA("Model") and obj.Parent or obj)
+                if not seen[model] then
+                    seen[model] = true
+                    local p
+                    pcall(function()
+                        local v3 = model:GetAttribute("V3")
+                        if typeof(v3) == "Vector3" then
+                            p = v3
+                        end
+                    end)
+                    if not p then
+                        p = model:IsA("Model") and model:GetPivot().Position or model.Position
+                    end
+                    local d = (pos - p).Magnitude
+                    if d < radius then
+                        local waterZone
+                        pcall(function()
+                            if model:IsA("Model") then
+                                waterZone = model:FindFirstChild("WaterZone")
+                            end
+                        end)
+                        table.insert(list, {model = model, dist = d, pos = p, waterZone = waterZone})
+                    end
+                end
+            end
+        end
+    end)
+    -- Fallback: look for Models named "Lake" in workspace.Interactions.Lakes
+    if #list == 0 then
+        pcall(function()
+            local inter = workspace:FindFirstChild("Interactions")
+            local lakesFolder = inter and inter:FindFirstChild("Lakes")
+            if lakesFolder then
+                for _, model in ipairs(lakesFolder:GetDescendants()) do
+                    if model:IsA("Model") and not seen[model] then
+                        seen[model] = true
+                        local p
+                        pcall(function()
+                            local v3 = model:GetAttribute("V3")
+                            if typeof(v3) == "Vector3" then p = v3 end
+                        end)
+                        if not p then
+                            p = model:GetPivot().Position
+                        end
+                        local d = (pos - p).Magnitude
+                        if d < radius then
+                            local wz = model:FindFirstChild("WaterZone")
+                            table.insert(list, {model = model, dist = d, pos = p, waterZone = wz})
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+-- Teleport character to target position facing the target (so proximity GetVisible passes).
+local function teleportFacing(targetPos, offsetUp, offsetBack)
+    offsetUp = offsetUp or 1
+    offsetBack = offsetBack or 0
+    local hrp = getHRP()
+    if not hrp then return false end
+    local p = getPosition()
+    if not p then return false end
+    -- Put character slightly in front of the target, looking at it.
+    -- Simpler: place directly above + face the target.
+    local lookDir = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(p.X, 0, p.Z))
+    if lookDir.Magnitude < 0.1 then
+        lookDir = Vector3.new(0, 0, 1)
+    else
+        lookDir = lookDir.Unit
+    end
+    local standPos = Vector3.new(
+        targetPos.X - lookDir.X * offsetBack,
+        targetPos.Y + offsetUp,
+        targetPos.Z - lookDir.Z * offsetBack
+    )
+    local lookAt = targetPos
+    local ok = false
+    pcall(function()
+        hrp.CFrame = CFrame.lookAt(standPos, lookAt)
+        ok = true
+    end)
+    return ok
+end
+
+handlers.test_eat = function()
+    log("[test_eat] === FOOD TEST START ===")
+
+    -- If user is already in-world we can skip the slot UI entirely.
+    refreshCharacterRefs()
+    if not character then
+        log("[test_eat] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_eat] Already in world")
     end
 
     local regionName, biome = detectCurrentRegion()
-    log("[test_eat] Current region: " .. regionName)
+    log("[test_eat] Current region: " .. tostring(regionName))
 
     local appetite, thirstAppetite = getCreatureAppetite()
-    log("[test_eat] Appetite=" .. tostring(appetite) .. " ThirstAppetite=" .. tostring(thirstAppetite))
+    log("[test_eat] Creature Appetite=" .. tostring(appetite) .. " ThirstAppetite=" .. tostring(thirstAppetite))
 
-    local stats = getCreatureStats()
-    local hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
-    log("[test_eat] Creature hunger: food=" .. tostring(stats.food) .. " appetite=" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
+    local stats0 = getCreatureStats()
+    local hungerPct0 = appetite and appetite > 0 and math.floor(stats0.food / appetite * 100) or -1
+    log("[test_eat] Initial hunger: " .. tostring(stats0.food) .. "/" .. tostring(appetite) .. " (" .. tostring(hungerPct0) .. "%)")
 
     local foodRemote = getRemoteEvent("Food")
     if not foodRemote then
-        log("[test_eat] ERROR: Food RemoteEvent not found!")
+        log("[test_eat] ERROR: 'Food' RemoteEvent not found.")
         return {ok = false, error = "Food RemoteEvent not found"}
     end
-    log("[test_eat] Food RemoteEvent found: " .. tostring(foodRemote))
 
-    local maxCycles = 30
+    if not appetite or appetite <= 0 then
+        log("[test_eat] WARN: appetite unknown, will keep eating until 8 cycles pass with no change.")
+    end
+
+    local maxCycles = 40
+    local triedSources = {}
+    local cyclesNoProgress = 0
+    local lastFood = stats0.food
+
     for cycle = 1, maxCycles do
-        stats = getCreatureStats()
-        hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
-        if appetite and stats.food >= appetite then
-            log("[test_eat] FULL! food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (100%) — stopping")
+        if stopFlagExists() then
+            log("[test_eat] STOPPED by flag at cycle " .. cycle)
             break
         end
-        log("[test_eat] Cycle " .. cycle .. ": food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
+        local stats = getCreatureStats()
+        local hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
+
+        if appetite and stats.food >= appetite then
+            log("[test_eat] FULL (food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. ") — done")
+            break
+        end
 
         local pos = getPosition()
         if not pos then
-            log("[test_eat] No position, waiting...")
+            log("[test_eat] No position — waiting")
             task.wait(1)
         else
-            local food, dist = scanForFood(pos, 800)
-            if food then
-                local foodName = "?"
-                pcall(function() foodName = food:GetAttribute("FoodDataName") or food.Name end)
-                local foodValue = -1
-                pcall(function() foodValue = food:GetAttribute("Value") or -1 end)
-                log("[test_eat] Found food: " .. foodName .. " value=" .. tostring(foodValue) .. " dist=" .. math.floor(dist))
+            local list = scanAllFood(pos, 1500)
+            log("[test_eat] Cycle " .. cycle .. " food=" .. tostring(stats.food) .. "/" .. tostring(appetite)
+                .. " (" .. tostring(hungerPct) .. "%), found " .. #list .. " food sources in 1500 studs")
 
-                if foodValue == 0 then
-                    log("[test_eat] Food depleted, searching for another source...")
-                    task.wait(0.5)
-                else
-                    local fp = food:IsA("Model")
-                        and (food.PrimaryPart and food.PrimaryPart.Position or food:GetPivot().Position)
-                        or food.Position
-                    local hrp = getHRP()
-                    if hrp then
-                        pcall(function() hrp.CFrame = CFrame.new(fp.X, fp.Y + 1, fp.Z) end)
-                        task.wait(0.3)
-                    end
-
-                    local prevFood = stats.food
-                    for bite = 1, 5 do
-                        pcall(function() foodRemote:FireServer(food) end)
-                        task.wait(1.5)
-                        local s = getCreatureStats()
-                        local fv = -1
-                        pcall(function() fv = food:GetAttribute("Value") or -1 end)
-                        log("[test_eat]   bite " .. bite .. ": creature_food=" .. tostring(s.food) .. " source_value=" .. tostring(fv))
-                        if appetite and s.food >= appetite then
-                            log("[test_eat] Full after bite " .. bite)
-                            break
-                        end
-                        if fv == 0 then
-                            log("[test_eat] Source depleted after bite " .. bite .. ", will find new source")
-                            break
-                        end
-                        prevFood = s.food
-                    end
+            -- Pick nearest that we haven't marked depleted and still has Value > 0.
+            local target = nil
+            for _, info in ipairs(list) do
+                if not triedSources[info.obj] then
+                    target = info
+                    break
                 end
-            else
-                log("[test_eat] No food found within 800 studs, teleporting to biome entry")
+            end
+            -- If all tried, reset and retry (in case they refilled).
+            if not target and #list > 0 then
+                log("[test_eat] All sources tried this round — resetting attempt list")
+                triedSources = {}
+                target = list[1]
+            end
+
+            if not target then
+                log("[test_eat] No food found within 1500 studs — moving to biome entry and retrying")
                 if biome then safeTeleportVec(biome.entry) end
                 task.wait(2)
+            else
+                local foodModel = target.obj
+                local foodName = "?"
+                pcall(function() foodName = foodModel:GetAttribute("FoodDataName") or foodModel.Name end)
+                log(string.format("[test_eat] TP to '%s' value=%s dist=%d",
+                    tostring(foodName), tostring(target.value), math.floor(target.dist)))
+
+                -- Teleport facing the food (for proximity `GetVisible` dot-product check).
+                teleportFacing(target.pos, 1, 0)
+                task.wait(0.35)
+
+                -- Eat loop: fire Food:FireServer(model) every 1.5s until full or depleted.
+                local biteFood = getCreatureStats().food
+                local localNoChange = 0
+                for bite = 1, 8 do
+                    if stopFlagExists() then break end
+                    pcall(function() foodRemote:FireServer(foodModel) end)
+                    task.wait(1.55)
+                    local s = getCreatureStats()
+                    local fv = -1
+                    pcall(function()
+                        local a = foodModel:GetAttribute("Value")
+                        if type(a) == "number" then fv = a end
+                    end)
+                    log(string.format("[test_eat]   bite %d: food=%s/%s  src=%s",
+                        bite, tostring(s.food), tostring(appetite), tostring(fv)))
+
+                    if appetite and s.food >= appetite then
+                        log("[test_eat] Full after bite " .. bite)
+                        break
+                    end
+                    if type(fv) == "number" and fv <= 0 then
+                        log("[test_eat] Source depleted after bite " .. bite)
+                        triedSources[foodModel] = true
+                        break
+                    end
+                    if s.food <= biteFood then
+                        localNoChange = localNoChange + 1
+                        if localNoChange >= 3 then
+                            log("[test_eat] No food gain for 3 bites — marking source as bad")
+                            triedSources[foodModel] = true
+                            break
+                        end
+                    else
+                        localNoChange = 0
+                    end
+                    biteFood = s.food
+                end
             end
         end
+
+        -- Global no-progress detection.
+        local after = getCreatureStats()
+        if after.food <= lastFood then
+            cyclesNoProgress = cyclesNoProgress + 1
+            if cyclesNoProgress >= 6 then
+                log("[test_eat] No progress for 6 cycles — aborting")
+                break
+            end
+        else
+            cyclesNoProgress = 0
+        end
+        lastFood = after.food
     end
 
-    stats = getCreatureStats()
-    hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
-    log("[test_eat] DONE. Final: food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. " (" .. tostring(hungerPct) .. "%)")
-    return {ok = true, log = "test_eat completed. food=" .. tostring(stats.food) .. " (" .. tostring(hungerPct) .. "%)"}
+    local stats = getCreatureStats()
+    local hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
+    log("[test_eat] === DONE === food=" .. tostring(stats.food) .. "/" .. tostring(appetite)
+        .. " (" .. tostring(hungerPct) .. "%)")
+    return {ok = true, log = string.format("test_eat finished: food=%s/%s (%s%%)",
+        tostring(stats.food), tostring(appetite), tostring(hungerPct))}
 end
 
 handlers.test_drink = function()
-    log("[test_drink] STUB: not implemented yet")
-    return {ok = true, log = "test_drink: stub"}
+    log("[test_drink] === WATER TEST START ===")
+
+    refreshCharacterRefs()
+    if not character then
+        log("[test_drink] Not in world — attempting to enter...")
+        if not tryEnterWorldFromSlotUi(30, DEFAULT_CREATURE) then
+            return {ok = false, error = "Could not enter world"}
+        end
+    else
+        log("[test_drink] Already in world")
+    end
+
+    local regionName, biome = detectCurrentRegion()
+    log("[test_drink] Current region: " .. tostring(regionName))
+
+    local appetite, thirstAppetite = getCreatureAppetite()
+    log("[test_drink] Creature ThirstAppetite=" .. tostring(thirstAppetite) .. " (Appetite=" .. tostring(appetite) .. ")")
+
+    local stats0 = getCreatureStats()
+    local thirstPct0 = thirstAppetite and thirstAppetite > 0
+        and math.floor(stats0.water / thirstAppetite * 100) or -1
+    log("[test_drink] Initial thirst: " .. tostring(stats0.water) .. "/" .. tostring(thirstAppetite)
+        .. " (" .. tostring(thirstPct0) .. "%)")
+
+    local drinkRemote = getRemoteEvent("DrinkRemote")
+    local drinkBuildable = getRemoteEvent("DrinkBuildableWater")
+    if not drinkRemote then
+        log("[test_drink] ERROR: 'DrinkRemote' not found.")
+        return {ok = false, error = "DrinkRemote not found"}
+    end
+
+    local maxCycles = 40
+    local triedLakes = {}
+    local cyclesNoProgress = 0
+    local lastWater = stats0.water
+
+    for cycle = 1, maxCycles do
+        if stopFlagExists() then
+            log("[test_drink] STOPPED by flag at cycle " .. cycle)
+            break
+        end
+        local stats = getCreatureStats()
+        local thirstPct = thirstAppetite and thirstAppetite > 0
+            and math.floor(stats.water / thirstAppetite * 100) or -1
+
+        if thirstAppetite and stats.water >= thirstAppetite then
+            log("[test_drink] FULL (water=" .. tostring(stats.water) .. "/" .. tostring(thirstAppetite) .. ") — done")
+            break
+        end
+
+        local pos = getPosition()
+        if not pos then
+            log("[test_drink] No position — waiting")
+            task.wait(1)
+        else
+            local lakes = scanAllLakes(pos, 2500)
+            log("[test_drink] Cycle " .. cycle .. " water=" .. tostring(stats.water) .. "/" .. tostring(thirstAppetite)
+                .. " (" .. tostring(thirstPct) .. "%), found " .. #lakes .. " lakes in 2500 studs")
+
+            local target = nil
+            for _, info in ipairs(lakes) do
+                if not triedLakes[info.model] then
+                    target = info
+                    break
+                end
+            end
+            if not target and #lakes > 0 then
+                log("[test_drink] All lakes tried — resetting list")
+                triedLakes = {}
+                target = lakes[1]
+            end
+
+            if not target then
+                log("[test_drink] No lake found within 2500 studs — moving to biome entry")
+                if biome then safeTeleportVec(biome.entry) end
+                task.wait(2)
+            else
+                local lakeModel = target.model
+                local lakeName = lakeModel.Name or "Lake"
+                local isBuildable = false
+                pcall(function()
+                    isBuildable = lakeModel:HasTag("Buildable") or
+                        (lakeModel:IsA("Model") and lakeModel:FindFirstAncestorOfClass("Model") and
+                         lakeModel:FindFirstAncestorOfClass("Model"):HasTag("Buildable")) or false
+                end)
+
+                -- Determine a good stand position: inside WaterZone if present, else right on the lake pivot.
+                local stand = target.pos
+                if target.waterZone and target.waterZone:IsA("BasePart") then
+                    local wzPos = target.waterZone.Position
+                    -- Stand at the center of WaterZone, just above it.
+                    stand = Vector3.new(wzPos.X, wzPos.Y + (target.waterZone.Size.Y * 0.5), wzPos.Z)
+                end
+                log(string.format("[test_drink] TP to '%s' buildable=%s dist=%d pos=(%.1f,%.1f,%.1f)",
+                    tostring(lakeName), tostring(isBuildable), math.floor(target.dist),
+                    stand.X, stand.Y, stand.Z))
+
+                local hrp = getHRP()
+                if hrp then
+                    pcall(function() hrp.CFrame = CFrame.new(stand.X, stand.Y + 1, stand.Z) end)
+                end
+                task.wait(0.4)
+
+                local re = isBuildable and drinkBuildable or drinkRemote
+                if not re then
+                    log("[test_drink] Required remote missing (buildable=" .. tostring(isBuildable) .. "), skip lake")
+                    triedLakes[lakeModel] = true
+                else
+                    local prevWater = getCreatureStats().water
+                    local localNoChange = 0
+                    for sip = 1, 10 do
+                        if stopFlagExists() then break end
+                        -- Per client code, the argument is the lake model itself (buildable sends the part).
+                        pcall(function() re:FireServer(lakeModel) end)
+                        task.wait(1.55)
+                        local s = getCreatureStats()
+                        log(string.format("[test_drink]   sip %d: water=%s/%s",
+                            sip, tostring(s.water), tostring(thirstAppetite)))
+                        if thirstAppetite and s.water >= thirstAppetite then
+                            log("[test_drink] Full after sip " .. sip)
+                            break
+                        end
+                        if s.water <= prevWater then
+                            localNoChange = localNoChange + 1
+                            if localNoChange >= 3 then
+                                log("[test_drink] No water gain for 3 sips — marking lake as bad")
+                                triedLakes[lakeModel] = true
+                                break
+                            end
+                        else
+                            localNoChange = 0
+                        end
+                        prevWater = s.water
+                    end
+                end
+            end
+        end
+
+        local after = getCreatureStats()
+        if after.water <= lastWater then
+            cyclesNoProgress = cyclesNoProgress + 1
+            if cyclesNoProgress >= 6 then
+                log("[test_drink] No progress for 6 cycles — aborting")
+                break
+            end
+        else
+            cyclesNoProgress = 0
+        end
+        lastWater = after.water
+    end
+
+    local stats = getCreatureStats()
+    local thirstPct = thirstAppetite and thirstAppetite > 0
+        and math.floor(stats.water / thirstAppetite * 100) or -1
+    log("[test_drink] === DONE === water=" .. tostring(stats.water) .. "/" .. tostring(thirstAppetite)
+        .. " (" .. tostring(thirstPct) .. "%)")
+    return {ok = true, log = string.format("test_drink finished: water=%s/%s (%s%%)",
+        tostring(stats.water), tostring(thirstAppetite), tostring(thirstPct))}
 end
 
 handlers.test_walk = function()
@@ -4648,7 +5037,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v35-test-menu-eat]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v36-test-eat-drink-toggle]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)

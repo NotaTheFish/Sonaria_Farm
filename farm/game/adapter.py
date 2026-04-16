@@ -1654,6 +1654,8 @@ class WindowsGameAdapter(GameAdapter):
     ) -> None:
         if not self._universal_sonaria_ready():
             raise RuntimeError("universal_sonaria: не настроен скрипт.")
+        from farm.game.stop_flags import clear_stop_flag
+        clear_stop_flag(account.id)
         params = build_universal_script_params(
             account,
             test_command,

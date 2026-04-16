@@ -73,3 +73,12 @@ runtime/inject_universal_wrap/
 # .NET build
 bin/
 obj/
+
+*.rbxl
+*.rbxlx
+*.lock
+*.exe
+*.dll
+*.zip
+*.obj
+external/sonaria_data/

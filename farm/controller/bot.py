@@ -1936,11 +1936,76 @@ def build_router(config: Config) -> Router:
             await message.answer("Нет активных фермеров.", reply_markup=test_kb())
             return
         farmer = farmers[0]
+
+        # Toggle state is tracked by a marker file per (farmer, command).
+        # If marker exists → a test is running → write stop flag + remove marker.
+        # If marker doesn't exist → start test + create marker.
+        import time
+        from pathlib import Path as _P
+        marker_dir = _P("runtime") / "test_toggle"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker = marker_dir / f"{farmer.id}__{test_command}.active"
+
+        # Stale marker protection: consider markers older than 10 min as stale (Lua likely died).
+        STALE_SEC = 600
+        is_active = False
+        if marker.exists():
+            try:
+                age = time.time() - marker.stat().st_mtime
+                is_active = age < STALE_SEC
+            except OSError:
+                is_active = False
+            if not is_active:
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        if is_active:
+            # Stop the running test.
+            from farm.game.stop_flags import write_stop_flag
+            await request_cancel_tasks(
+                task_type=TaskType.UNIVERSAL_TEST.value,
+                account_id=farmer.id,
+                only_pending=False,
+            )
+            try:
+                write_stop_flag(farmer.id)
+            except OSError as exc:
+                logger.warning("Could not write stop flag: %s", exc)
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Clean other markers for this farmer to keep state consistent.
+            try:
+                for m in marker_dir.glob(f"{farmer.id}__*.active"):
+                    m.unlink(missing_ok=True)
+            except OSError:
+                pass
+            await message.answer(
+                f"Тест `{test_command}` остановлен для {farmer.login}.",
+                reply_markup=test_kb(),
+            )
+            return
+
+        # Not active → start fresh. Clean stop flag + any stale markers first.
+        from farm.game.stop_flags import clear_stop_flag
+        try:
+            for m in marker_dir.glob(f"{farmer.id}__*.active"):
+                m.unlink(missing_ok=True)
+        except OSError:
+            pass
         await request_cancel_tasks(
             task_type=TaskType.UNIVERSAL_TEST.value,
             account_id=farmer.id,
             only_pending=False,
         )
+        clear_stop_flag(farmer.id)
+        try:
+            marker.write_text("1\n", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write test marker: %s", exc)
         await create_task(
             task_type=TaskType.UNIVERSAL_TEST.value,
             priority=2000,
