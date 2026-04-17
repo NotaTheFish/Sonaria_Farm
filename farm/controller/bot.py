@@ -1747,13 +1747,19 @@ def build_router(config: Config) -> Router:
             )
             return
 
-        count, err = await enqueue_set_sell_price_for_active_storages(ranges, priority_tokens)
+        # Use the UNIVERSAL flow (universal_sonaria_bot.lua handlers.sell). This
+        # invokes the in-game TeleportToRemote RF (rbxlx ~6142777), lands in the
+        # Trade Realm, then runs the claim-stand + list-items loop.
+        # The legacy sell.lua (stub) path is kept only for back-compat with
+        # `Продажи (универсал)` — same destination, same handler.
+        count, err = await enqueue_universal_sell_for_active_storages(ranges, priority_tokens)
         if err:
             await message.answer(f"Продажи включены. {err}", reply_markup=control_kb())
             return
 
         await message.answer(
-            f"Продажи включены. Созданы задачи на склады ({count}): выставление лотов по сохранённым ценам.\n"
+            f"Продажи включены. Созданы задачи на склады ({count}): телепорт в Trade Realm → "
+            f"занять стойку → выставить лоты по сохранённым ценам.\n"
             f"Приоритеты: {', '.join(priority_tokens)}",
             reply_markup=control_kb(),
         )

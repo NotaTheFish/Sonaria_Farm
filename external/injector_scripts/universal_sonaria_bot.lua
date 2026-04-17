@@ -376,6 +376,154 @@ local BIOME_ATLAS = {
      walk = {{-60,5,1040},{-160,5,940},{-60,5,940},{-160,5,1040},{-110,5,993}}},
 }
 
+-- ==========================================================================
+-- STEALTH / ANTI-DETECTION LAYER
+-- ==========================================================================
+-- Sonaria's server enforces silent rate-limit debounces (rbxlx
+-- ~5929915 CheckActionDebounce, ~5944672 mob bite cooldown,
+-- ~5952984 meteor 2.5s flag-and-webhook). Spamming faster than the debounce
+-- doesn't ban, just gets ignored — but it ALSO leaves obvious bot patterns
+-- (perfectly periodic remotes, no idle, instant-teleport-then-fire combos)
+-- which can attract player reports and manual moderation.
+--
+-- This layer enforces:
+--   * Min gap between FireServer/InvokeServer per-remote.
+--   * Min gap between teleports + jittered settle delay AFTER teleport.
+--   * Random "human-like" idle pauses periodically.
+--   * Jittered waits to break up perfectly-periodic timings.
+--   * Kick / disconnect detection so the bot exits cleanly instead of
+--     looping into nothing after the player is removed.
+local Stealth = {}
+
+Stealth.config = {
+    minRemoteGapSec     = 0.18,       -- minimum seconds between same-remote fires
+    minTeleportGapSec   = 0.22,       -- minimum seconds between teleports
+    postTeleportJitter  = {0.10, 0.30}, -- delay AFTER each teleport (settle)
+    waitJitter          = {0.04, 0.16}, -- added to every Stealth.wait()
+    idleEveryMissions   = {7, 13},    -- random N: idle every N missions
+    idleDurationSec     = {3.5, 11.0},-- random idle length
+    maxTeleportDist     = 6000,       -- studs (above this is suspicious)
+}
+
+Stealth.state = {
+    lastFireAt        = {},   -- per-remote → tick() of last fire
+    lastTeleportAt    = 0,
+    teleportsThisMin  = 0,
+    teleportMinStart  = 0,
+    missionsSinceIdle = 0,
+    aborted           = false,
+    abortReason       = nil,
+    kickListenerSet   = false,
+}
+
+local function _randf(lo, hi) return lo + math.random() * (hi - lo) end
+
+function Stealth.jitter(extra)
+    extra = extra or 0
+    return extra + _randf(Stealth.config.waitJitter[1], Stealth.config.waitJitter[2])
+end
+
+-- Wait `secs` plus a small random jitter (so we don't have perfectly periodic timings).
+function Stealth.wait(secs)
+    task.wait(Stealth.jitter(secs or 0))
+end
+
+-- Enforce a minimum interval between consecutive fires of the SAME remote.
+function Stealth.fireServer(remote, ...)
+    if not remote then return end
+    local args = table.pack(...)
+    local key = "RE:" .. tostring(remote)
+    local last = Stealth.state.lastFireAt[key] or 0
+    local gap = tick() - last
+    if gap < Stealth.config.minRemoteGapSec then
+        task.wait(Stealth.config.minRemoteGapSec - gap)
+    end
+    pcall(function() remote:FireServer(table.unpack(args, 1, args.n)) end)
+    Stealth.state.lastFireAt[key] = tick()
+end
+
+function Stealth.invokeServer(remote, ...)
+    if not remote then return nil end
+    local args = table.pack(...)
+    local key = "RF:" .. tostring(remote)
+    local last = Stealth.state.lastFireAt[key] or 0
+    local gap = tick() - last
+    if gap < Stealth.config.minRemoteGapSec then
+        task.wait(Stealth.config.minRemoteGapSec - gap)
+    end
+    local ok, ret = pcall(function()
+        return remote:InvokeServer(table.unpack(args, 1, args.n))
+    end)
+    Stealth.state.lastFireAt[key] = tick()
+    if ok then return ret end
+    return nil
+end
+
+-- Pre-teleport throttle. Caller still does the actual CFrame mutation.
+-- After your teleport, call Stealth.afterTeleport() so the bot doesn't
+-- immediately fire a remote (server-side anti-cheat-pattern: TP + instant action).
+function Stealth.beforeTeleport()
+    local now = tick()
+    -- Reset per-minute counter every 60s.
+    if now - Stealth.state.teleportMinStart >= 60 then
+        Stealth.state.teleportMinStart = now
+        Stealth.state.teleportsThisMin = 0
+    end
+    local gap = now - Stealth.state.lastTeleportAt
+    if gap < Stealth.config.minTeleportGapSec then
+        task.wait(Stealth.config.minTeleportGapSec - gap)
+    end
+end
+
+function Stealth.afterTeleport()
+    Stealth.state.lastTeleportAt = tick()
+    Stealth.state.teleportsThisMin = (Stealth.state.teleportsThisMin or 0) + 1
+    -- Brief "settling" delay so subsequent remote calls don't look like an
+    -- instant TP+act combo (a classic exploit signature).
+    local cfg = Stealth.config.postTeleportJitter
+    task.wait(_randf(cfg[1], cfg[2]))
+end
+
+-- Called between missions in doMissionStep. Periodically inserts a longer
+-- pause to break up the otherwise robotic mission-after-mission cadence.
+function Stealth.maybeIdleBetweenMissions()
+    Stealth.state.missionsSinceIdle = (Stealth.state.missionsSinceIdle or 0) + 1
+    local lo, hi = Stealth.config.idleEveryMissions[1], Stealth.config.idleEveryMissions[2]
+    local trigger = math.random(lo, hi)
+    if Stealth.state.missionsSinceIdle >= trigger then
+        Stealth.state.missionsSinceIdle = 0
+        local d = _randf(Stealth.config.idleDurationSec[1], Stealth.config.idleDurationSec[2])
+        log(string.format("[Stealth] human-like idle pause: %.1fs", d))
+        task.wait(d)
+    end
+end
+
+function Stealth.aborted()    return Stealth.state.aborted end
+function Stealth.abortReason() return Stealth.state.abortReason end
+
+-- Kick / disconnect / client-side abort detection.
+local function _stealthSetupListeners()
+    if Stealth.state.kickListenerSet then return end
+    Stealth.state.kickListenerSet = true
+    pcall(function()
+        local Players = game:GetService("Players")
+        Players.PlayerRemoving:Connect(function(p)
+            if Players.LocalPlayer and p == Players.LocalPlayer then
+                Stealth.state.aborted = true
+                Stealth.state.abortReason = "LocalPlayer removed (kick or disconnect)"
+                log("[Stealth] " .. Stealth.state.abortReason)
+            end
+        end)
+    end)
+    pcall(function()
+        game:BindToClose(function()
+            Stealth.state.aborted = true
+            Stealth.state.abortReason = "BindToClose (game shutdown)"
+        end)
+    end)
+end
+_stealthSetupListeners()
+
 -- Survival thresholds
 local SURVIVAL_FOOD_CRITICAL = 15
 local SURVIVAL_WATER_CRITICAL = 15
@@ -2252,36 +2400,54 @@ local function getSlotDataFolder()
     return slot
 end
 
+-- Reads per-region mission progress from the correct location in replicated data.
+--
+-- CRITICAL (verified in rbxlx):
+--   Runtime path is `PlayerGui.Data.Missions.RegionMissions.<RegionName>.<MissionType>`.
+--   `PlayerData` in the client is `PlayerGui:WaitForChild("Data")` (rbxlx ~5929463).
+--   Used by the UI at rbxlx ~6015194: `GetClient().PlayerData.Missions:WaitForChild("RegionMissions")`.
+--   Each <MissionType> is a `BoolValue` named e.g. "AttackOrHealCreatureOrNPC"; its
+--   `.Value` is the "claimed" flag. Child IntValues `Amount` and `TargetAmount` carry
+--   progress. HUD's completion check (rbxlx ~6015296):
+--     `amount >= target OR bool.Value`.
+--
+-- Region subfolder name is the raw RawRegionData key ("Central Rockfaces",
+-- "Volcano Island", "Swamp Hill", etc.), not the DisplayName.
 local function readRegionMissions(regionName)
     local result = {}
     pcall(function()
-        local slot = getSlotDataFolder()
-        if not slot then return end
-        local missions = slot:FindFirstChild("RegionMissions")
-        if not missions then
-            local m2 = slot:FindFirstChild("Missions")
-            if m2 then missions = m2:FindFirstChild("RegionMissions") end
-        end
-        if not missions then return end
-        local regionFolder = missions:FindFirstChild(regionName)
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then return end
+        local data = pg:FindFirstChild("Data")
+        if not data then return end
+        local missionsFolder = data:FindFirstChild("Missions")
+        if not missionsFolder then return end
+        local regionMissions = missionsFolder:FindFirstChild("RegionMissions")
+        if not regionMissions then return end
+        local regionFolder = regionMissions:FindFirstChild(regionName)
         if not regionFolder then return end
+
         for _, missionChild in ipairs(regionFolder:GetChildren()) do
             local mType = missionChild.Name
-            local amount, targetAmount, completed = 0, 0, false
             local amountVal = missionChild:FindFirstChild("Amount")
             local targetVal = missionChild:FindFirstChild("TargetAmount")
-            local valueVal  = missionChild:FindFirstChild("Value")
-            local claimedVal = missionChild:FindFirstChild("Claimed")
-            if amountVal then amount = amountVal.Value or 0 end
-            if targetVal then targetAmount = targetVal.Value or 0 end
-            if valueVal then
-                if typeof(valueVal.Value) == "boolean" then
-                    completed = valueVal.Value
-                end
-            end
-            if claimedVal and claimedVal.Value == true then completed = true end
-            if amount >= targetAmount and targetAmount > 0 then completed = true end
-            result[mType] = {amount = amount, targetAmount = targetAmount, completed = completed}
+
+            local amount = (amountVal and type(amountVal.Value) == "number") and amountVal.Value or 0
+            local targetAmount = (targetVal and type(targetVal.Value) == "number") and targetVal.Value or 0
+
+            -- Claim flag lives on the BoolValue itself, NOT as a `Claimed`/`Value` child.
+            local claimed = false
+            local ok, val = pcall(function() return missionChild.Value end)
+            if ok and type(val) == "boolean" then claimed = val end
+
+            local completed = claimed or (targetAmount > 0 and amount >= targetAmount)
+
+            result[mType] = {
+                amount       = amount,
+                targetAmount = targetAmount,
+                completed    = completed,
+                claimed      = claimed,
+            }
         end
     end)
     return result
@@ -2303,6 +2469,20 @@ local function safeTeleport(x, y, z)
     local hrp = getHRP()
     if not hrp then return false end
     if y < -100 then y = 50 end
+    -- Suspicious-distance clamp: don't TP further than the configured max in one go.
+    -- (Sonaria has no global speed-hack monitor in our rbxlx audit, but extreme
+    -- single-frame jumps still look unnatural to spectators.)
+    pcall(function()
+        local cur = hrp.Position
+        local target = Vector3.new(x, y + 5, z)
+        if (cur - target).Magnitude > Stealth.config.maxTeleportDist then
+            -- Cap distance: hop toward target instead of all the way.
+            local dir = (target - cur).Unit
+            local capped = cur + dir * Stealth.config.maxTeleportDist
+            x, y, z = capped.X, capped.Y - 5, capped.Z
+        end
+    end)
+    Stealth.beforeTeleport()
     for attempt = 1, 3 do
         pcall(function()
             hrp.CFrame = CFrame.new(x, y + 5, z)
@@ -2310,11 +2490,13 @@ local function safeTeleport(x, y, z)
         task.wait(0.5)
         local pos = getPosition()
         if pos and (Vector3.new(x, y + 5, z) - pos).Magnitude < 100 then
+            Stealth.afterTeleport()
             return true
         end
         x = x + (attempt * 5)
         z = z + (attempt * 5)
     end
+    Stealth.afterTeleport()
     return true
 end
 
@@ -2519,14 +2701,43 @@ local function getCreatureStats()
     return stats
 end
 
+-- Read max appetite / thirst for the CURRENT creature directly from CharacterData
+-- attributes. Creatures grow over time and their tanks scale up — relying on a
+-- historical maxSeen value produces false "full" readings (rbxlx ~5901703:
+-- compressed attr keys are "a"=Appetite, "ta"=ThirstAppetite).
+local function getCurrentMaxFor(kind)
+    local cap = nil
+    pcall(function()
+        refreshCharacterRefs()
+        if not character then return end
+        local dataInst = nil
+        for _, inst in ipairs(character:GetDescendants()) do
+            if inst:HasTag("CharacterData") then dataInst = inst; break end
+        end
+        if not dataInst then dataInst = character:FindFirstChild("Data") end
+        if not dataInst then return end
+        local attrKey = (kind == "food") and "a" or "ta"
+        local fallback = (kind == "food") and "Appetite" or "ThirstAppetite"
+        local v = dataInst:GetAttribute(attrKey) or dataInst:GetAttribute(fallback)
+        if type(v) == "number" and v > 0 then cap = v end
+    end)
+    return cap
+end
+
 local function isFull(stats, kind)
-    if kind == "food" then
-        if stats.food >= 999 then return true end
-        if _maxFoodSeen > 0 and stats.food >= _maxFoodSeen * 0.95 then return true end
-        return false
+    -- Prefer the live CharacterData attribute: it's the exact current max.
+    local realMax = getCurrentMaxFor(kind)
+    local cur = (kind == "food") and stats.food or stats.water
+    if realMax and realMax > 0 then
+        return cur >= realMax * 0.95
     end
-    if stats.water >= 999 then return true end
-    if _maxWaterSeen > 0 and stats.water >= _maxWaterSeen * 0.95 then return true end
+    -- Fallback: use historical max (old behavior) if attribute is unreadable.
+    if cur >= 999 then return true end
+    if kind == "food" then
+        if _maxFoodSeen > 0 and cur >= _maxFoodSeen * 0.95 then return true end
+    else
+        if _maxWaterSeen > 0 and cur >= _maxWaterSeen * 0.95 then return true end
+    end
     return false
 end
 
@@ -3012,96 +3223,10 @@ local function checkAntiStuck()
     return false
 end
 
--- Main doMissionStep (state machine, called each tick from handlers.farm)
-local function doMissionStep()
-    if not _missionState.initialized then
-        _missionState.initialized = true
-        _missionState.biomeEnteredTime = tick()
-        _maxFoodSeen = 0
-        _maxWaterSeen = 0
-        local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
-        mlog("Mission system initialized, starting biome: " .. (biome and biome.name or "?"), nil)
-        safeTeleportVec(biome.entry)
-        task.wait(1)
-        return true
-    end
-
-    if not isCreatureAlive() then return false end
-
-    -- Step 1: Survival check
-    local stats = getCreatureStats()
-    local need = needsSurvivalAction(stats)
-    if need then
-        mlog("Survival: " .. need .. " (food=" .. tostring(stats.food) .. "/" .. tostring(_maxFoodSeen) .. " water=" .. tostring(stats.water) .. "/" .. tostring(_maxWaterSeen) .. " hp=" .. tostring(stats.hp) .. ")", "survival", 15)
-        doEmergencyRefill(need)
-        return true
-    end
-
-    -- Step 2: Anti-stuck check
-    if checkAntiStuck() then return true end
-
-    -- Step 3: Check biome
-    local biome = BIOME_ATLAS[_missionState.currentBiomeIdx]
-    if not biome then
-        _missionState.currentBiomeIdx = 1
-        biome = BIOME_ATLAS[1]
-    end
-
-    -- Step 4: Pick next mission from ACTUAL game data
-    local missionType, missionData = pickNextMission(biome.name, biome.zone)
-
-    if not missionType then
-        if isBiomeComplete(biome.name) then
-            mlog("BIOME DONE " .. biome.name, nil)
-        else
-            mlog("No executable missions in " .. biome.name .. ", rotating", "no_exec", 30)
-        end
-        if not switchBiome() then
-            mlog("All biomes done or stuck, idling 10s", "all_done", 60)
-            task.wait(10)
-            return true
-        end
-        return true
-    end
-
-    if missionType ~= _missionState.currentMissionType then
-        _missionState.currentMissionType = missionType
-        mlog("mission_start=" .. missionType .. " in " .. biome.name, nil)
-    end
-
-    mlog("region=" .. biome.name .. " mission=" .. missionType .. " progress=" .. tostring(missionData.amount) .. "/" .. tostring(missionData.targetAmount), "progress:" .. biome.name .. ":" .. missionType, 30)
-
-    -- Step 5: Execute
-    local prevAmount = missionData.amount
-    local executor = MISSION_EXECUTORS[missionType]
-    if executor then
-        local execOk, execErr = pcall(function() executor() end)
-        if not execOk then
-            mlog("Mission executor error: " .. tostring(execErr), "exec_err", 10)
-        end
-    end
-
-    -- Step 6: Check progress
-    local newMissions = readRegionMissions(biome.name)
-    local newData = newMissions[missionType]
-    if newData then
-        if newData.amount > prevAmount then
-            local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":" .. missionType
-            _missionState.missionStuckTimers[stuckKey] = nil
-            mlog("PROGRESS " .. missionType .. " " .. tostring(newData.amount) .. "/" .. tostring(newData.targetAmount) .. " in " .. biome.name, nil)
-            if newData.completed then
-                mlog("MISSION COMPLETE: " .. missionType .. " in " .. biome.name, nil)
-            end
-        elseif newData.amount == prevAmount and missionType ~= "TimePlayed" and missionType ~= "DistanceTravelled" then
-            local stuckKey = (_missionState.currentBiomeIdx or 1) .. ":" .. missionType
-            if not _missionState.missionStuckTimers[stuckKey] then
-                _missionState.missionStuckTimers[stuckKey] = tick()
-            end
-        end
-    end
-
-    return true
-end
+-- Forward declaration for doMissionStep; real body is defined below,
+-- AFTER `handlers` table and all `handlers.test_*` assignments, so that
+-- those upvalue references resolve correctly at call time.
+local doMissionStep
 
 local function findPlayerByName(name)
     for _, p in pairs(Players:GetPlayers()) do
@@ -3560,37 +3685,51 @@ local function alreadyInTradeRealm()
     return false
 end
 
--- По снимкам CoS (.rbxlx): PlaceTeleportService → TeleportToRemote("ToPlaceType","Trade",{}) или ToPlaceId.
+-- Teleport to Trade Realm via the game's RemoteFunction `TeleportToRemote`.
+--
+-- VERIFIED in rbxlx ~6142777-6142790 (server OnServerInvoke):
+--   TeleportToRemote.OnServerInvoke = function(player, mode, ...)
+--       if mode == "ToPlaceId"   then return TeleportToPlace(player, ...)
+--       elseif mode == "ToPlaceType" then return TeleportToPlaceType(player, ...)
+--       elseif mode == "ToPlaceName" then return TeleportToPlaceName(player, ...)
+--       elseif mode == "FollowPlayer" then return FollowPlayer(player, ...)
+--       end
+--   end
+--
+-- `ToPlaceType "Trade"` resolves to the Trade Realm via GetPlacesByType (rbxlx
+-- ~6142679). Direct remote lookup (no `require(Sonar)`) avoids the historical
+-- require-deadlock the script hit on first-run; getRemoteFunction caches the
+-- instance across calls.
 local function tryCoSTeleportToTradeRealm()
-    local sonar = requireSonar()
-    if not sonar then
-        return false, "no Sonar module"
-    end
-    local ru = sonar("RemoteUtils")
-    if not ru or type(ru.GetRemoteFunction) ~= "function" then
-        return false, "no RemoteUtils"
-    end
-    local rf = ru.GetRemoteFunction("TeleportToRemote")
+    local rf = getRemoteFunction("TeleportToRemote")
     if not rf or type(rf.InvokeServer) ~= "function" then
-        return false, "no TeleportToRemote"
+        return false, "TeleportToRemote RF not found in ReplicatedStorage"
     end
+
+    -- Primary: ToPlaceType "Trade" — lets the server pick the right Trade place
+    -- (Main Trade Realm or Test Trade Realm based on PlaceContext).
     local ok, a, b = pcall(function()
         return rf:InvokeServer("ToPlaceType", "Trade", {})
     end)
     if not ok then
-        return false, tostring(a)
+        return false, "InvokeServer(ToPlaceType) errored: " .. tostring(a)
     end
     if a == false then
+        log("[trade-tp] ToPlaceType returned false, falling back to ToPlaceId=" .. tostring(TRADE_REALM_PLACE_ID))
         ok, a, b = pcall(function()
             return rf:InvokeServer("ToPlaceId", TRADE_REALM_PLACE_ID, {})
         end)
         if not ok then
-            return false, tostring(a)
+            return false, "InvokeServer(ToPlaceId) errored: " .. tostring(a)
         end
         if a == false then
-            return false, tostring(b)
+            return false, "ToPlaceId rejected: " .. tostring(b)
         end
     end
+
+    -- Teleport request accepted. Wait a few seconds for the place load to begin;
+    -- the script context ends when the character is rebuilt in the new place.
+    log("[trade-tp] Teleport accepted, waiting for place load...")
     wait(3)
     return true, nil
 end
@@ -4238,6 +4377,26 @@ handlers.test_eat = function()
     local cyclesNoProgress = 0
     local lastFood = stats0.food
 
+    -- Read initial EatFoodDrinkWater mission progress so we can use it as the
+    -- primary exit signal. Firing Food:FireServer while full might still
+    -- consume food.Value AND tick the mission (server-side gating for the
+    -- regular Food remote isn't visible in our rbxlx audit — we let the server
+    -- decide by trying, and detect via progress).
+    local initialMissionAmount = 0
+    local initialMissionTarget = 0
+    do
+        local m = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+        if m then
+            initialMissionAmount = m.amount or 0
+            initialMissionTarget = m.targetAmount or 0
+            if m.completed then
+                log("[test_eat] EatFoodDrinkWater mission already complete — exiting")
+                return {ok = true, log = "test_eat: mission already complete"}
+            end
+        end
+    end
+    local lastMissionAmount = initialMissionAmount
+
     for cycle = 1, maxCycles do
         if stopFlagExists() then
             log("[test_eat] STOPPED by flag at cycle " .. cycle)
@@ -4246,8 +4405,31 @@ handlers.test_eat = function()
         local stats = getCreatureStats()
         local hungerPct = appetite and appetite > 0 and math.floor(stats.food / appetite * 100) or -1
 
-        if appetite and stats.food >= appetite then
-            log("[test_eat] FULL (food=" .. tostring(stats.food) .. "/" .. tostring(appetite) .. ") — done")
+        -- Refresh region each cycle — if we drifted into a neighbour biome we
+        -- want to read THAT region's mission, not the one we started in.
+        regionName = detectCurrentRegion()
+
+        -- PRIMARY EXIT: mission complete.
+        do
+            local m = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+            if m and (m.completed or (m.targetAmount or 0) > 0
+                     and (m.amount or 0) >= m.targetAmount)
+            then
+                log(string.format("[test_eat] Mission complete: %d/%d — exiting",
+                    m.amount or 0, m.targetAmount or 0))
+                break
+            end
+        end
+
+        -- BELLY-FULL EXIT: the server silently refuses when Food.Value >= Appetite
+        -- (the Food remote's OnServerEvent isn't in the rbxlx dump, but DrinkBuildableWater
+        -- at ~5932126 explicitly gates on `Full`, and the observed behaviour for Food is
+        -- identical — src.Value doesn't decrement and mission doesn't tick). Rather than
+        -- burn cycles hopping between food sources, bail out so the dispatcher defers this
+        -- mission for 60s (its built-in EatFoodDrinkWater defer window) while hunger drains.
+        if appetite and appetite > 0 and stats.food >= appetite * 0.95 then
+            log(string.format("[test_eat] Belly full (%s/%s) — server won't accept more bites, deferring mission",
+                tostring(stats.food), tostring(appetite)))
             break
         end
 
@@ -4256,7 +4438,9 @@ handlers.test_eat = function()
             log("[test_eat] No position — waiting")
             task.wait(1)
         else
-            local list = scanAllFood(pos, 1500)
+            -- Restricted to ~800 studs so we don't drift out of the current biome
+            -- (was 1500 — that could pull us into a neighbouring region).
+            local list = scanAllFood(pos, 800)
             log("[test_eat] Cycle " .. cycle .. " food=" .. tostring(stats.food) .. "/" .. tostring(appetite)
                 .. " (" .. tostring(hungerPct) .. "%), found " .. #list .. " food sources in 1500 studs")
 
@@ -4290,58 +4474,86 @@ handlers.test_eat = function()
                 teleportFacing(target.pos, 1, 0)
                 task.wait(0.35)
 
-                -- Eat loop: fire Food:FireServer(model) every 1.5s until full or depleted.
-                local biteFood = getCreatureStats().food
+                -- Eat loop: fire Food:FireServer(model) repeatedly. Exit when:
+                --   (a) mission completes,
+                --   (b) source depletes (fv <= 0),
+                --   (c) nothing changes for 3 bites (source or server refused).
+                -- Crucially we do NOT stop on "belly full" — the mission tracks
+                -- units consumed, not stat gain.
+                local lastFV = nil
                 local localNoChange = 0
-                for bite = 1, 8 do
+                local biteFoodInitial = getCreatureStats().food
+                pcall(function() lastFV = foodModel:GetAttribute("Value") end)
+
+                for bite = 1, 14 do
                     if stopFlagExists() then break end
-                    pcall(function() foodRemote:FireServer(foodModel) end)
-                    task.wait(1.55)
+                    Stealth.fireServer(foodRemote, foodModel)
+                    Stealth.wait(1.55)
                     local s = getCreatureStats()
                     local fv = -1
                     pcall(function()
                         local a = foodModel:GetAttribute("Value")
                         if type(a) == "number" then fv = a end
                     end)
-                    log(string.format("[test_eat]   bite %d: food=%s/%s  src=%s",
-                        bite, tostring(s.food), tostring(appetite), tostring(fv)))
+                    local mNow = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+                    local mAmt = mNow and mNow.amount or lastMissionAmount
+                    local mTgt = mNow and mNow.targetAmount or initialMissionTarget
+                    log(string.format("[test_eat]   bite %d: food=%s/%s  src=%s  mission=%d/%d",
+                        bite, tostring(s.food), tostring(appetite), tostring(fv), mAmt, mTgt))
 
-                    if appetite and s.food >= appetite then
-                        log("[test_eat] Full after bite " .. bite)
-                        break
+                    -- EXIT: mission complete.
+                    if mNow and (mNow.completed
+                        or (mTgt > 0 and mAmt >= mTgt)) then
+                        log("[test_eat] Mission complete via eating — done")
+                        return {ok = true, log = "test_eat: mission completed"}
                     end
+
+                    -- EXIT: source empty.
                     if type(fv) == "number" and fv <= 0 then
                         log("[test_eat] Source depleted after bite " .. bite)
                         triedSources[foodModel] = true
                         break
                     end
-                    if s.food <= biteFood then
+
+                    -- Track change across BOTH stat AND source Value AND mission
+                    -- so we can detect "nothing is happening" robustly.
+                    local madeProgress = false
+                    if s.food > biteFoodInitial then madeProgress = true end
+                    if lastFV and type(fv) == "number" and fv < lastFV then madeProgress = true end
+                    if mAmt > lastMissionAmount then madeProgress = true end
+
+                    if madeProgress then
+                        localNoChange = 0
+                        biteFoodInitial = s.food
+                        lastFV = fv
+                        lastMissionAmount = mAmt
+                    else
                         localNoChange = localNoChange + 1
                         if localNoChange >= 3 then
-                            log("[test_eat] No food gain for 3 bites — marking source as bad")
+                            log("[test_eat] No change after 3 bites — source dead or server refused, skipping")
                             triedSources[foodModel] = true
                             break
                         end
-                    else
-                        localNoChange = 0
                     end
-                    biteFood = s.food
                 end
             end
         end
 
-        -- Global no-progress detection.
-        local after = getCreatureStats()
-        if after.food <= lastFood then
+        -- Global no-progress detection: use MISSION amount as the signal,
+        -- not stat.food (which may stay capped at appetite).
+        local mNow = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+        local mAmt = mNow and mNow.amount or lastMissionAmount
+        if mAmt <= lastMissionAmount then
             cyclesNoProgress = cyclesNoProgress + 1
             if cyclesNoProgress >= 6 then
-                log("[test_eat] No progress for 6 cycles — aborting")
+                log("[test_eat] Mission progress stalled for 6 cycles — aborting")
                 break
             end
         else
             cyclesNoProgress = 0
         end
-        lastFood = after.food
+        lastMissionAmount = mAmt
+        lastFood = getCreatureStats().food
     end
 
     local stats = getCreatureStats()
@@ -4389,6 +4601,26 @@ handlers.test_drink = function()
     local cyclesNoProgress = 0
     local lastWater = stats0.water
 
+    -- Read initial EatFoodDrinkWater mission state. Mission is the primary
+    -- exit signal; we no longer stop on "full thirst".
+    -- NOTE: rbxlx ~5932126 confirms DrinkBuildableWater server-side refuses
+    -- when full (returns "Full"), but DrinkRemote (regular lakes) handler is
+    -- not in the dump, so we attempt and detect via mission progress.
+    local initialMissionAmount = 0
+    local initialMissionTarget = 0
+    do
+        local m = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+        if m then
+            initialMissionAmount = m.amount or 0
+            initialMissionTarget = m.targetAmount or 0
+            if m.completed then
+                log("[test_drink] EatFoodDrinkWater mission already complete — exiting")
+                return {ok = true, log = "test_drink: mission already complete"}
+            end
+        end
+    end
+    local lastMissionAmount = initialMissionAmount
+
     for cycle = 1, maxCycles do
         if stopFlagExists() then
             log("[test_drink] STOPPED by flag at cycle " .. cycle)
@@ -4398,9 +4630,30 @@ handlers.test_drink = function()
         local thirstPct = thirstAppetite and thirstAppetite > 0
             and math.floor(stats.water / thirstAppetite * 100) or -1
 
-        if thirstAppetite and stats.water >= thirstAppetite then
-            log("[test_drink] FULL (water=" .. tostring(stats.water) .. "/" .. tostring(thirstAppetite) .. ") — done")
+        -- Refresh region each cycle — if we drifted into a neighbour biome we
+        -- want to read THAT region's mission, not the one we started in.
+        regionName = detectCurrentRegion()
+
+        -- THIRST-FULL EXIT: server-side `DrinkBuildableWater` explicitly refuses
+        -- when Water.Value >= ThirstAppetite (rbxlx ~5932126). Regular lakes
+        -- (`DrinkRemote`) behave the same way empirically. Bail out immediately
+        -- so the dispatcher defers the mission for 60s.
+        if thirstAppetite and thirstAppetite > 0 and stats.water >= thirstAppetite * 0.95 then
+            log(string.format("[test_drink] Thirst full (%s/%s) — server won't accept more sips, deferring mission",
+                tostring(stats.water), tostring(thirstAppetite)))
             break
+        end
+
+        -- PRIMARY EXIT: mission complete.
+        do
+            local m = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+            if m and (m.completed or (m.targetAmount or 0) > 0
+                     and (m.amount or 0) >= m.targetAmount)
+            then
+                log(string.format("[test_drink] Mission complete: %d/%d — exiting",
+                    m.amount or 0, m.targetAmount or 0))
+                break
+            end
         end
 
         local pos = getPosition()
@@ -4408,9 +4661,11 @@ handlers.test_drink = function()
             log("[test_drink] No position — waiting")
             task.wait(1)
         else
-            local lakes = scanAllLakes(pos, 2500)
+            -- Restrict to 1200 studs so we stay within the current biome
+            -- (was 2500 — could pull us into neighbouring regions).
+            local lakes = scanAllLakes(pos, 1200)
             log("[test_drink] Cycle " .. cycle .. " water=" .. tostring(stats.water) .. "/" .. tostring(thirstAppetite)
-                .. " (" .. tostring(thirstPct) .. "%), found " .. #lakes .. " lakes in 2500 studs")
+                .. " (" .. tostring(thirstPct) .. "%), found " .. #lakes .. " lakes in 1200 studs")
 
             local target = nil
             for _, info in ipairs(lakes) do
@@ -4507,29 +4762,43 @@ handlers.test_drink = function()
                     log("[test_drink] Required remote missing (buildable=" .. tostring(isBuildable) .. "), skip lake")
                     triedLakes[lakeModel] = true
                 else
+                    -- Drink loop: NO "full" early exit. We watch mission progress,
+                    -- water stat, and 3-in-a-row no-change to bail cleanly.
                     local prevWater = getCreatureStats().water
                     local localNoChange = 0
-                    for sip = 1, 10 do
+                    for sip = 1, 14 do
                         if stopFlagExists() then break end
                         -- Per client code, the argument is the lake model itself (buildable sends the part).
-                        pcall(function() re:FireServer(lakeModel) end)
-                        task.wait(1.55)
+                        Stealth.fireServer(re, lakeModel)
+                        Stealth.wait(1.55)
                         local s = getCreatureStats()
-                        log(string.format("[test_drink]   sip %d: water=%s/%s",
-                            sip, tostring(s.water), tostring(thirstAppetite)))
-                        if thirstAppetite and s.water >= thirstAppetite then
-                            log("[test_drink] Full after sip " .. sip)
-                            break
+                        local mNow = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+                        local mAmt = mNow and mNow.amount or lastMissionAmount
+                        local mTgt = mNow and mNow.targetAmount or initialMissionTarget
+                        log(string.format("[test_drink]   sip %d: water=%s/%s  mission=%d/%d",
+                            sip, tostring(s.water), tostring(thirstAppetite), mAmt, mTgt))
+
+                        -- EXIT: mission complete.
+                        if mNow and (mNow.completed
+                            or (mTgt > 0 and mAmt >= mTgt)) then
+                            log("[test_drink] Mission complete via drinking — done")
+                            return {ok = true, log = "test_drink: mission completed"}
                         end
-                        if s.water <= prevWater then
+
+                        local progressed = false
+                        if s.water > prevWater then progressed = true end
+                        if mAmt > lastMissionAmount then progressed = true end
+
+                        if progressed then
+                            localNoChange = 0
+                            lastMissionAmount = mAmt
+                        else
                             localNoChange = localNoChange + 1
                             if localNoChange >= 3 then
-                                log("[test_drink] No water gain for 3 sips — marking lake as bad")
+                                log("[test_drink] No change after 3 sips — lake dead or server refused, skipping")
                                 triedLakes[lakeModel] = true
                                 break
                             end
-                        else
-                            localNoChange = 0
                         end
                         prevWater = s.water
                     end
@@ -4537,17 +4806,20 @@ handlers.test_drink = function()
             end
         end
 
-        local after = getCreatureStats()
-        if after.water <= lastWater then
+        -- Global no-progress detection — use MISSION as the signal.
+        local mNow = (readRegionMissions(regionName or "") or {}).EatFoodDrinkWater
+        local mAmt = mNow and mNow.amount or lastMissionAmount
+        if mAmt <= lastMissionAmount then
             cyclesNoProgress = cyclesNoProgress + 1
             if cyclesNoProgress >= 6 then
-                log("[test_drink] No progress for 6 cycles — aborting")
+                log("[test_drink] Mission progress stalled for 6 cycles — aborting")
                 break
             end
         else
             cyclesNoProgress = 0
         end
-        lastWater = after.water
+        lastMissionAmount = mAmt
+        lastWater = getCreatureStats().water
     end
 
     local stats = getCreatureStats()
@@ -4578,7 +4850,9 @@ local function getDistanceProgress()
     return amount, target, completed
 end
 
--- Read creature Stamina from CharacterData ("s" attribute is Stamina in compressed form).
+-- Read creature Stamina from CharacterData.
+-- Confirmed in rbxlx ~5901703: compressed attribute key is "st" (Stamina),
+-- not "s" — and "tp" is TimePlayed, "is" is IsSprinting, "a"/"ta" are Appetite/ThirstAppetite.
 local function getStamina()
     local stamina = 100
     pcall(function()
@@ -4592,7 +4866,7 @@ local function getStamina()
             dataInst = character:FindFirstChild("Data")
         end
         if dataInst then
-            local s = dataInst:GetAttribute("s") or dataInst:GetAttribute("Stamina")
+            local s = dataInst:GetAttribute("st") or dataInst:GetAttribute("Stamina")
             if type(s) == "number" then stamina = s end
         end
     end)
@@ -4627,6 +4901,14 @@ handlers.test_walk = function()
     if completed0 then
         log("[test_walk] Mission already completed in this region")
         return {ok = true, log = "test_walk: already complete"}
+    end
+
+    -- If the region's daily 3 missions don't include DistanceTravelled, target will be 0.
+    -- Don't waste time walking — report and exit cleanly.
+    if target0 == 0 then
+        log("[test_walk] DistanceTravelled mission is not active in '" .. tostring(regionName)
+            .. "' (daily pool rotated). Try another biome.")
+        return {ok = true, log = "test_walk: mission not active in " .. tostring(regionName)}
     end
 
     -- Teleport to the known-safe entry point first.
@@ -4705,7 +4987,21 @@ handlers.test_walk = function()
 
         -- Issue MoveTo and wait until we arrive or timeout.
         refreshCharacterRefs()
-        if not humanoid then break end
+        if not humanoid then
+            log("[test_walk] Humanoid temporarily nil — waiting and refreshing")
+            task.wait(1.0)
+            refreshCharacterRefs()
+            if not humanoid then
+                log("[test_walk] Humanoid still nil — retrying TP to safe and character refresh")
+                safeTeleportVec(biome.safe)
+                task.wait(1.5)
+                refreshCharacterRefs()
+                if not humanoid then
+                    log("[test_walk] Humanoid unrecoverable — aborting")
+                    break
+                end
+            end
+        end
         pcall(function() humanoid:MoveTo(goTo) end)
 
         local legStart = tick()
@@ -4914,19 +5210,26 @@ local function isModelAlive(model)
     return true
 end
 
--- Fire a bite through BOTH remotes. Sonaria classifies some entities as "Characters"
--- (big NPCs and players) and others as "Mob" (small NPCs). The mission increment
--- is only wired to Characters-path on the client XML (rbxlx ~5944348) but we send
--- both to maximize chances.
+-- Fire a bite through the correct remote per target type.
+--
+-- CRITICAL (verified in rbxlx):
+--   * CharactersDamageRemote resolves each entry via `getCharacterFromModel` which
+--     compares arg to `PlayerWrapper.Character` (the MODEL — not HumanoidRootPart).
+--     See rbxlx ~5929748 and GetRoot at ~5968509. Passing the HRP silently resolves
+--     to nil and the per-target block is skipped → no damage, no mission tick.
+--   * MobDamageRemote on the server calls `v_u_15.GetMobFromHitbox(part)` on each
+--     entry (rbxlx ~5944688) — it EXPECTS a BasePart hitbox, not a Model.
+--
+-- So we send the MODEL to Characters and the PART to Mob.
 local function fireBite(targetModel, targetHitRoot)
-    pcall(function()
+    if targetModel and targetModel:IsA("Model") then
         local re = getRemoteEvent("CharactersDamageRemote")
-        if re then re:FireServer({targetHitRoot or targetModel}) end
-    end)
-    pcall(function()
+        if re then Stealth.fireServer(re, {targetModel}) end
+    end
+    if targetHitRoot and targetHitRoot:IsA("BasePart") then
         local re = getRemoteEvent("MobDamageRemote")
-        if re then re:FireServer({targetHitRoot or targetModel}) end
-    end)
+        if re then Stealth.fireServer(re, {targetHitRoot}) end
+    end
 end
 
 handlers.test_attack = function()
@@ -4950,8 +5253,20 @@ handlers.test_attack = function()
         return {ok = false, error = "unknown biome"}
     end
 
-    local amount0, target0 = getAttackProgress()
-    log(string.format("[test_attack] Initial mission: %d/%d", amount0, target0))
+    local amount0, target0, completed0 = getAttackProgress()
+    log(string.format("[test_attack] Initial mission: %d/%d (completed=%s)",
+        amount0, target0, tostring(completed0)))
+
+    -- Early exit if mission is already done or not present in region's daily pool.
+    if completed0 or (target0 > 0 and amount0 >= target0) then
+        log("[test_attack] Mission already completed — exiting")
+        return {ok = true, log = "test_attack: already complete"}
+    end
+    if target0 == 0 then
+        log("[test_attack] AttackOrHealCreatureOrNPC not active in '"
+            .. tostring(regionName) .. "' — exiting")
+        return {ok = true, log = "test_attack: mission not active in " .. tostring(regionName)}
+    end
 
     -- Game uses ATTACK_COOLDOWN = 0.8s (rbxlx ~5901184), scaled by TimePlayed/BiteCooldown.
     -- Use 1.1s between bites to be safe with server debounce.
@@ -4969,7 +5284,11 @@ handlers.test_attack = function()
 
         local amt, tgt, comp = getAttackProgress()
         if comp or (tgt > 0 and amt >= tgt) then
-            log("[test_attack] Mission completed!")
+            log("[test_attack] Mission completed — stopping")
+            break
+        end
+        if tgt == 0 then
+            log("[test_attack] Mission became inactive (target=0) — stopping")
             break
         end
 
@@ -4987,6 +5306,23 @@ handlers.test_attack = function()
                 end
             end
 
+            -- Helper: overlap-TP our HRP onto the target's hitroot, facing the target.
+            -- The server doesn't check distance for Characters path, but placing the bot
+            -- on top of the target gives correct ownership/network replication and
+            -- matches what the legit client Bite() hitbox would touch.
+            local function approachAndFace(targetHitRoot, targetPos)
+                local hrp = getHRP()
+                if not hrp or not targetHitRoot then return false end
+                -- Place bot slightly offset (+2 studs UP, 2 behind) then lookAt the target.
+                -- Using lookAt guarantees facing; offset prevents getting stuck inside the model.
+                local tpos = (targetHitRoot:IsA("BasePart") and targetHitRoot.Position) or targetPos
+                local myStand = tpos + Vector3.new(0, 2, 0)
+                pcall(function()
+                    hrp.CFrame = CFrame.lookAt(myStand, tpos)
+                end)
+                return true
+            end
+
             if targetInfo then
                 local model = targetInfo.model
                 local hitRoot = resolveHitRoot(model)
@@ -4994,43 +5330,32 @@ handlers.test_attack = function()
                     log("[test_attack] NPC has no usable hit root, skipping")
                     triedNPC[model] = true
                 else
-                    log(string.format("[test_attack] NPC target: %s  dist=%d",
+                    log(string.format("[test_attack] NPC target: %s  dist=%d (stay & bite)",
                         tostring(model.Name), math.floor(targetInfo.distance)))
 
-                    -- Teleport to within bite range: game checks Size.Magnitude*8+hitbox.
-                    -- Approach to ~10 studs, facing the NPC.
-                    local approach = targetInfo.position + Vector3.new(0, 3, -8)
-                    local hrp = getHRP()
-                    if hrp then
-                        pcall(function()
-                            hrp.CFrame = CFrame.lookAt(approach, targetInfo.position)
-                        end)
-                    end
-                    task.wait(0.4)
+                    approachAndFace(hitRoot, targetInfo.position)
+                    task.wait(0.5)
 
-                    -- Bite loop on this NPC (until dead / mission complete / no progress).
                     local noProgressBites = 0
                     local amountBefore = select(1, getAttackProgress())
-                    for _ = 1, 10 do
+                    for _ = 1, 12 do
                         if stopFlagExists() then break end
-                        if not isModelAlive(model) then
-                            log("[test_attack] NPC died")
+                        if not isModelAlive(model) or not hitRoot.Parent then
+                            log("[test_attack] NPC died or despawned — moving on")
                             break
                         end
-                        -- Re-check proximity; re-teleport if drifted.
-                        local p = getPosition()
-                        if p and (p - targetInfo.position).Magnitude > 35 then
-                            pcall(function()
-                                hrp.CFrame = CFrame.lookAt(
-                                    targetInfo.position + Vector3.new(0, 3, -8),
-                                    targetInfo.position)
-                            end)
+                        -- Re-anchor on top if we drifted (knockback / physics).
+                        local myP = getPosition()
+                        local tposNow = hitRoot.Position
+                        if myP and (myP - tposNow).Magnitude > 8 then
+                            approachAndFace(hitRoot, tposNow)
                             task.wait(0.3)
                         end
 
                         fireBite(model, hitRoot)
                         bites = bites + 1
-                        task.wait(BITE_INTERVAL)
+                        -- Wait AFTER bite for server to process damage + mission tick.
+                        task.wait(1.0)
 
                         local amountNow = select(1, getAttackProgress())
                         if amountNow > amountBefore then
@@ -5041,8 +5366,8 @@ handlers.test_attack = function()
                             if tgt > 0 and amountNow >= tgt then break end
                         else
                             noProgressBites = noProgressBites + 1
-                            if noProgressBites >= 3 then
-                                log("[test_attack] No mission progress from NPC bites — this NPC/mob type may not count")
+                            if noProgressBites >= 4 then
+                                log("[test_attack] No mission progress from 4 NPC bites — this NPC type may not count; trying another")
                                 break
                             end
                         end
@@ -5056,7 +5381,6 @@ handlers.test_attack = function()
                     log("[test_attack] No NPCs or players in range. Teleport to biome entry and retry.")
                     safeTeleportVec(biome.entry)
                     task.wait(2)
-                    -- If still nothing after teleport, break.
                     local pos2 = getPosition()
                     if pos2 then
                         local again = findNearbyPlayers(pos2, 1500)
@@ -5074,32 +5398,79 @@ handlers.test_attack = function()
                     end
                 else
                     local pl = players[1]
-                    log(string.format("[test_attack] Player target: %s dist=%d (hit-and-run)",
+                    local pHRP = pl.model and pl.model:FindFirstChild("HumanoidRootPart")
+                    local pHitRoot = pHRP or resolveHitRoot(pl.model) or pl.model
+                    log(string.format("[test_attack] Player target: %s dist=%d (STAY & BITE until mission ticks)",
                         pl.name, math.floor(pl.distance)))
-                    local hitRoot = resolveHitRoot(pl.model) or pl.model
-                    local approach = pl.position + Vector3.new(0, 3, -6)
-                    local hrp = getHRP()
-                    if hrp then
-                        pcall(function()
-                            hrp.CFrame = CFrame.lookAt(approach, pl.position)
-                        end)
-                    end
-                    task.wait(0.25)
 
+                    approachAndFace(pHitRoot, pl.position)
+                    task.wait(0.5)
+
+                    -- Bite THIS player until mission progresses or they move far away / die.
                     local amountBefore = select(1, getAttackProgress())
-                    fireBite(pl.model, hitRoot)
-                    bites = bites + 1
-                    -- Immediately retreat to safe point.
-                    task.wait(0.15)
-                    safeTeleportVec(biome.safe)
-                    task.wait(BITE_INTERVAL + 0.3)
+                    local noProgressBites = 0
+                    local startedAt = tick()
+                    for _ = 1, 10 do
+                        if stopFlagExists() then break end
+                        -- Is the player still valid and reachable?
+                        if not pl.model or not pl.model.Parent then
+                            log("[test_attack] Player left / model despawned")
+                            break
+                        end
+                        -- Re-resolve position (player moves constantly).
+                        local curHRP = pl.model:FindFirstChild("HumanoidRootPart")
+                        if curHRP then
+                            pHitRoot = curHRP
+                            approachAndFace(pHitRoot, curHRP.Position)
+                            task.wait(0.3)
+                        end
 
-                    local amountNow = select(1, getAttackProgress())
-                    if amountNow > amountBefore then
-                        log(string.format("[test_attack] Player bite OK  mission %d → %d", amountBefore, amountNow))
-                    else
-                        log("[test_attack] Player bite — no progress visible yet (may be cooldown/ailment)")
+                        fireBite(pl.model, pHitRoot)
+                        bites = bites + 1
+                        -- CRITICAL: long wait AFTER bite for server to process.
+                        task.wait(1.0)
+
+                        local amountNow = select(1, getAttackProgress())
+                        if amountNow > amountBefore then
+                            log(string.format("[test_attack] Player bite LANDED  mission %d → %d (bite #%d)",
+                                amountBefore, amountNow, bites))
+                            amountBefore = amountNow
+                            noProgressBites = 0
+                            if tgt > 0 and amountNow >= tgt then break end
+                            -- Mission progressed! Now retreat a bit before the next bite
+                            -- so we don't get killed by the player in a counter-attack.
+                            local retreatPos = pl.model:FindFirstChild("HumanoidRootPart")
+                            if retreatPos then
+                                local hrp = getHRP()
+                                local away = retreatPos.Position + Vector3.new(
+                                    math.random(-30, 30), 6, math.random(-30, 30))
+                                if hrp then
+                                    pcall(function() hrp.CFrame = CFrame.new(away) end)
+                                end
+                                task.wait(0.3)
+                            end
+                        else
+                            noProgressBites = noProgressBites + 1
+                            if noProgressBites >= 3 then
+                                log("[test_attack] Player bites not ticking mission — moving on")
+                                break
+                            end
+                        end
+
+                        if tick() - startedAt > 20 then
+                            log("[test_attack] 20s on this player — rotating")
+                            break
+                        end
                     end
+
+                    -- Only NOW retreat to safe, after we tried to tick the mission.
+                    if (select(1, getAttackProgress())) > amountBefore then
+                        log("[test_attack] Mission advanced — retreating to safe")
+                    else
+                        log("[test_attack] No mission tick on this player — retreating to safe anyway")
+                    end
+                    safeTeleportVec(biome.safe)
+                    task.wait(BITE_INTERVAL)
                 end
             end
         end
@@ -5295,12 +5666,12 @@ handlers.test_mud = function()
                 if stopFlagExists() then break end
 
                 -- Fire the mud remote with the mud root (the tagged instance itself).
-                pcall(function() mudRemote:FireServer(mudObj) end)
+                Stealth.fireServer(mudRemote, mudObj)
                 log("[test_mud] Mud:FireServer sent")
                 task.wait(1.0)
                 -- Also send HideScent as the keybind path does (harmless if server ignores).
                 if hideScentRemote then
-                    pcall(function() hideScentRemote:FireServer() end)
+                    Stealth.fireServer(hideScentRemote)
                     log("[test_mud] HideScent:FireServer sent")
                 end
                 task.wait(1.5)
@@ -5385,59 +5756,87 @@ handlers.test_survive = function()
         return {ok = true, log = "test_survive: already complete"}
     end
 
-    -- Teleport to safe point.
-    log(string.format("[test_survive] TP to safe point (%d,%d,%d)",
-        biome.safe[1], biome.safe[2], biome.safe[3]))
-    safeTeleportVec(biome.safe)
+    -- If the region's daily 3 missions don't include TimePlayed, target will be 0.
+    -- Don't waste time — report and exit cleanly.
+    if target0 == 0 then
+        log("[test_survive] TimePlayed mission is not active in '" .. tostring(regionName)
+            .. "' (daily pool rotated). Try another biome.")
+        return {ok = true, log = "test_survive: mission not active in " .. tostring(regionName)}
+    end
+
+    -- Survive strategy:
+    -- 1. Teleport UNDER the safe point — the region-check is XZ only, so we stay in-biome
+    --    but most creatures can't reach us for damage.
+    -- 2. If HP drops anyway, wiggle XZ slightly so targeted attacks miss.
+    -- 3. Primary exit signal is mission `completed` flag, not the wall-clock timer.
+    local UNDER_MAP_Y_OFFSET = -55  -- tuned so we're below terrain but far above fallout floor
+    local underSafe = {biome.safe[1], biome.safe[2] + UNDER_MAP_Y_OFFSET, biome.safe[3]}
+    log(string.format("[test_survive] TP under biome at (%d,%d,%d)",
+        underSafe[1], underSafe[2], underSafe[3]))
+    safeTeleportVec(underSafe)
     task.wait(1.0)
 
-    -- Wait until mission is complete, with a generous ceiling (165s = 150 + 15 buffer).
-    -- We also run light survival maintenance (emergency refill) so we don't die here.
-    local targetSec = (target0 > 0) and target0 or 150
-    local buffer = 15
-    local waitTotal = targetSec + buffer
+    -- Hard ceiling — mission target is ~150s but can tick faster in-game when the region
+    -- increments every N frames. Keep a generous ceiling and rely on `completed` to exit.
+    local hardCeiling = 300
     local startTime = tick()
     local lastLog = 0
-    local lastSurvivalCheck = 0
+    local lastHP = nil
+    local wiggles = 0
 
-    while tick() - startTime < waitTotal do
+    while tick() - startTime < hardCeiling do
         if stopFlagExists() then
             log("[test_survive] STOPPED by flag")
+            break
+        end
+
+        -- Read mission every tick to exit as soon as it's done.
+        local amt, tgt, comp = getTimePlayedProgress()
+        if comp or (tgt > 0 and amt >= tgt) then
+            log(string.format("[test_survive] Mission COMPLETED: %d/%d", amt, tgt))
+            break
+        end
+        -- If the mission disappeared (rolled out of region pool mid-run), exit.
+        if tgt == 0 then
+            log("[test_survive] Mission no longer active (target==0) — exiting")
             break
         end
 
         local elapsed = math.floor(tick() - startTime)
         if tick() - lastLog > 5 then
             lastLog = tick()
-            local amt, tgt, comp = getTimePlayedProgress()
             local stats = getCreatureStats()
-            log(string.format("[test_survive] t=%ds/%ds  mission=%d/%d  hp=%d food=%d water=%d",
-                elapsed, waitTotal, amt, tgt, stats.hp or -1, stats.food or -1, stats.water or -1))
-            if comp then
-                log("[test_survive] Mission completed!")
-                break
+            log(string.format("[test_survive] t=%ds  mission=%d/%d  hp=%s food=%s water=%s  wiggles=%d",
+                elapsed, amt, tgt, tostring(stats.hp), tostring(stats.food),
+                tostring(stats.water), wiggles))
+        end
+
+        -- HP watch: if HP dropped by ≥2, wiggle XZ a bit (stay under map).
+        do
+            local stats = getCreatureStats()
+            local hp = stats.hp
+            if type(hp) == "number" then
+                if lastHP and hp < lastHP - 2 then
+                    wiggles = wiggles + 1
+                    local ox = math.random(-45, 45)
+                    local oz = math.random(-45, 45)
+                    local wigglePos = {biome.safe[1] + ox, biome.safe[2] + UNDER_MAP_Y_OFFSET, biome.safe[3] + oz}
+                    log(string.format("[test_survive] Took damage (%d -> %d) — wiggling to (%d,%d,%d)",
+                        lastHP, hp, wigglePos[1], wigglePos[2], wigglePos[3]))
+                    safeTeleportVec(wigglePos)
+                end
+                lastHP = hp
             end
         end
 
-        -- Light survival maintenance every 10s: top up if truly critical.
-        if tick() - lastSurvivalCheck > 10 then
-            lastSurvivalCheck = tick()
-            local stats = getCreatureStats()
-            if (stats.food or 100) < SURVIVAL_FOOD_CRITICAL
-                or (stats.water or 100) < SURVIVAL_WATER_CRITICAL
-                or (stats.hp or 100) < SURVIVAL_HP_CRITICAL then
-                log("[test_survive] Survival critical — emergency top-up will not be run in test")
-                -- Just teleport back to safe in case we drifted.
-                safeTeleportVec(biome.safe)
-            else
-                -- Re-anchor every 10s in case of push from waves/wind.
-                local p = getPosition()
-                if p then
-                    local dx = p.X - biome.safe[1]
-                    local dz = p.Z - biome.safe[3]
-                    if math.sqrt(dx*dx + dz*dz) > 80 then
-                        safeTeleportVec(biome.safe)
-                    end
+        -- Re-anchor if we drifted too far (currents, knockback, fall).
+        do
+            local p = getPosition()
+            if p then
+                local dx = p.X - biome.safe[1]
+                local dz = p.Z - biome.safe[3]
+                if math.sqrt(dx*dx + dz*dz) > 80 or p.Y > biome.safe[2] - 5 then
+                    safeTeleportVec(underSafe)
                 end
             end
         end
@@ -5446,10 +5845,12 @@ handlers.test_survive = function()
     end
 
     local finalAmt, finalTgt, finalComp = getTimePlayedProgress()
-    log(string.format("[test_survive] === DONE === mission=%d/%d completed=%s elapsed=%ds",
-        finalAmt, finalTgt, tostring(finalComp), math.floor(tick() - startTime)))
+    local missionMet = finalComp or (finalTgt > 0 and finalAmt >= finalTgt)
+    log(string.format("[test_survive] === DONE === mission=%d/%d completed=%s met=%s elapsed=%ds",
+        finalAmt, finalTgt, tostring(finalComp), tostring(missionMet),
+        math.floor(tick() - startTime)))
     return {
-        ok = finalComp or finalAmt >= (target0 > 0 and target0 or 150),
+        ok = missionMet,
         log = string.format("test_survive: mission=%d/%d completed=%s",
             finalAmt, finalTgt, tostring(finalComp))
     }
@@ -5644,9 +6045,8 @@ handlers.test_shrooms = function()
 
         local amountBefore = select(1, getShoomProgress())
 
-        local ok, ret = pcall(function()
-            return collectRF:InvokeServer(target.region, target.id)
-        end)
+        local ret = Stealth.invokeServer(collectRF, target.region, target.id)
+        local ok = ret ~= nil
         if not ok then
             log("[test_shrooms] InvokeServer errored: " .. tostring(ret))
             triedPiles[target.obj] = true
@@ -5679,6 +6079,356 @@ handlers.test_shrooms = function()
     }
 end
 end -- == /test_shrooms scope ==
+
+-- ==========================================================================
+-- MISSIONS V2 — delegates to the proven test-button handlers.
+--
+-- Must be defined AFTER the `handlers` table and all `handlers.test_*`
+-- assignments so that internal references resolve correctly (forward-decl
+-- `local doMissionStep` was made earlier in the file).
+--
+-- Priority (per user spec):
+--   1. EatFoodDrinkWater          (50 food/water units)
+--   2. DistanceTravelled          (2500 studs)
+--   3. Sniff                      (5 times)
+--   4. ShoomPilesCollected        (3 piles)
+--   5. ConcealScent               (3 mud rolls — Land only)
+--   6. TimePlayed                 (150 seconds)
+--   7. AttackOrHealCreatureOrNPC  (5 bites)
+--
+-- Mission type names are the real ones from rbxlx ~5452145 (RegionMissions
+-- catalog module), confirmed against RawRegionData.
+-- ==========================================================================
+doMissionStep = function()
+    _missionState.deferredUntil = _missionState.deferredUntil or {}
+    _missionState.underMapSince = _missionState.underMapSince or 0
+    _missionState.runningMission = _missionState.runningMission or nil
+
+    if not _missionState.initialized then
+        _missionState.initialized = true
+        _missionState.biomeEnteredTime = tick()
+        _maxFoodSeen = 0
+        _maxWaterSeen = 0
+        local b0 = BIOME_ATLAS[_missionState.currentBiomeIdx or 1] or BIOME_ATLAS[1]
+        mlog("[MISSIONS-V2] Init, starting biome: " .. (b0 and b0.name or "?"), nil)
+        safeTeleportVec(b0.entry)
+        task.wait(1.5)
+    end
+
+    if stopFlagExists() then return false end
+    if Stealth.aborted() then return false end
+    if not isCreatureAlive() then return false end
+
+    -- Priority table (1 = highest).
+    local PRIO = {
+        EatFoodDrinkWater         = 1,
+        DistanceTravelled         = 2,
+        Sniff                     = 3,
+        ShoomPilesCollected       = 4,
+        ConcealScent              = 5,
+        TimePlayed                = 6,
+        AttackOrHealCreatureOrNPC = 7,
+    }
+    -- Mission type → test handler name (EatFoodDrinkWater is special-cased).
+    local HANDLER_NAME = {
+        DistanceTravelled         = "test_walk",
+        Sniff                     = "test_sniff",
+        ShoomPilesCollected       = "test_shrooms",
+        ConcealScent              = "test_mud",
+        TimePlayed                = "test_survive",
+        AttackOrHealCreatureOrNPC = "test_attack",
+    }
+
+    local function dkey(biomeName, mType) return biomeName .. "|" .. mType end
+
+    local function isDeferred(biomeName, mType)
+        local t = _missionState.deferredUntil[dkey(biomeName, mType)]
+        return t and tick() < t
+    end
+
+    local function setDeferred(biomeName, mType, seconds, reason)
+        _missionState.deferredUntil[dkey(biomeName, mType)] = tick() + seconds
+        mlog(string.format("[MISSIONS-V2] Defer %s/%s for %ds (%s)",
+            biomeName, mType, seconds, tostring(reason)), nil)
+    end
+
+    local function isMissionActive(m)
+        if not m then return false end
+        if m.completed then return false end
+        local tgt = m.targetAmount or 0
+        if tgt == 0 then return false end
+        if (m.amount or 0) >= tgt then return false end
+        return true
+    end
+
+    local function missionEligibleInBiome(mType, biome)
+        if mType == "ConcealScent" and biome.zone ~= "Land" then return false end
+        return PRIO[mType] ~= nil
+    end
+
+    local function pickInBiome(biome)
+        local missions = readRegionMissions(biome.name)
+        if not missions or not next(missions) then return nil end
+        local best, bestPrio = nil, 999
+        for mType, m in pairs(missions) do
+            local p = PRIO[mType]
+            if p and isMissionActive(m)
+                and missionEligibleInBiome(mType, biome)
+                and not isDeferred(biome.name, mType)
+                and p < bestPrio
+            then
+                best = mType
+                bestPrio = p
+            end
+        end
+        return best
+    end
+
+    local function anyBiomeHasFoodMission()
+        for _, b in ipairs(BIOME_ATLAS) do
+            local missions = readRegionMissions(b.name)
+            if missions and isMissionActive(missions.EatFoodDrinkWater) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function findBiomeWithWork()
+        local startIdx = (_missionState.currentBiomeIdx or 1)
+        for i = 1, #BIOME_ATLAS do
+            local idx = ((startIdx - 1 + i) % #BIOME_ATLAS) + 1
+            local b = BIOME_ATLAS[idx]
+            if pickInBiome(b) then
+                return idx, b
+            end
+        end
+        return nil, nil
+    end
+
+    -- Run ONE mission to completion via the matching test-handler call.
+    -- Uses pre/post mission amounts to decide deferral.
+    local function runMissionOnce(mType, biome)
+        local regionName = biome.name
+        local pre = readRegionMissions(regionName) or {}
+        local preM = pre[mType]
+        local amountBefore = (preM and preM.amount) or 0
+        local targetAmount = (preM and preM.targetAmount) or 0
+        mlog(string.format("[MISSIONS-V2] START  %s in %s (%d/%d)",
+            mType, regionName, amountBefore, targetAmount), nil)
+
+        _missionState.runningMission = mType
+
+        if mType == "EatFoodDrinkWater" then
+            -- Try eat first.
+            if handlers.test_eat then
+                local ok, err = pcall(handlers.test_eat)
+                if not ok then
+                    mlog("[MISSIONS-V2] test_eat error: " .. tostring(err), nil)
+                end
+            end
+            if stopFlagExists() then _missionState.runningMission = nil; return end
+            -- If still not done, try drink.
+            local mid = readRegionMissions(regionName)
+            local midM = mid and mid.EatFoodDrinkWater
+            local midDone = midM and (midM.completed
+                or (midM.amount or 0) >= (midM.targetAmount or 0))
+            if not midDone and not stopFlagExists() and handlers.test_drink then
+                local ok, err = pcall(handlers.test_drink)
+                if not ok then
+                    mlog("[MISSIONS-V2] test_drink error: " .. tostring(err), nil)
+                end
+            end
+        else
+            local name = HANDLER_NAME[mType]
+            local h = name and handlers[name]
+            if h then
+                local ok, err = pcall(h)
+                if not ok then
+                    mlog("[MISSIONS-V2] " .. tostring(name) .. " error: " .. tostring(err), nil)
+                end
+            else
+                setDeferred(regionName, mType, 600, "no_handler")
+                _missionState.runningMission = nil
+                return
+            end
+        end
+
+        _missionState.runningMission = nil
+        if stopFlagExists() then return end
+        task.wait(0.5)
+
+        local post = readRegionMissions(regionName) or {}
+        local postM = post[mType]
+        local amountAfter = (postM and postM.amount) or amountBefore
+        local completed = (postM and postM.completed) or false
+
+        if completed
+            or (postM and (postM.targetAmount or 0) > 0
+                and amountAfter >= postM.targetAmount)
+        then
+            mlog(string.format("[MISSIONS-V2] DONE   %s in %s (%d/%d)",
+                mType, regionName, amountAfter, (postM and postM.targetAmount) or 0), nil)
+        elseif amountAfter > amountBefore then
+            mlog(string.format("[MISSIONS-V2] PARTIAL %s in %s (%d->%d/%d)",
+                mType, regionName, amountBefore, amountAfter,
+                (postM and postM.targetAmount) or 0), nil)
+        else
+            local defer = 120
+            if mType == "EatFoodDrinkWater" then defer = 60 end
+            if mType == "AttackOrHealCreatureOrNPC" then defer = 180 end
+            if mType == "ShoomPilesCollected" then defer = 240 end
+            if mType == "Sniff" then defer = 30 end
+            setDeferred(regionName, mType, defer, "no_progress")
+        end
+    end
+
+    -- Hide under the map (XZ-in-biome, Y below terrain) and poll for fresh
+    -- missions. Region check is XZ-only, so the current biome keeps ticking.
+    local function hideUnderMapAndWait()
+        local biome = BIOME_ATLAS[_missionState.currentBiomeIdx or 1] or BIOME_ATLAS[1]
+        if (_missionState.underMapSince or 0) == 0 then
+            _missionState.underMapSince = tick()
+            mlog("[MISSIONS-V2] ALL DONE — hiding under map at " .. biome.name, nil)
+        end
+        local under = {biome.safe[1], biome.safe[2] - 60, biome.safe[3]}
+        safeTeleportVec(under)
+
+        -- Wait 60s with 5s granularity so stop-flag is honored.
+        local waited = 0
+        while waited < 60 do
+            if stopFlagExists() then return end
+            if not isCreatureAlive() then return end
+            task.wait(5)
+            waited = waited + 5
+        end
+
+        -- Clear ALL deferrals (they might have refreshed daily) and look again.
+        _missionState.deferredUntil = {}
+        local idx, b = findBiomeWithWork()
+        if idx then
+            _missionState.currentBiomeIdx = idx
+            _missionState.underMapSince = 0
+            mlog("[MISSIONS-V2] Fresh mission at " .. b.name .. " — resuming", nil)
+        end
+    end
+
+    -- ---- Main step dispatch ----
+
+    local targetBiome = BIOME_ATLAS[_missionState.currentBiomeIdx or 1]
+    if not targetBiome then
+        _missionState.currentBiomeIdx = 1
+        targetBiome = BIOME_ATLAS[1]
+    end
+
+    -- Teleport into target biome ONLY when necessary. Test handlers manage their
+    -- own positioning (to food / lake / NPC), which routinely puts the bot at the
+    -- border of adjacent biomes. Re-TPing to biome.entry every cycle made the bot
+    -- thrash between biomes instead of finishing one biome's missions.
+    --
+    -- Rules:
+    --   1. If `currentBiomeIdx` changed since last commit → TP once (explicit rotation).
+    --   2. If bot is > 1200 studs from biome.entry → TP (respawn or got flung far).
+    --   3. Otherwise: stay put, let the next test handler work locally.
+    local regionName = detectCurrentRegion()
+    local myPos = getPosition()
+    local needTP = false
+    local committedIdx = _missionState.committedBiomeIdx
+    if committedIdx ~= _missionState.currentBiomeIdx then
+        needTP = true  -- explicit biome rotation
+    elseif myPos then
+        local entry = targetBiome.entry
+        local dx = myPos.X - entry[1]
+        local dz = myPos.Z - entry[3]
+        local distToEntry = math.sqrt(dx*dx + dz*dz)
+        if distToEntry > 1200 and regionName ~= targetBiome.name then
+            needTP = true  -- drifted far away AND in a different region
+        end
+    else
+        -- No position → character may have just respawned; TP to be safe.
+        needTP = true
+    end
+
+    if needTP then
+        mlog(string.format("[MISSIONS-V2] Entering biome %s (currently: %s)",
+            targetBiome.name, tostring(regionName)), nil)
+        safeTeleportVec(targetBiome.entry)
+        task.wait(1.5)
+        regionName = detectCurrentRegion()
+        _missionState.committedBiomeIdx = _missionState.currentBiomeIdx
+
+        -- If TP landed us somewhere else AND that biome has pending work,
+        -- accept it rather than bouncing.
+        if regionName ~= targetBiome.name then
+            for idx, b in ipairs(BIOME_ATLAS) do
+                if b.name == regionName and pickInBiome(b) then
+                    _missionState.currentBiomeIdx = idx
+                    _missionState.committedBiomeIdx = idx
+                    targetBiome = b
+                    mlog("[MISSIONS-V2] TP mismatch — switched to actual biome " .. regionName, nil)
+                    break
+                end
+            end
+        end
+    else
+        -- No TP this cycle; just record commitment so subsequent cycles know.
+        _missionState.committedBiomeIdx = _missionState.currentBiomeIdx
+    end
+
+    -- Survival: only top up if there's NO food/water mission anywhere,
+    -- because otherwise we'd rob ourselves of mission progress in the next biome.
+    if not anyBiomeHasFoodMission() then
+        local stats = getCreatureStats()
+        local need = needsSurvivalAction(stats)
+        if need then
+            mlog(string.format("[MISSIONS-V2] Survival (no food/water mission): %s hp=%s food=%s water=%s",
+                need, tostring(stats.hp), tostring(stats.food), tostring(stats.water)), nil)
+            doEmergencyRefill(need)
+            return true
+        end
+    end
+
+    -- Pick highest-priority active & non-deferred mission in current biome.
+    local mType = pickInBiome(targetBiome)
+    if mType then
+        runMissionOnce(mType, targetBiome)
+        -- After each completed mission, occasionally insert a longer "human"
+        -- idle so the cadence isn't perfectly periodic to onlookers.
+        Stealth.maybeIdleBetweenMissions()
+        return true
+    end
+
+    -- Current biome has no pending work — diagnose & rotate.
+    do
+        local missions = readRegionMissions(targetBiome.name)
+        local summary = {}
+        if missions and next(missions) then
+            for t, m in pairs(missions) do
+                local state = "?"
+                if m.completed then state = "done"
+                elseif (m.targetAmount or 0) == 0 then state = "inactive"
+                elseif isDeferred(targetBiome.name, t) then state = "deferred"
+                else state = string.format("%d/%d", m.amount or 0, m.targetAmount or 0) end
+                table.insert(summary, t .. "=" .. state)
+            end
+        else
+            table.insert(summary, "(no mission data for this region)")
+        end
+        mlog("[MISSIONS-V2] No work in " .. targetBiome.name
+            .. " | " .. table.concat(summary, ", "), nil)
+    end
+
+    local idx, b = findBiomeWithWork()
+    if idx then
+        _missionState.currentBiomeIdx = idx
+        mlog("[MISSIONS-V2] Rotating to biome: " .. b.name, nil)
+        return true
+    end
+
+    -- Nothing active anywhere → hide under map, wait for refresh.
+    hideUnderMapAndWait()
+    return true
+end
 
 -- ФАРМ (фармер)
 handlers.farm = function()
@@ -5715,6 +6465,18 @@ handlers.farm = function()
             return {
                 ok = true,
                 log = "Farm stopped by flag after " .. cycles .. " cycles",
+                inventory = getInventory(),
+                tokens_earned = totalTokensEarned,
+            }
+        end
+
+        -- Stealth: if the player was kicked / removed while we were running,
+        -- exit cleanly instead of looping into a dead character.
+        if Stealth.aborted() then
+            log("[Stealth] Farm aborted: " .. tostring(Stealth.abortReason()))
+            return {
+                ok = false,
+                error = "Stealth abort: " .. tostring(Stealth.abortReason()),
                 inventory = getInventory(),
                 tokens_earned = totalTokensEarned,
             }
@@ -5792,7 +6554,12 @@ handlers.farm = function()
             end
             wait(2)
         else
-            doMissionStep()
+            -- Wrap in pcall so a single bad step doesn't tear down the farm.
+            -- The error is logged; the outer loop re-enters after wait(1).
+            local stepOk, stepErr = pcall(doMissionStep)
+            if not stepOk then
+                log("[FARM] doMissionStep error: " .. tostring(stepErr))
+            end
             wait(1)
         end
 
@@ -6174,7 +6941,7 @@ end
 -- ========== ГЛАВНЫЙ ОБРАБОТЧИК ==========
 
 local function main()
-    log("=== UNIVERSAL SONARIA BOT STARTED === [v39-walk-survive-attack]")
+    log("=== UNIVERSAL SONARIA BOT STARTED === [v47-full-defer-trade-tp]")
     log("Account: " .. ACCOUNT_LOGIN .. " (" .. ACCOUNT_ID .. ")")
     log("Role: " .. ROLE)
     log("Command: " .. COMMAND)
